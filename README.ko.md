@@ -33,12 +33,18 @@ Phase 0–5 수직 기능 묶음이 구현되어 있습니다. 네이티브 실�
 
 ```sh
 brew tap qkdxorjs1002/tap
+
+# 안정 릴리스
 brew install fastmvm
+
+# 최신 안정 또는 prerelease
+brew install fastmvm@pre
+
 fastmvm --version
 fastmvm doctor --json
 ```
 
-formula는 `fastmvm`, `fastmvm-mcp`, 서명된 `fastmvm-vmm-helper`, `e2fsprogs`를 설치합니다. 네이티브 실행에는 별도로 호환되는 정식 libkrun 및 libkrunfw 라이브러리가 필요합니다. `doctor`는 호스트를 변경하지 않고 누락된 경로, 심볼, 프레임워크, 서명 기능을 정확히 보고합니다.
+두 formula 모두 `fastmvm`, `fastmvm-mcp`, 서명된 `fastmvm-vmm-helper`, `e2fsprogs`를 설치합니다. 같은 실행 파일을 설치하므로 서로 충돌하며, 채널을 바꾸기 전에 현재 formula를 제거해야 합니다. 네이티브 실행에는 별도로 호환되는 정식 libkrun 및 libkrunfw 라이브러리가 필요합니다. `doctor`는 호스트를 변경하지 않고 누락된 경로, 심볼, 프레임워크, 서명 기능을 정확히 보고합니다.
 
 ### 이식 가능한 실행 경로 확인
 
@@ -286,13 +292,13 @@ fastmvm doctor --json
 
 ## 릴리스
 
-예를 들어 `0.1.0`처럼 workspace 버전과 정확히 같은 안정 태그를 push하면 [릴리스 워크플로](.github/workflows/release.yml)가 시작됩니다.
+앞에 `v`가 없는 검증된 태그를 push하면 [릴리스 워크플로](.github/workflows/release.yml)가 시작됩니다. 안정 태그는 `x.y.z`, prerelease 태그는 `x.y.z-alphaN`, `x.y.z-betaN`, `x.y.z-rcN` 형식이며 예시는 `0.0.0-alpha1`입니다. 태그가 릴리스 버전의 기준이며 품질 게이트 전에 runner의 임시 workspace에 동기화됩니다. 소스 commit은 다시 쓰지 않습니다.
 
 1. Apple Silicon macOS runner에서 전체 Rust 품질 게이트를 실행합니다.
 2. `fastmvm`, `fastmvm-mcp`, entitlement가 포함된 VMM helper를 빌드하고 릴리스 인증서로 서명합니다.
 3. 서명과 패키지의 process 백엔드 smoke 경로를 검증합니다.
-4. 아카이브와 SHA-256 파일을 GitHub Releases에 게시합니다.
-5. `Formula/fastmvm.rb`를 생성·검증해 `qkdxorjs1002/homebrew-tap`에 push합니다.
+4. 아카이브와 SHA-256 파일을 GitHub Releases에 게시하고 prerelease 태그를 그에 맞게 표시합니다.
+5. `qkdxorjs1002/homebrew-tap`의 rolling `Formula/fastmvm-pre.rb`와 `fastmvm@pre` alias를 갱신하며, 안정 태그일 때는 `Formula/fastmvm.rb`도 갱신합니다.
 
 저장소 릴리스 secret:
 

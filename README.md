@@ -33,12 +33,18 @@ The Homebrew release currently targets Apple Silicon macOS:
 
 ```sh
 brew tap qkdxorjs1002/tap
+
+# Stable release
 brew install fastmvm
+
+# Newest stable or prerelease
+brew install fastmvm@pre
+
 fastmvm --version
 fastmvm doctor --json
 ```
 
-The formula installs `fastmvm`, `fastmvm-mcp`, the signed `fastmvm-vmm-helper`, and `e2fsprogs`. Native execution still requires compatible released libkrun and libkrunfw libraries. `doctor` reports the exact missing path, symbol, framework, or signing capability without changing the host.
+Both formulae install `fastmvm`, `fastmvm-mcp`, the signed `fastmvm-vmm-helper`, and `e2fsprogs`. They conflict because they install the same executables; uninstall the current formula before switching channels. Native execution still requires compatible released libkrun and libkrunfw libraries. `doctor` reports the exact missing path, symbol, framework, or signing capability without changing the host.
 
 ### Verify the portable path
 
@@ -286,13 +292,13 @@ More project detail:
 
 ## Release
 
-Pushing a stable tag that exactly matches the workspace version, for example `0.1.0`, starts [the release workflow](.github/workflows/release.yml). It:
+Pushing a validated tag without a leading `v` starts [the release workflow](.github/workflows/release.yml). Stable tags use `x.y.z`; prerelease tags use `x.y.z-alphaN`, `x.y.z-betaN`, or `x.y.z-rcN`, for example `0.0.0-alpha1`. The tag is the release version and is synchronized into the runner's temporary workspace before the quality gate; the source commit is not rewritten. The workflow:
 
 1. Runs the full Rust quality gate on an Apple Silicon macOS runner.
 2. Builds and release-signs `fastmvm`, `fastmvm-mcp`, and the entitled VMM helper.
 3. Verifies the signatures and packaged process-backend smoke path.
-4. Publishes the archive and SHA-256 file to GitHub Releases.
-5. Generates, validates, and pushes `Formula/fastmvm.rb` to `qkdxorjs1002/homebrew-tap`.
+4. Publishes the archive and SHA-256 file to GitHub Releases, marking prerelease tags accordingly.
+5. Updates the rolling `Formula/fastmvm-pre.rb` and `fastmvm@pre` alias in `qkdxorjs1002/homebrew-tap`; stable tags also update `Formula/fastmvm.rb`.
 
 Repository release secrets:
 

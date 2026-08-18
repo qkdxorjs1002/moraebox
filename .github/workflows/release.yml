@@ -36,22 +36,63 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ ! "${RELEASE_TAG}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "Release tags must use x.y.z without a leading v; got ${RELEASE_TAG}." >&2
+          release_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)(0|[1-9][0-9]*))?$'
+          if [[ ! "${RELEASE_TAG}" =~ ${release_pattern} ]]; then
+            echo "Release tags must use x.y.z or x.y.z-(alpha|beta|rc)N without a leading v; got ${RELEASE_TAG}." >&2
             exit 1
           fi
+
+          prerelease=false
+          if [[ "${RELEASE_TAG}" == *-* ]]; then
+            prerelease=true
+          fi
+
+          echo "version=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+          echo "archive=fastmvm-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz" >> "${GITHUB_OUTPUT}"
+
+      - name: Synchronize workspace version
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          manifest = Path("Cargo.toml")
+          release_version = os.environ["RELEASE_VERSION"]
+          lines = manifest.read_text(encoding="utf-8").splitlines(keepends=True)
+          in_workspace_package = False
+          replacements = 0
+
+          for index, line in enumerate(lines):
+              stripped = line.strip()
+              if stripped.startswith("[") and stripped.endswith("]"):
+                  in_workspace_package = stripped == "[workspace.package]"
+                  continue
+              if in_workspace_package and line.startswith("version = "):
+                  newline = "\n" if line.endswith("\n") else ""
+                  lines[index] = f'version = "{release_version}"{newline}'
+                  replacements += 1
+
+          if replacements != 1:
+              raise SystemExit(
+                  f"expected one [workspace.package] version, replaced {replacements}"
+              )
+          manifest.write_text("".join(lines), encoding="utf-8")
+          PY
 
           workspace_version="$(
             cargo metadata --no-deps --format-version 1 |
               python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(package["version"] for package in data["packages"] if package["name"] == "fastmvm-cli"))'
           )"
-          if [[ "${RELEASE_TAG}" != "${workspace_version}" ]]; then
-            echo "Tag ${RELEASE_TAG} does not match workspace version ${workspace_version}." >&2
+          if [[ "${RELEASE_VERSION}" != "${workspace_version}" ]]; then
+            echo "Could not synchronize workspace version to ${RELEASE_VERSION}; got ${workspace_version}." >&2
             exit 1
           fi
-
-          echo "version=${workspace_version}" >> "${GITHUB_OUTPUT}"
-          echo "archive=fastmvm-${workspace_version}-aarch64-apple-darwin.tar.gz" >> "${GITHUB_OUTPUT}"
 
       - name: Require release credentials
         env:
@@ -196,6 +237,7 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_PRERELEASE: ${{ steps.version.outputs.prerelease }}
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
         shell: bash
@@ -203,14 +245,20 @@ jobs:
           set -euo pipefail
 
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release edit "${RELEASE_TAG}" \
-              --title "fastmvm ${RELEASE_VERSION}" \
-              --prerelease=false
+            edit_args=(--title "fastmvm ${RELEASE_VERSION}")
+            if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
+              edit_args+=(--prerelease)
+            else
+              edit_args+=(--prerelease=false)
+            fi
+            gh release edit "${RELEASE_TAG}" "${edit_args[@]}"
             gh release upload "${RELEASE_TAG}" release-dist/* --clobber
           else
-            gh release create "${RELEASE_TAG}" release-dist/* \
-              --title "fastmvm ${RELEASE_VERSION}" \
-              --generate-notes
+            create_args=(--title "fastmvm ${RELEASE_VERSION}" --generate-notes)
+            if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
+              create_args+=(--prerelease)
+            fi
+            gh release create "${RELEASE_TAG}" release-dist/* "${create_args[@]}"
           fi
 
       - name: Checkout Homebrew tap
@@ -224,25 +272,29 @@ jobs:
         env:
           ARCHIVE_NAME: ${{ steps.version.outputs.archive }}
           ARCHIVE_SHA256: ${{ steps.asset.outputs.sha256 }}
+          RELEASE_PRERELEASE: ${{ steps.version.outputs.prerelease }}
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p homebrew-tap/Formula
-          ruby - "homebrew-tap/Formula/fastmvm.rb" <<'RUBY'
+          mkdir -p homebrew-tap/Formula homebrew-tap/Aliases
+          ruby - "homebrew-tap" <<'RUBY'
+          require "fileutils"
           require "pathname"
 
-          formula_path = Pathname(ARGV.fetch(0))
+          tap_root = Pathname(ARGV.fetch(0))
           repository = ENV.fetch("GITHUB_REPOSITORY")
           tag = ENV.fetch("RELEASE_TAG")
           version = ENV.fetch("RELEASE_VERSION")
           archive = ENV.fetch("ARCHIVE_NAME")
           sha256 = ENV.fetch("ARCHIVE_SHA256")
+          prerelease = ENV.fetch("RELEASE_PRERELEASE") == "true"
 
-          formula_path.write(<<~FORMULA)
-            class Fastmvm < Formula
+          def formula_content(class_name:, conflict:, repository:, tag:, version:, archive:, sha256:)
+            <<~FORMULA
+            class #{class_name} < Formula
               desc "Disposable microVM sandbox for coding agents"
               homepage "https://github.com/#{repository}"
               url "https://github.com/#{repository}/releases/download/#{tag}/#{archive}"
@@ -253,6 +305,8 @@ jobs:
               depends_on arch: :arm64
               depends_on :macos
               depends_on "e2fsprogs"
+
+              conflicts_with "#{conflict}", because: "both install the fastmvm executables"
 
               def install
                 bin.install "fastmvm"
@@ -274,14 +328,50 @@ jobs:
                 assert_match "stdio MCP server", shell_output("\#{bin}/fastmvm-mcp --help")
               end
             end
-          FORMULA
+            FORMULA
+          end
+
+          pre_formula = tap_root/"Formula/fastmvm-pre.rb"
+          pre_formula.write(
+            formula_content(
+              class_name: "FastmvmPre",
+              conflict: "fastmvm",
+              repository: repository,
+              tag: tag,
+              version: version,
+              archive: archive,
+              sha256: sha256,
+            ),
+          )
+          FileUtils.ln_sf("../Formula/fastmvm-pre.rb", tap_root/"Aliases/fastmvm@pre")
+
+          unless prerelease
+            (tap_root/"Formula/fastmvm.rb").write(
+              formula_content(
+                class_name: "Fastmvm",
+                conflict: "fastmvm-pre",
+                repository: repository,
+                tag: tag,
+                version: version,
+                archive: archive,
+                sha256: sha256,
+              ),
+            )
+          end
           RUBY
 
-          ruby -c homebrew-tap/Formula/fastmvm.rb
-          brew style homebrew-tap/Formula/fastmvm.rb
+          formula_files=(homebrew-tap/Formula/fastmvm-pre.rb)
+          if [[ "${RELEASE_PRERELEASE}" == "false" ]]; then
+            formula_files+=(homebrew-tap/Formula/fastmvm.rb)
+          fi
+          for formula_file in "${formula_files[@]}"; do
+            ruby -c "${formula_file}"
+          done
+          brew style "${formula_files[@]}"
 
       - name: Commit Homebrew formula
         env:
+          RELEASE_PRERELEASE: ${{ steps.version.outputs.prerelease }}
           RELEASE_TAG: ${{ github.ref_name }}
         shell: bash
         run: |
@@ -289,14 +379,20 @@ jobs:
 
           git -C homebrew-tap config user.name "github-actions[bot]"
           git -C homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git -C homebrew-tap add Formula/fastmvm.rb
+          tap_paths=(Formula/fastmvm-pre.rb Aliases/fastmvm@pre)
+          release_channel="prerelease"
+          if [[ "${RELEASE_PRERELEASE}" == "false" ]]; then
+            tap_paths+=(Formula/fastmvm.rb)
+            release_channel="stable"
+          fi
+          git -C homebrew-tap add "${tap_paths[@]}"
 
           if git -C homebrew-tap diff --cached --quiet; then
             echo "Homebrew tap is already up to date."
             exit 0
           fi
 
-          git -C homebrew-tap commit -m "fastmvm ${RELEASE_TAG}"
+          git -C homebrew-tap commit -m "fastmvm ${RELEASE_TAG} (${release_channel})"
           git -C homebrew-tap push
 
       - name: Remove release keychain
