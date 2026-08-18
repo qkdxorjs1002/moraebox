@@ -2,9 +2,9 @@
 
 [한국어](README.ko.md)
 
-[![GitHub release](https://img.shields.io/github/v/release/paragonnov/fastmvm?include_prereleases)](https://github.com/paragonnov/fastmvm/releases)
+[![GitHub release](https://img.shields.io/github/v/release/qkdxorjs1002/fastmvm?include_prereleases)](https://github.com/qkdxorjs1002/fastmvm/releases)
 [![Rust 1.85+](https://img.shields.io/badge/Rust-1.85%2B-000000?logo=rust&logoColor=white)](Cargo.toml)
-[![CI](https://github.com/paragonnov/fastmvm/actions/workflows/ci.yml/badge.svg)](https://github.com/paragonnov/fastmvm/actions/workflows/ci.yml)
+[![CI](https://github.com/qkdxorjs1002/fastmvm/actions/workflows/ci.yml/badge.svg)](https://github.com/qkdxorjs1002/fastmvm/actions/workflows/ci.yml)
 
 **Disposable microVM execution for coding agents.** fastmvm is a daemonless Rust runtime that gives each one-shot command its own Linux microVM, streams its output, and destroys the sandbox on completion, timeout, cancellation, backend failure, or owner loss.
 
@@ -32,7 +32,7 @@ Coding-agent harnesses need more than a child process, but they should not need 
 The Homebrew release currently targets Apple Silicon macOS:
 
 ```sh
-brew tap paragonnov/tap
+brew tap qkdxorjs1002/tap
 brew install fastmvm
 fastmvm --version
 fastmvm doctor --json
@@ -292,13 +292,13 @@ Pushing a stable tag that exactly matches the workspace version, for example `0.
 2. Builds and release-signs `fastmvm`, `fastmvm-mcp`, and the entitled VMM helper.
 3. Verifies the signatures and packaged process-backend smoke path.
 4. Publishes the archive and SHA-256 file to GitHub Releases.
-5. Generates, validates, and pushes `Formula/fastmvm.rb` to `paragonnov/homebrew-tap`.
+5. Generates, validates, and pushes `Formula/fastmvm.rb` to `qkdxorjs1002/homebrew-tap`.
 
 Repository release secrets:
 
 | Secret | Purpose |
 | --- | --- |
-| `HOMEBREW_TAP_TOKEN` | Write access to `paragonnov/homebrew-tap` |
+| `HOMEBREW_TAP_TOKEN` | Write access to `qkdxorjs1002/homebrew-tap` |
 | `MACOS_CERTIFICATE_P12` | Base64-encoded signing certificate and private key |
 | `MACOS_CERTIFICATE_PASSWORD` | Password for the PKCS#12 bundle |
 | `MACOS_SIGNING_IDENTITY` | Identity passed to `codesign` |

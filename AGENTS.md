@@ -36,3 +36,6 @@ The development helper may be ad-hoc signed with `assets/fastmvm-vmm.entitlement
 - Keep generated build output under `target/` and runtime state under `.fastmvm/` or the platform cache directory.
 - Preserve user changes and never commit TAPL workflow data.
 - Do not commit credentials, registry tokens, guest secrets, VM disks, or trace files containing content.
+
+## Task Completion Rule
+- After complete tasks, create task branch and commit modified files.

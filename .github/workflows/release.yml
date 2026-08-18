@@ -1,0 +1,305 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish signed macOS release and Homebrew formula
+    runs-on: macos-15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Validate release tag
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${RELEASE_TAG}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tags must use x.y.z without a leading v; got ${RELEASE_TAG}." >&2
+            exit 1
+          fi
+
+          workspace_version="$(
+            cargo metadata --no-deps --format-version 1 |
+              python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(package["version"] for package in data["packages"] if package["name"] == "fastmvm-cli"))'
+          )"
+          if [[ "${RELEASE_TAG}" != "${workspace_version}" ]]; then
+            echo "Tag ${RELEASE_TAG} does not match workspace version ${workspace_version}." >&2
+            exit 1
+          fi
+
+          echo "version=${workspace_version}" >> "${GITHUB_OUTPUT}"
+          echo "archive=fastmvm-${workspace_version}-aarch64-apple-darwin.tar.gz" >> "${GITHUB_OUTPUT}"
+
+      - name: Require release credentials
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=()
+          for name in \
+            HOMEBREW_TAP_TOKEN \
+            MACOS_CERTIFICATE_P12 \
+            MACOS_CERTIFICATE_PASSWORD \
+            MACOS_SIGNING_IDENTITY; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("${name}")
+            fi
+          done
+
+          if (( ${#missing[@]} > 0 )); then
+            printf 'Missing required release secret: %s\n' "${missing[@]}" >&2
+            exit 1
+          fi
+
+      - name: Run release quality gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
+      - name: Build release binaries
+        shell: bash
+        run: >-
+          cargo build --release --locked
+          -p fastmvm-cli
+          -p fastmvm-mcp
+          -p fastmvm-vmm-helper
+
+      - name: Import release signing certificate
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          certificate_path="${RUNNER_TEMP}/fastmvm-release.p12"
+          keychain_path="${RUNNER_TEMP}/fastmvm-release.keychain-db"
+          keychain_password="$(uuidgen)"
+
+          printf '%s' "${MACOS_CERTIFICATE_P12}" | base64 --decode > "${certificate_path}"
+          security create-keychain -p "${keychain_password}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${keychain_password}" "${keychain_path}"
+          security import "${certificate_path}" \
+            -P "${MACOS_CERTIFICATE_PASSWORD}" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "${keychain_path}"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "${keychain_password}" \
+            "${keychain_path}"
+          security list-keychains -d user -s "${keychain_path}" login.keychain-db
+
+          echo "RELEASE_KEYCHAIN_PATH=${keychain_path}" >> "${GITHUB_ENV}"
+
+      - name: Sign and verify release binaries
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          codesign_args=(
+            --force
+            --options runtime
+            --timestamp
+            --sign "${MACOS_SIGNING_IDENTITY}"
+            --keychain "${RELEASE_KEYCHAIN_PATH}"
+          )
+
+          codesign "${codesign_args[@]}" target/release/fastmvm
+          codesign "${codesign_args[@]}" target/release/fastmvm-mcp
+          codesign "${codesign_args[@]}" \
+            --entitlements assets/fastmvm-vmm.entitlements \
+            target/release/fastmvm-vmm-helper
+
+          for binary in fastmvm fastmvm-mcp fastmvm-vmm-helper; do
+            codesign --verify --strict --verbose=2 "target/release/${binary}"
+          done
+          codesign -d --entitlements :- target/release/fastmvm-vmm-helper 2>&1 |
+            grep -q 'com.apple.security.hypervisor'
+
+      - name: Prepare release asset
+        id: asset
+        env:
+          ARCHIVE_NAME: ${{ steps.version.outputs.archive }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bundle="${RUNNER_TEMP}/fastmvm-${RELEASE_VERSION}"
+          mkdir -p "${bundle}" release-dist
+          install -m 0755 target/release/fastmvm "${bundle}/fastmvm"
+          install -m 0755 target/release/fastmvm-mcp "${bundle}/fastmvm-mcp"
+          install -m 0755 target/release/fastmvm-vmm-helper "${bundle}/fastmvm-vmm-helper"
+          install -m 0644 README.md "${bundle}/README.md"
+
+          tar -C "${bundle}" -czf "release-dist/${ARCHIVE_NAME}" .
+          archive_sha256="$(shasum -a 256 "release-dist/${ARCHIVE_NAME}" | awk '{print $1}')"
+          printf '%s  %s\n' "${archive_sha256}" "${ARCHIVE_NAME}" > \
+            "release-dist/${ARCHIVE_NAME}.sha256"
+
+          echo "sha256=${archive_sha256}" >> "${GITHUB_OUTPUT}"
+          ls -lh release-dist
+
+      - name: Smoke-test packaged binaries
+        env:
+          ARCHIVE_NAME: ${{ steps.version.outputs.archive }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          smoke_root="${RUNNER_TEMP}/fastmvm-smoke"
+          mkdir -p "${smoke_root}"
+          tar -C "${smoke_root}" -xzf "release-dist/${ARCHIVE_NAME}"
+          test "$("${smoke_root}/fastmvm" --version)" = "fastmvm ${RELEASE_VERSION}"
+          "${smoke_root}/fastmvm" run --backend process -- /usr/bin/true
+          "${smoke_root}/fastmvm-mcp" --help >/dev/null
+          "${smoke_root}/fastmvm-vmm-helper" --help >/dev/null
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" \
+              --title "fastmvm ${RELEASE_VERSION}" \
+              --prerelease=false
+            gh release upload "${RELEASE_TAG}" release-dist/* --clobber
+          else
+            gh release create "${RELEASE_TAG}" release-dist/* \
+              --title "fastmvm ${RELEASE_VERSION}" \
+              --generate-notes
+          fi
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v7
+        with:
+          repository: qkdxorjs1002/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update Homebrew formula
+        env:
+          ARCHIVE_NAME: ${{ steps.version.outputs.archive }}
+          ARCHIVE_SHA256: ${{ steps.asset.outputs.sha256 }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p homebrew-tap/Formula
+          ruby - "homebrew-tap/Formula/fastmvm.rb" <<'RUBY'
+          require "pathname"
+
+          formula_path = Pathname(ARGV.fetch(0))
+          repository = ENV.fetch("GITHUB_REPOSITORY")
+          tag = ENV.fetch("RELEASE_TAG")
+          version = ENV.fetch("RELEASE_VERSION")
+          archive = ENV.fetch("ARCHIVE_NAME")
+          sha256 = ENV.fetch("ARCHIVE_SHA256")
+
+          formula_path.write(<<~FORMULA)
+            class Fastmvm < Formula
+              desc "Disposable microVM sandbox for coding agents"
+              homepage "https://github.com/#{repository}"
+              url "https://github.com/#{repository}/releases/download/#{tag}/#{archive}"
+              sha256 "#{sha256}"
+              version "#{version}"
+              license "Apache-2.0"
+
+              depends_on arch: :arm64
+              depends_on :macos
+              depends_on "e2fsprogs"
+
+              def install
+                bin.install "fastmvm"
+                bin.install "fastmvm-mcp"
+                bin.install "fastmvm-vmm-helper"
+              end
+
+              def caveats
+                <<~EOS
+                  Native execution requires compatible released libkrun and libkrunfw libraries.
+                  Run `fastmvm doctor --json` to inspect the exact paths and signing gate.
+                EOS
+              end
+
+              test do
+                assert_match version.to_s, shell_output("\#{bin}/fastmvm --version")
+                assert_equal "fastmvm\\n",
+                             shell_output("\#{bin}/fastmvm run --backend process -- /bin/echo fastmvm")
+                assert_match "stdio MCP server", shell_output("\#{bin}/fastmvm-mcp --help")
+              end
+            end
+          FORMULA
+          RUBY
+
+          ruby -c homebrew-tap/Formula/fastmvm.rb
+          brew style homebrew-tap/Formula/fastmvm.rb
+
+      - name: Commit Homebrew formula
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git -C homebrew-tap config user.name "github-actions[bot]"
+          git -C homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C homebrew-tap add Formula/fastmvm.rb
+
+          if git -C homebrew-tap diff --cached --quiet; then
+            echo "Homebrew tap is already up to date."
+            exit 0
+          fi
+
+          git -C homebrew-tap commit -m "fastmvm ${RELEASE_TAG}"
+          git -C homebrew-tap push
+
+      - name: Remove release keychain
+        if: always() && env.RELEASE_KEYCHAIN_PATH != ''
+        shell: bash
+        run: security delete-keychain "${RELEASE_KEYCHAIN_PATH}" || true

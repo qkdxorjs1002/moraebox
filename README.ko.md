@@ -2,9 +2,9 @@
 
 [English](README.md)
 
-[![GitHub release](https://img.shields.io/github/v/release/paragonnov/fastmvm?include_prereleases)](https://github.com/paragonnov/fastmvm/releases)
+[![GitHub release](https://img.shields.io/github/v/release/qkdxorjs1002/fastmvm?include_prereleases)](https://github.com/qkdxorjs1002/fastmvm/releases)
 [![Rust 1.85+](https://img.shields.io/badge/Rust-1.85%2B-000000?logo=rust&logoColor=white)](Cargo.toml)
-[![CI](https://github.com/paragonnov/fastmvm/actions/workflows/ci.yml/badge.svg)](https://github.com/paragonnov/fastmvm/actions/workflows/ci.yml)
+[![CI](https://github.com/qkdxorjs1002/fastmvm/actions/workflows/ci.yml/badge.svg)](https://github.com/qkdxorjs1002/fastmvm/actions/workflows/ci.yml)
 
 **코딩 에이전트를 위한 일회용 microVM 실행 환경.** fastmvm은 데몬 없이 동작하는 Rust 런타임입니다. 일회성 명령마다 독립된 Linux microVM을 만들고 출력을 스트리밍하며, 실행 완료·타임아웃·취소·백엔드 실패·소유자 프로세스 종료 시 샌드박스를 폐기합니다.
 
@@ -32,7 +32,7 @@ Phase 0–5 수직 기능 묶음이 구현되어 있습니다. 네이티브 실�
 현재 Homebrew 릴리스 대상은 Apple Silicon macOS입니다.
 
 ```sh
-brew tap paragonnov/tap
+brew tap qkdxorjs1002/tap
 brew install fastmvm
 fastmvm --version
 fastmvm doctor --json
@@ -292,13 +292,13 @@ fastmvm doctor --json
 2. `fastmvm`, `fastmvm-mcp`, entitlement가 포함된 VMM helper를 빌드하고 릴리스 인증서로 서명합니다.
 3. 서명과 패키지의 process 백엔드 smoke 경로를 검증합니다.
 4. 아카이브와 SHA-256 파일을 GitHub Releases에 게시합니다.
-5. `Formula/fastmvm.rb`를 생성·검증해 `paragonnov/homebrew-tap`에 push합니다.
+5. `Formula/fastmvm.rb`를 생성·검증해 `qkdxorjs1002/homebrew-tap`에 push합니다.
 
 저장소 릴리스 secret:
 
 | Secret | 용도 |
 | --- | --- |
-| `HOMEBREW_TAP_TOKEN` | `paragonnov/homebrew-tap` 쓰기 권한 |
+| `HOMEBREW_TAP_TOKEN` | `qkdxorjs1002/homebrew-tap` 쓰기 권한 |
 | `MACOS_CERTIFICATE_P12` | base64로 인코딩한 서명 인증서와 private key |
 | `MACOS_CERTIFICATE_PASSWORD` | PKCS#12 bundle 비밀번호 |
 | `MACOS_SIGNING_IDENTITY` | `codesign`에 전달할 identity |
