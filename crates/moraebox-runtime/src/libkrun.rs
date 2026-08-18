@@ -195,6 +195,13 @@ fn spawn_pty(_command: Command, _spec: &RunSpec) -> Result<SpawnedSandbox, Backe
 
 #[derive(Debug)]
 struct LibkrunController {
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "libkrun helper signals are unsupported on this platform"
+        )
+    )]
     pid: Arc<u32>,
 }
 

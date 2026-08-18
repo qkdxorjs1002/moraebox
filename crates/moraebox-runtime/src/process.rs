@@ -68,6 +68,10 @@ impl Backend for ProcessBackend {
 
 #[derive(Debug)]
 struct ProcessController {
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "process signals are unsupported on this platform")
+    )]
     pid: Arc<u32>,
 }
 
