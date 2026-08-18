@@ -44,7 +44,9 @@ fastmvm --version
 fastmvm doctor --json
 ```
 
-Both formulae install `fastmvm`, `fastmvm-mcp`, the signed `fastmvm-vmm-helper`, and `e2fsprogs`. They conflict because they install the same executables; uninstall the current formula before switching channels. Native execution still requires compatible released libkrun and libkrunfw libraries. `doctor` reports the exact missing path, symbol, framework, or signing capability without changing the host.
+Both formulae download a checksummed release source archive and compile `fastmvm`, `fastmvm-mcp`, and `fastmvm-vmm-helper` on the Mac running `brew install`; no prebuilt fastmvm bottle or binary is downloaded. Homebrew supplies Rust as a build dependency, installs `e2fsprogs`, and ad-hoc signs the locally built helper with the Hypervisor entitlement. This signature does not identify a developer and is not Apple-notarized.
+
+The stable and prerelease formulae conflict because they install the same executables; uninstall the current formula before switching channels. Native execution still requires compatible released libkrun and libkrunfw libraries. `doctor` reports the exact missing path, symbol, framework, or signing capability without changing the host.
 
 ### Verify the portable path
 
@@ -100,7 +102,7 @@ codesign --force --sign - \
   target/release/fastmvm-vmm-helper
 ```
 
-Ad-hoc signing is for local development only. Published release helpers are signed by the release workflow.
+This is also the signing model used by the Homebrew formula: the helper is built and ad-hoc signed on the installation Mac. It carries the required entitlement but no Developer ID identity or Apple notarization.
 
 ## Run a sandbox
 
@@ -295,21 +297,18 @@ More project detail:
 Pushing a validated tag without a leading `v` starts [the release workflow](.github/workflows/release.yml). Stable tags use `x.y.z`; prerelease tags use `x.y.z-alphaN`, `x.y.z-betaN`, or `x.y.z-rcN`, for example `0.0.0-alpha1`. The tag is the release version and is synchronized into the runner's temporary workspace before the quality gate; the source commit is not rewritten. The workflow:
 
 1. Runs the full Rust quality gate on an Apple Silicon macOS runner.
-2. Builds and release-signs `fastmvm`, `fastmvm-mcp`, and the entitled VMM helper.
-3. Verifies the signatures and packaged process-backend smoke path.
-4. Publishes the archive and SHA-256 file to GitHub Releases, marking prerelease tags accordingly.
-5. Updates the rolling `Formula/fastmvm-pre.rb` and `fastmvm@pre` alias in `qkdxorjs1002/homebrew-tap`; stable tags also update `Formula/fastmvm.rb`.
+2. Creates a versioned source archive containing the synchronized workspace manifest and locked dependency set, then verifies its contents.
+3. Publishes only the source archive and SHA-256 file to GitHub Releases, marking prerelease tags accordingly.
+4. Updates the rolling `Formula/fastmvm-pre.rb` and `fastmvm@pre` alias in `qkdxorjs1002/homebrew-tap`; stable tags also update `Formula/fastmvm.rb`.
+5. On each `brew install`, the formula builds the three executables from that source with Cargo's locked dependencies and ad-hoc signs the installed VMM helper with `assets/fastmvm-vmm.entitlements`.
+
+The workflow does not publish fastmvm binaries or use Developer ID signing and Apple notarization. Each installation therefore performs its own source build; the resulting ad-hoc signature proves neither developer identity nor notarization.
 
 Repository release secrets:
 
 | Secret | Purpose |
 | --- | --- |
 | `HOMEBREW_TAP_TOKEN` | Write access to `qkdxorjs1002/homebrew-tap` |
-| `MACOS_CERTIFICATE_P12` | Base64-encoded signing certificate and private key |
-| `MACOS_CERTIFICATE_PASSWORD` | Password for the PKCS#12 bundle |
-| `MACOS_SIGNING_IDENTITY` | Identity passed to `codesign` |
-
-The workflow does not publish Linux, Windows, or Intel macOS binaries because those native adapters are not currently release-qualified.
 
 ## License
 
