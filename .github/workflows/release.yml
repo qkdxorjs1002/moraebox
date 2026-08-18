@@ -49,7 +49,7 @@ jobs:
 
           echo "version=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
           echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
-          echo "archive=fastmvm-${RELEASE_TAG}.tar.gz" >> "${GITHUB_OUTPUT}"
+          echo "archive=moraebox-${RELEASE_TAG}.tar.gz" >> "${GITHUB_OUTPUT}"
 
       - name: Synchronize workspace version
         env:
@@ -87,7 +87,7 @@ jobs:
 
           workspace_version="$(
             cargo metadata --no-deps --format-version 1 |
-              python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(package["version"] for package in data["packages"] if package["name"] == "fastmvm-cli"))'
+              python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(package["version"] for package in data["packages"] if package["name"] == "moraebox-cli"))'
           )"
           if [[ "${RELEASE_VERSION}" != "${workspace_version}" ]]; then
             echo "Could not synchronize workspace version to ${RELEASE_VERSION}; got ${workspace_version}." >&2
@@ -122,8 +122,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          staging_root="$(mktemp -d "${RUNNER_TEMP}/fastmvm-source.XXXXXX")"
-          bundle="${staging_root}/fastmvm-${RELEASE_VERSION}"
+          staging_root="$(mktemp -d "${RUNNER_TEMP}/moraebox-source.XXXXXX")"
+          bundle="${staging_root}/moraebox-${RELEASE_VERSION}"
           mkdir -p "${bundle}" release-dist
           git checkout-index --all --prefix="${bundle}/"
 
@@ -183,19 +183,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          verify_root="$(mktemp -d "${RUNNER_TEMP}/fastmvm-source-verify.XXXXXX")"
+          verify_root="$(mktemp -d "${RUNNER_TEMP}/moraebox-source-verify.XXXXXX")"
           tar -C "${verify_root}" -xzf "release-dist/${ARCHIVE_NAME}"
-          source_root="${verify_root}/fastmvm-${RELEASE_VERSION}"
+          source_root="${verify_root}/moraebox-${RELEASE_VERSION}"
           test -f "${source_root}/Cargo.toml"
           test -f "${source_root}/Cargo.lock"
-          test -f "${source_root}/assets/fastmvm-vmm.entitlements"
+          test -f "${source_root}/assets/moraebox-vmm.entitlements"
           test "$(
             cargo metadata \
               --manifest-path "${source_root}/Cargo.toml" \
               --locked \
               --no-deps \
               --format-version 1 |
-              python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(package["version"] for package in data["packages"] if package["name"] == "fastmvm-cli"))'
+              python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(package["version"] for package in data["packages"] if package["name"] == "moraebox-cli"))'
           )" = "${RELEASE_VERSION}"
 
       - name: Publish GitHub source release
@@ -210,7 +210,7 @@ jobs:
           set -euo pipefail
 
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            edit_args=(--title "fastmvm ${RELEASE_VERSION}")
+            edit_args=(--title "moraebox ${RELEASE_VERSION}")
             if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
               edit_args+=(--prerelease)
             else
@@ -218,7 +218,7 @@ jobs:
             fi
             gh release edit "${RELEASE_TAG}" "${edit_args[@]}"
 
-            existing_release_dir="$(mktemp -d "${RUNNER_TEMP}/fastmvm-existing-release.XXXXXX")"
+            existing_release_dir="$(mktemp -d "${RUNNER_TEMP}/moraebox-existing-release.XXXXXX")"
             if gh release download "${RELEASE_TAG}" \
               --pattern "${ARCHIVE_NAME}" \
               --dir "${existing_release_dir}" >/dev/null 2>&1; then
@@ -231,7 +231,7 @@ jobs:
             fi
             gh release upload "${RELEASE_TAG}" release-dist/* --clobber
           else
-            create_args=(--title "fastmvm ${RELEASE_VERSION}" --generate-notes)
+            create_args=(--title "moraebox ${RELEASE_VERSION}" --generate-notes)
             if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
               create_args+=(--prerelease)
             fi
@@ -284,39 +284,39 @@ jobs:
               depends_on "e2fsprogs"
               depends_on :macos
 
-              conflicts_with "#{conflict}", because: "both install the fastmvm executables"
+              conflicts_with "#{conflict}", because: "both install the moraebox executables"
 
               def install
-                system "cargo", "install", *std_cargo_args(path: "crates/fastmvm-cli")
-                system "cargo", "install", *std_cargo_args(path: "crates/fastmvm-mcp")
-                system "cargo", "install", *std_cargo_args(path: "crates/fastmvm-vmm-helper")
+                system "cargo", "install", *std_cargo_args(path: "crates/moraebox-cli")
+                system "cargo", "install", *std_cargo_args(path: "crates/moraebox-mcp")
+                system "cargo", "install", *std_cargo_args(path: "crates/moraebox-vmm-helper")
 
-                helper = bin/"fastmvm-vmm-helper"
+                helper = bin/"morae-vmm-helper"
                 helper.chmod 0755
                 system "/usr/bin/codesign", "--force", "--sign", "-",
-                       "--entitlements", "assets/fastmvm-vmm.entitlements", helper
+                       "--entitlements", "assets/moraebox-vmm.entitlements", helper
                 system "/usr/bin/codesign", "--verify", "--strict", helper
               end
 
               def caveats
                 <<~EOS
-                  Homebrew builds fastmvm on this Mac and ad-hoc signs the VMM helper
+                  Homebrew builds moraebox on this Mac and ad-hoc signs the VMM helper
                   with its Hypervisor entitlement. The signature does not identify a
                   developer and the locally built executable is not Apple-notarized.
 
                   Native execution also requires compatible released libkrun and
-                  libkrunfw libraries. Run `fastmvm doctor --json` to inspect the exact
+                  libkrunfw libraries. Run `morae doctor --json` to inspect the exact
                   paths and signing gate.
                 EOS
               end
 
               test do
-                assert_match version.to_s, shell_output("\#{bin}/fastmvm --version")
-                assert_equal "fastmvm\\n",
-                             shell_output("\#{bin}/fastmvm run --backend process -- /bin/echo fastmvm")
-                assert_match "stdio MCP server", shell_output("\#{bin}/fastmvm-mcp --help")
+                assert_match version.to_s, shell_output("\#{bin}/morae --version")
+                assert_equal "morae\\n",
+                             shell_output("\#{bin}/morae run --backend process -- /bin/echo morae")
+                assert_match "stdio MCP server", shell_output("\#{bin}/morae-mcp --help")
                 entitlements = shell_output(
-                  "/usr/bin/codesign -d --entitlements - \#{bin}/fastmvm-vmm-helper 2>&1",
+                  "/usr/bin/codesign -d --entitlements - \#{bin}/morae-vmm-helper 2>&1",
                 )
                 assert_match "com.apple.security.hypervisor", entitlements
               end
@@ -324,11 +324,11 @@ jobs:
             FORMULA
           end
 
-          pre_formula = tap_root/"Formula/fastmvm-pre.rb"
+          pre_formula = tap_root/"Formula/moraebox-pre.rb"
           pre_formula.write(
             formula_content(
-              class_name: "FastmvmPre",
-              conflict: "fastmvm",
+              class_name: "MoraeboxPre",
+              conflict: "moraebox",
               repository: repository,
               tag: tag,
               version: version,
@@ -336,13 +336,13 @@ jobs:
               sha256: sha256,
             ),
           )
-          FileUtils.ln_sf("../Formula/fastmvm-pre.rb", tap_root/"Aliases/fastmvm@pre")
+          FileUtils.ln_sf("../Formula/moraebox-pre.rb", tap_root/"Aliases/moraebox@pre")
 
           unless prerelease
-            (tap_root/"Formula/fastmvm.rb").write(
+            (tap_root/"Formula/moraebox.rb").write(
               formula_content(
-                class_name: "Fastmvm",
-                conflict: "fastmvm-pre",
+                class_name: "Moraebox",
+                conflict: "moraebox-pre",
                 repository: repository,
                 tag: tag,
                 version: version,
@@ -353,9 +353,9 @@ jobs:
           end
           RUBY
 
-          formula_files=(homebrew-tap/Formula/fastmvm-pre.rb)
+          formula_files=(homebrew-tap/Formula/moraebox-pre.rb)
           if [[ "${RELEASE_PRERELEASE}" == "false" ]]; then
-            formula_files+=(homebrew-tap/Formula/fastmvm.rb)
+            formula_files+=(homebrew-tap/Formula/moraebox.rb)
           fi
           for formula_file in "${formula_files[@]}"; do
             ruby -c "${formula_file}"
@@ -372,10 +372,10 @@ jobs:
 
           git -C homebrew-tap config user.name "github-actions[bot]"
           git -C homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          tap_paths=(Formula/fastmvm-pre.rb Aliases/fastmvm@pre)
+          tap_paths=(Formula/moraebox-pre.rb Aliases/moraebox@pre)
           release_channel="prerelease"
           if [[ "${RELEASE_PRERELEASE}" == "false" ]]; then
-            tap_paths+=(Formula/fastmvm.rb)
+            tap_paths+=(Formula/moraebox.rb)
             release_channel="stable"
           fi
           git -C homebrew-tap add "${tap_paths[@]}"
@@ -385,5 +385,5 @@ jobs:
             exit 0
           fi
 
-          git -C homebrew-tap commit -m "fastmvm ${RELEASE_TAG} (${release_channel})"
+          git -C homebrew-tap commit -m "moraebox ${RELEASE_TAG} (${release_channel})"
           git -C homebrew-tap push

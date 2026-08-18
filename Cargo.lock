@@ -270,102 +270,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fastmvm-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "fastmvm-core",
- "fastmvm-image",
- "fastmvm-runtime",
- "humantime",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "fastmvm-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "fastmvm-image"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "futures-util",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "thiserror",
- "tokio",
- "zstd",
-]
-
-[[package]]
-name = "fastmvm-mcp"
-version = "0.1.0"
-dependencies = [
- "base64",
- "clap",
- "fastmvm-core",
- "fastmvm-runtime",
- "fastmvm-sdk",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "fastmvm-protocol"
-version = "0.1.0"
-dependencies = [
- "prost",
- "thiserror",
-]
-
-[[package]]
-name = "fastmvm-runtime"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "fastmvm-core",
- "nix",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "fastmvm-sdk"
-version = "0.1.0"
-dependencies = [
- "fastmvm-core",
- "fastmvm-runtime",
- "serde",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "fastmvm-vmm-helper"
-version = "0.1.0"
-dependencies = [
- "clap",
- "libc",
- "libloading",
- "thiserror",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -815,6 +719,102 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "moraebox-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "humantime",
+ "moraebox-core",
+ "moraebox-image",
+ "moraebox-runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "moraebox-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "moraebox-image"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "zstd",
+]
+
+[[package]]
+name = "moraebox-mcp"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "clap",
+ "moraebox-core",
+ "moraebox-runtime",
+ "moraebox-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "moraebox-protocol"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "thiserror",
+]
+
+[[package]]
+name = "moraebox-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "moraebox-core",
+ "nix",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "moraebox-sdk"
+version = "0.1.0"
+dependencies = [
+ "moraebox-core",
+ "moraebox-runtime",
+ "serde",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "moraebox-vmm-helper"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "libloading",
+ "thiserror",
 ]
 
 [[package]]

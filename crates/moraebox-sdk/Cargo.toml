@@ -1,0 +1,17 @@
+[package]
+name = "moraebox-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+moraebox-core = { path = "../moraebox-core" }
+moraebox-runtime = { path = "../moraebox-runtime" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

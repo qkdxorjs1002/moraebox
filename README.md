@@ -1,22 +1,22 @@
-# fastmvm
+# moraebox
 
 [한국어](README.ko.md)
 
-[![GitHub release](https://img.shields.io/github/v/release/qkdxorjs1002/fastmvm?include_prereleases)](https://github.com/qkdxorjs1002/fastmvm/releases)
+[![GitHub release](https://img.shields.io/github/v/release/qkdxorjs1002/moraebox?include_prereleases)](https://github.com/qkdxorjs1002/moraebox/releases)
 [![Rust 1.85+](https://img.shields.io/badge/Rust-1.85%2B-000000?logo=rust&logoColor=white)](Cargo.toml)
-[![CI](https://github.com/qkdxorjs1002/fastmvm/actions/workflows/ci.yml/badge.svg)](https://github.com/qkdxorjs1002/fastmvm/actions/workflows/ci.yml)
+[![CI](https://github.com/qkdxorjs1002/moraebox/actions/workflows/ci.yml/badge.svg)](https://github.com/qkdxorjs1002/moraebox/actions/workflows/ci.yml)
 
-**Disposable microVM execution for coding agents.** fastmvm is a daemonless Rust runtime that gives each one-shot command its own Linux microVM, streams its output, and destroys the sandbox on completion, timeout, cancellation, backend failure, or owner loss.
+**Disposable microVM execution for coding agents.** moraebox is a daemonless Rust runtime that gives each one-shot command its own Linux microVM, streams its output, and destroys the sandbox on completion, timeout, cancellation, backend failure, or owner loss.
 
 The Phase 0–5 vertical slice is implemented. Native execution is currently release-qualified only on Apple Silicon macOS with compatible released libkrun and libkrunfw builds. Linux and Windows remain compile-and-test targets; the process backend is a deterministic test double and does **not** provide VM isolation.
 
 [Get started](#quick-start) · [Install](#installation) · [Run a sandbox](#run-a-sandbox) · [Use the MCP server](#mcp-server) · [Review the security model](#security-model)
 
-## Why fastmvm?
+## Why moraebox?
 
 Coding-agent harnesses need more than a child process, but they should not need a long-running privileged daemon or a reusable VM that retains untrusted state.
 
-| Need | fastmvm behavior |
+| Need | moraebox behavior |
 | --- | --- |
 | Strong one-shot ownership | One helper process and one fresh microVM belong to one sandbox run |
 | Predictable cleanup | Completion, timeout, cancellation, failure, and parent loss all converge on cleanup |
@@ -35,38 +35,38 @@ The Homebrew release currently targets Apple Silicon macOS:
 brew tap qkdxorjs1002/tap
 
 # Stable release
-brew install fastmvm
+brew install moraebox
 
 # Newest stable or prerelease
-brew install fastmvm@pre
+brew install moraebox@pre
 
-fastmvm --version
-fastmvm doctor --json
+morae --version
+morae doctor --json
 ```
 
-Both formulae download a checksummed release source archive and compile `fastmvm`, `fastmvm-mcp`, and `fastmvm-vmm-helper` on the Mac running `brew install`; no prebuilt fastmvm bottle or binary is downloaded. Homebrew supplies Rust as a build dependency, installs `e2fsprogs`, and ad-hoc signs the locally built helper with the Hypervisor entitlement. This signature does not identify a developer and is not Apple-notarized.
+Both formulae download a checksummed release source archive and compile `morae`, `morae-mcp`, and `morae-vmm-helper` on the Mac running `brew install`; no prebuilt moraebox bottle or binary is downloaded. Homebrew supplies Rust as a build dependency, installs `e2fsprogs`, and ad-hoc signs the locally built helper with the Hypervisor entitlement. This signature does not identify a developer and is not Apple-notarized.
 
 The stable and prerelease formulae conflict because they install the same executables; uninstall the current formula before switching channels. Native execution still requires compatible released libkrun and libkrunfw libraries. `doctor` reports the exact missing path, symbol, framework, or signing capability without changing the host.
 
 ### Verify the portable path
 
 ```sh
-fastmvm run --backend process -- /usr/bin/printf 'hello from fastmvm\n'
+morae run --backend process -- /usr/bin/printf 'hello from moraebox\n'
 ```
 
 This verifies the lifecycle and output path only. The process backend runs directly on the host and is **not a security sandbox**.
 
 ### Run a native microVM
 
-Point fastmvm at released native dependencies, then require the full readiness gate:
+Point moraebox at released native dependencies, then require the full readiness gate:
 
 ```sh
-export FASTMVM_HELPER_PATH="$(brew --prefix fastmvm)/bin/fastmvm-vmm-helper"
-export FASTMVM_LIBKRUN_PATH="/path/to/libkrun.dylib"
-export FASTMVM_LIB_DIR="/path/to/native/library-directory"
+export MORAE_HELPER_PATH="$(brew --prefix moraebox)/bin/morae-vmm-helper"
+export MORAE_LIBKRUN_PATH="/path/to/libkrun.dylib"
+export MORAE_LIB_DIR="/path/to/native/library-directory"
 
-fastmvm doctor --strict
-fastmvm run --image alpine@latest -- /bin/uname -a
+morae doctor --strict
+morae run --image alpine@latest -- /bin/uname -a
 ```
 
 The currently validated development stack is libkrun 1.19.4 with libkrunfw 5.5.0 on Apple Silicon macOS. The adapter detects the released libkrun 1.x root API and the explicit-resource 2.0 ABI at runtime; unreleased `main` ABI changes are not a compatibility target.
@@ -93,13 +93,13 @@ For source development:
 
 ```sh
 cargo build --release --locked \
-  -p fastmvm-cli \
-  -p fastmvm-mcp \
-  -p fastmvm-vmm-helper
+  -p moraebox-cli \
+  -p moraebox-mcp \
+  -p moraebox-vmm-helper
 
 codesign --force --sign - \
-  --entitlements assets/fastmvm-vmm.entitlements \
-  target/release/fastmvm-vmm-helper
+  --entitlements assets/moraebox-vmm.entitlements \
+  target/release/morae-vmm-helper
 ```
 
 This is also the signing model used by the Homebrew formula: the helper is built and ad-hoc signed on the installation Mac. It carries the required entitlement but no Developer ID identity or Apple notarization.
@@ -109,9 +109,9 @@ This is also the signing model used by the Homebrew formula: the helper is built
 ### Inspect native readiness
 
 ```sh
-fastmvm doctor
-fastmvm doctor --json
-fastmvm doctor --strict
+morae doctor
+morae doctor --json
+morae doctor --strict
 ```
 
 `--strict` returns a failure status unless the native backend is ready.
@@ -119,19 +119,19 @@ fastmvm doctor --strict
 ### Pull an OCI image
 
 ```sh
-fastmvm image pull alpine@latest --json
-fastmvm image pull ghcr.io/example/image:tag \
-  --cache-dir .fastmvm/cache
+morae image pull alpine@latest --json
+morae image pull ghcr.io/example/image:tag \
+  --cache-dir .moraebox/cache
 ```
 
-Registry manifests and blobs are digest-verified before layers are materialized. Registry credentials are accepted only as an explicit username/password pair through options or `FASTMVM_REGISTRY_USERNAME` and `FASTMVM_REGISTRY_PASSWORD`.
+Registry manifests and blobs are digest-verified before layers are materialized. Registry credentials are accepted only as an explicit username/password pair through options or `MORAE_REGISTRY_USERNAME` and `MORAE_REGISTRY_PASSWORD`.
 
 `oci-layout:` and `docker-archive:` references are parsed by the image layer but are not yet imported by the public CLI.
 
 ### Execute a command
 
 ```sh
-fastmvm run \
+morae run \
   --image alpine@latest \
   --cpus 2 \
   --memory-mib 512 \
@@ -142,7 +142,7 @@ fastmvm run \
 Everything after `--` is passed as an argv array. Shell syntax is interpreted only when you explicitly run a shell:
 
 ```sh
-fastmvm run --image alpine@latest -- /bin/sh -c 'printf "%s\n" "$HOME"'
+morae run --image alpine@latest -- /bin/sh -c 'printf "%s\n" "$HOME"'
 ```
 
 The guest environment is empty by default. Add individual values with `--env KEY=VALUE`, or use `--inherit-env` only when host environment forwarding is intentional.
@@ -150,8 +150,8 @@ The guest environment is empty by default. Add individual values with `--env KEY
 The default timeout is one hour:
 
 ```sh
-fastmvm run --backend process --timeout 10m -- /usr/bin/true
-fastmvm run --backend process --timeout none -- /usr/bin/true
+morae run --backend process --timeout 10m -- /usr/bin/true
+morae run --backend process --timeout none -- /usr/bin/true
 ```
 
 `none` (or `0`) is the explicit unlimited setting.
@@ -159,18 +159,18 @@ fastmvm run --backend process --timeout none -- /usr/bin/true
 ### Attach a read-only workspace
 
 ```sh
-fastmvm run \
+morae run \
   --rootfs /path/to/materialized-rootfs \
   --workspace ./project \
   -- /bin/sh -c 'cat /workspace/Cargo.toml'
 ```
 
-fastmvm walks the host tree without following symlinks, rejects unsafe entries, creates a mode-0444 ext4 image, and attaches it read-only at `/workspace`. The original host directory is never exposed directly through virtio-fs.
+moraebox walks the host tree without following symlinks, rejects unsafe entries, creates a mode-0444 ext4 image, and attaches it read-only at `/workspace`. The original host directory is never exposed directly through virtio-fs.
 
 ### Stream through a PTY
 
 ```sh
-fastmvm run --image alpine@latest --tty --interactive -- /bin/sh
+morae run --image alpine@latest --tty --interactive -- /bin/sh
 ```
 
 PTY allocation is available on the native backend. Live PTY resize on the macOS controller is not implemented yet.
@@ -178,7 +178,7 @@ PTY allocation is available on the native backend. Live PTY resize on the macOS 
 ### Benchmark the lifecycle
 
 ```sh
-fastmvm benchmark \
+morae benchmark \
   --backend process \
   --iterations 100 \
   -- /usr/bin/true
@@ -191,13 +191,13 @@ The JSON report includes minimum, p50, p95, p99, and maximum latency. The curren
 Start the newline-delimited stdio server with either backend:
 
 ```sh
-fastmvm-mcp --backend process
+morae-mcp --backend process
 
-FASTMVM_HELPER_PATH="$(brew --prefix fastmvm)/bin/fastmvm-vmm-helper" \
-FASTMVM_LIBKRUN_PATH="/path/to/libkrun.dylib" \
-FASTMVM_ROOTFS="/path/to/materialized-rootfs" \
-FASTMVM_LIB_DIR="/path/to/native/library-directory" \
-fastmvm-mcp --backend libkrun
+MORAE_HELPER_PATH="$(brew --prefix moraebox)/bin/morae-vmm-helper" \
+MORAE_LIBKRUN_PATH="/path/to/libkrun.dylib" \
+MORAE_ROOTFS="/path/to/materialized-rootfs" \
+MORAE_LIB_DIR="/path/to/native/library-directory" \
+morae-mcp --backend libkrun
 ```
 
 The MCP server keeps stdout exclusively for protocol messages; diagnostics go to stderr.
@@ -279,7 +279,7 @@ cargo test --workspace
 Native macOS changes additionally require:
 
 ```sh
-fastmvm doctor --json
+morae doctor --json
 ```
 
 Run the real-backend smoke suite when the signed helper, released libkrun/libkrunfw builds, and Hypervisor.framework capability are available. A skipped native check should name the exact missing capability.
@@ -299,10 +299,10 @@ Pushing a validated tag without a leading `v` starts [the release workflow](.git
 1. Runs the full Rust quality gate on an Apple Silicon macOS runner.
 2. Creates a versioned source archive containing the synchronized workspace manifest and locked dependency set, then verifies its contents.
 3. Publishes only the source archive and SHA-256 file to GitHub Releases, marking prerelease tags accordingly.
-4. Updates the rolling `Formula/fastmvm-pre.rb` and `fastmvm@pre` alias in `qkdxorjs1002/homebrew-tap`; stable tags also update `Formula/fastmvm.rb`.
-5. On each `brew install`, the formula builds the three executables from that source with Cargo's locked dependencies and ad-hoc signs the installed VMM helper with `assets/fastmvm-vmm.entitlements`.
+4. Updates the rolling `Formula/moraebox-pre.rb` and `moraebox@pre` alias in `qkdxorjs1002/homebrew-tap`; stable tags also update `Formula/moraebox.rb`.
+5. On each `brew install`, the formula builds the three executables from that source with Cargo's locked dependencies and ad-hoc signs the installed VMM helper with `assets/moraebox-vmm.entitlements`.
 
-The workflow does not publish fastmvm binaries or use Developer ID signing and Apple notarization. Each installation therefore performs its own source build; the resulting ad-hoc signature proves neither developer identity nor notarization.
+The workflow does not publish moraebox binaries or use Developer ID signing and Apple notarization. Each installation therefore performs its own source build; the resulting ad-hoc signature proves neither developer identity nor notarization.
 
 Repository release secrets:
 
@@ -312,4 +312,4 @@ Repository release secrets:
 
 ## License
 
-fastmvm is licensed under Apache-2.0.
+moraebox is licensed under Apache-2.0.

@@ -1,0 +1,24 @@
+[package]
+name = "moraebox-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "morae"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["env"] }
+moraebox-core = { path = "../moraebox-core" }
+moraebox-image = { path = "../moraebox-image" }
+moraebox-runtime = { path = "../moraebox-runtime" }
+humantime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,5 +1,6 @@
 .tapl/**
 target/
+.moraebox/
 .fastmvm/
 *.profraw
 *.trace.jsonl

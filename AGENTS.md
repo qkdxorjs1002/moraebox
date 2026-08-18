@@ -2,7 +2,7 @@
 
 ## Scope
 
-fastmvm is a Rust workspace for a disposable coding-agent sandbox. Keep the portable lifecycle independent from the native libkrun adapter. Do not make the process backend appear to provide VM isolation.
+moraebox is a Rust workspace for a disposable coding-agent sandbox. Keep the portable lifecycle independent from the native libkrun adapter. Do not make the process backend appear to provide VM isolation.
 
 ## Required invariants
 
@@ -26,14 +26,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Native macOS changes also require `fastmvm doctor --json` and the real-backend smoke suite when the signed dependencies are available. A skipped native check must state the exact missing capability.
+Native macOS changes also require `morae doctor --json` and the real-backend smoke suite when the signed dependencies are available. A skipped native check must state the exact missing capability.
 
-The development helper may be ad-hoc signed with `assets/fastmvm-vmm.entitlements`; release artifacts require the project release-signing workflow.
+Local and Homebrew-built helpers must be ad-hoc signed with `assets/moraebox-vmm.entitlements`; the release workflow publishes source archives rather than binaries.
 
 ## Dependency and file hygiene
 
 - Pin native ABI compatibility to a released libkrun version; do not silently consume unreleased `main` ABI changes.
-- Keep generated build output under `target/` and runtime state under `.fastmvm/` or the platform cache directory.
+- Keep generated build output under `target/` and runtime state under `.moraebox/` or the platform cache directory.
 - Preserve user changes and never commit TAPL workflow data.
 - Do not commit credentials, registry tokens, guest secrets, VM disks, or trace files containing content.
 

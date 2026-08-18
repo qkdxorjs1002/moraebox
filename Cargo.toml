@@ -1,13 +1,13 @@
 [workspace]
 members = [
-    "crates/fastmvm-core",
-    "crates/fastmvm-protocol",
-    "crates/fastmvm-image",
-    "crates/fastmvm-runtime",
-    "crates/fastmvm-sdk",
-    "crates/fastmvm-cli",
-    "crates/fastmvm-mcp",
-    "crates/fastmvm-vmm-helper",
+    "crates/moraebox-core",
+    "crates/moraebox-protocol",
+    "crates/moraebox-image",
+    "crates/moraebox-runtime",
+    "crates/moraebox-sdk",
+    "crates/moraebox-cli",
+    "crates/moraebox-mcp",
+    "crates/moraebox-vmm-helper",
 ]
 resolver = "2"
 
@@ -15,7 +15,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/qkdxorjs1002/fastmvm"
+repository = "https://github.com/qkdxorjs1002/moraebox"
 rust-version = "1.85"
 
 [workspace.dependencies]
