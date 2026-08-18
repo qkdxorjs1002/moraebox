@@ -251,7 +251,6 @@ jobs:
           ARCHIVE_SHA256: ${{ steps.source.outputs.sha256 }}
           RELEASE_PRERELEASE: ${{ steps.version.outputs.prerelease }}
           RELEASE_TAG: ${{ github.ref_name }}
-          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -264,24 +263,98 @@ jobs:
           tap_root = Pathname(ARGV.fetch(0))
           repository = ENV.fetch("GITHUB_REPOSITORY")
           tag = ENV.fetch("RELEASE_TAG")
-          version = ENV.fetch("RELEASE_VERSION")
           archive = ENV.fetch("ARCHIVE_NAME")
           sha256 = ENV.fetch("ARCHIVE_SHA256")
           prerelease = ENV.fetch("RELEASE_PRERELEASE") == "true"
 
-          def formula_content(class_name:, conflict:, repository:, tag:, version:, archive:, sha256:)
+          def libkrunfw_formula_content
+            <<~FORMULA
+            class Libkrunfw < Formula
+              desc "Dynamic library bundling a Linux kernel in a convenient storage format"
+              homepage "https://github.com/containers/libkrunfw"
+              url "https://github.com/containers/libkrunfw/releases/download/v5.5.0/libkrunfw-prebuilt-aarch64.tgz"
+              sha256 "5bfae6efee63dbdf04a8fac2a69d772d9f900af2f54c4429b4acdfd6d86b9979"
+              license all_of: ["GPL-2.0-only", "LGPL-2.1-only"]
+
+              depends_on arch: :arm64
+
+              def install
+                system "make"
+                system "make", "PREFIX=\#{prefix}", "install"
+              end
+
+              test do
+                (testpath/"test.c").write <<~EOS
+                  int krunfw_get_version();
+
+                  int main()
+                  {
+                    int version = krunfw_get_version();
+                    return version > 0 ? 0 : 1;
+                  }
+                EOS
+                system ENV.cc, "test.c", "-I\#{include}", "-L\#{lib}",
+                       "-lkrunfw", "-o", "test"
+                system "./test"
+              end
+            end
+            FORMULA
+          end
+
+          def libkrun_formula_content
+            <<~FORMULA
+            class Libkrun < Formula
+              desc "Dynamic library providing microVM-based process isolation"
+              homepage "https://github.com/libkrun/libkrun"
+              url "https://github.com/containers/libkrun/archive/refs/tags/v1.19.4.tar.gz"
+              sha256 "e8775fab2b460972a67ca6cd936296bb79cdb078d852d712a283cb290dd0b284"
+              license "Apache-2.0"
+
+              depends_on "lld" => :build
+              depends_on "rust" => :build
+              depends_on arch: :arm64
+              depends_on "dtc"
+              depends_on "libkrunfw"
+              depends_on "xz"
+
+              def install
+                system "make", "BLK=1", "NET=1", "TIMESYNC=1"
+                system "make", "PREFIX=\#{prefix}", "install"
+              end
+
+              test do
+                (testpath/"test.c").write <<~EOS
+                  #include <libkrun.h>
+
+                  int main()
+                  {
+                    int context = krun_create_ctx();
+                    (void)context;
+                    return 0;
+                  }
+                EOS
+                system ENV.cc, "test.c", "-I\#{include}", "-L\#{lib}",
+                       "-lkrun", "-o", "test"
+                system "./test"
+              end
+            end
+            FORMULA
+          end
+
+          def formula_content(class_name:, conflict:, repository:, tag:, archive:, sha256:)
             <<~FORMULA
             class #{class_name} < Formula
               desc "Disposable microVM sandbox for coding agents"
               homepage "https://github.com/#{repository}"
               url "https://github.com/#{repository}/releases/download/#{tag}/#{archive}"
-              version "#{version}"
               sha256 "#{sha256}"
               license "Apache-2.0"
 
               depends_on "rust" => :build
               depends_on arch: :arm64
               depends_on "e2fsprogs"
+              depends_on "libkrun"
+              depends_on "libkrunfw"
               depends_on :macos
 
               conflicts_with "#{conflict}", because: "both install the moraebox executables"
@@ -304,9 +377,14 @@ jobs:
                   with its Hypervisor entitlement. The signature does not identify a
                   developer and the locally built executable is not Apple-notarized.
 
-                  Native execution also requires compatible released libkrun and
-                  libkrunfw libraries. Run `morae doctor --json` to inspect the exact
-                  paths and signing gate.
+                  This formula also installs the pinned libkrun 1.19.4 and libkrunfw
+                  5.5.0 runtime dependencies from this tap. For native execution, use:
+
+                    export MORAE_LIBKRUN_PATH="\#{formula_opt_lib("libkrun")}/libkrun.dylib"
+                    export MORAE_LIBKRUNFW_PATH="\#{formula_opt_lib("libkrunfw")}/libkrunfw.dylib"
+                    export MORAE_LIB_DIR="\#{formula_opt_lib("libkrun")}:\#{formula_opt_lib("libkrunfw")}"
+
+                  Run `morae doctor --json` to inspect the exact paths and signing gate.
                 EOS
               end
 
@@ -315,6 +393,9 @@ jobs:
                 assert_equal "morae\\n",
                              shell_output("\#{bin}/morae run --backend process -- /bin/echo morae")
                 assert_match "stdio MCP server", shell_output("\#{bin}/morae-mcp --help")
+                doctor = JSON.parse(shell_output("\#{bin}/morae doctor --json"))
+                assert doctor.dig("libkrun", "found")
+                assert doctor.dig("libkrunfw", "found")
                 entitlements = shell_output(
                   "/usr/bin/codesign -d --entitlements - \#{bin}/morae-vmm-helper 2>&1",
                 )
@@ -324,6 +405,9 @@ jobs:
             FORMULA
           end
 
+          (tap_root/"Formula/libkrunfw.rb").write(libkrunfw_formula_content)
+          (tap_root/"Formula/libkrun.rb").write(libkrun_formula_content)
+
           pre_formula = tap_root/"Formula/moraebox-pre.rb"
           pre_formula.write(
             formula_content(
@@ -331,7 +415,6 @@ jobs:
               conflict: "moraebox",
               repository: repository,
               tag: tag,
-              version: version,
               archive: archive,
               sha256: sha256,
             ),
@@ -345,7 +428,6 @@ jobs:
                 conflict: "moraebox-pre",
                 repository: repository,
                 tag: tag,
-                version: version,
                 archive: archive,
                 sha256: sha256,
               ),
@@ -353,7 +435,11 @@ jobs:
           end
           RUBY
 
-          formula_files=(homebrew-tap/Formula/moraebox-pre.rb)
+          formula_files=(
+            homebrew-tap/Formula/libkrunfw.rb
+            homebrew-tap/Formula/libkrun.rb
+            homebrew-tap/Formula/moraebox-pre.rb
+          )
           if [[ "${RELEASE_PRERELEASE}" == "false" ]]; then
             formula_files+=(homebrew-tap/Formula/moraebox.rb)
           fi
@@ -372,7 +458,12 @@ jobs:
 
           git -C homebrew-tap config user.name "github-actions[bot]"
           git -C homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          tap_paths=(Formula/moraebox-pre.rb Aliases/moraebox@pre)
+          tap_paths=(
+            Formula/libkrunfw.rb
+            Formula/libkrun.rb
+            Formula/moraebox-pre.rb
+            Aliases/moraebox@pre
+          )
           release_channel="prerelease"
           if [[ "${RELEASE_PRERELEASE}" == "false" ]]; then
             tap_paths+=(Formula/moraebox.rb)

@@ -33,6 +33,7 @@ The Homebrew release currently targets Apple Silicon macOS:
 
 ```sh
 brew tap qkdxorjs1002/tap
+brew trust qkdxorjs1002/tap
 
 # Stable release
 brew install moraebox
@@ -44,9 +45,11 @@ morae --version
 morae doctor --json
 ```
 
-Both formulae download a checksummed release source archive and compile `morae`, `morae-mcp`, and `morae-vmm-helper` on the Mac running `brew install`; no prebuilt moraebox bottle or binary is downloaded. Homebrew supplies Rust as a build dependency, installs `e2fsprogs`, and ad-hoc signs the locally built helper with the Hypervisor entitlement. This signature does not identify a developer and is not Apple-notarized.
+Homebrew 6 requires explicit trust for third-party formulae. Trusting this tap allows Homebrew to resolve the pinned companion dependency formulae during the moraebox install.
 
-The stable and prerelease formulae conflict because they install the same executables; uninstall the current formula before switching channels. Native execution still requires compatible released libkrun and libkrunfw libraries. `doctor` reports the exact missing path, symbol, framework, or signing capability without changing the host.
+Both formulae download a checksummed release source archive and compile `morae`, `morae-mcp`, and `morae-vmm-helper` on the Mac running `brew install`; no prebuilt moraebox bottle or binary is downloaded. The same install also provides the pinned native runtime through companion `libkrun` 1.19.4 and `libkrunfw` 5.5.0 formulae in this tap. Homebrew supplies the build dependencies, installs `e2fsprogs`, and ad-hoc signs the locally built helper with the Hypervisor entitlement. This signature does not identify a developer and is not Apple-notarized.
+
+The stable and prerelease formulae conflict because they install the same executables; uninstall the current formula before switching channels. `doctor` reports the exact missing path, symbol, framework, or signing capability without changing the host.
 
 ### Verify the portable path
 
@@ -58,12 +61,13 @@ This verifies the lifecycle and output path only. The process backend runs direc
 
 ### Run a native microVM
 
-Point moraebox at released native dependencies, then require the full readiness gate:
+The Homebrew install supplies the validated native libraries. Point moraebox at their stable Homebrew prefixes, then require the full readiness gate:
 
 ```sh
 export MORAE_HELPER_PATH="$(brew --prefix moraebox)/bin/morae-vmm-helper"
-export MORAE_LIBKRUN_PATH="/path/to/libkrun.dylib"
-export MORAE_LIB_DIR="/path/to/native/library-directory"
+export MORAE_LIBKRUN_PATH="$(brew --prefix libkrun)/lib/libkrun.dylib"
+export MORAE_LIBKRUNFW_PATH="$(brew --prefix libkrunfw)/lib/libkrunfw.dylib"
+export MORAE_LIB_DIR="$(brew --prefix libkrun)/lib:$(brew --prefix libkrunfw)/lib"
 
 morae doctor --strict
 morae run --image alpine@latest -- /bin/uname -a
@@ -78,7 +82,7 @@ The currently validated development stack is libkrun 1.19.4 with libkrunfw 5.5.0
 For native execution:
 
 - Apple Silicon macOS with Hypervisor.framework.
-- Compatible released libkrun and libkrunfw builds.
+- Compatible released libkrun and libkrunfw builds (installed automatically by the Homebrew formula).
 - A helper signed with the `com.apple.security.hypervisor` entitlement.
 - `mke2fs` from `e2fsprogs` when attaching a host workspace.
 - Network access to the selected OCI registry when pulling an image.
@@ -194,9 +198,10 @@ Start the newline-delimited stdio server with either backend:
 morae-mcp --backend process
 
 MORAE_HELPER_PATH="$(brew --prefix moraebox)/bin/morae-vmm-helper" \
-MORAE_LIBKRUN_PATH="/path/to/libkrun.dylib" \
+MORAE_LIBKRUN_PATH="$(brew --prefix libkrun)/lib/libkrun.dylib" \
+MORAE_LIBKRUNFW_PATH="$(brew --prefix libkrunfw)/lib/libkrunfw.dylib" \
 MORAE_ROOTFS="/path/to/materialized-rootfs" \
-MORAE_LIB_DIR="/path/to/native/library-directory" \
+MORAE_LIB_DIR="$(brew --prefix libkrun)/lib:$(brew --prefix libkrunfw)/lib" \
 morae-mcp --backend libkrun
 ```
 
@@ -299,8 +304,8 @@ Pushing a validated tag without a leading `v` starts [the release workflow](.git
 1. Runs the full Rust quality gate on an Apple Silicon macOS runner.
 2. Creates a versioned source archive containing the synchronized workspace manifest and locked dependency set, then verifies its contents.
 3. Publishes only the source archive and SHA-256 file to GitHub Releases, marking prerelease tags accordingly.
-4. Updates the rolling `Formula/moraebox-pre.rb` and `moraebox@pre` alias in `qkdxorjs1002/homebrew-tap`; stable tags also update `Formula/moraebox.rb`.
-5. On each `brew install`, the formula builds the three executables from that source with Cargo's locked dependencies and ad-hoc signs the installed VMM helper with `assets/moraebox-vmm.entitlements`.
+4. Updates pinned `Formula/libkrun.rb` and `Formula/libkrunfw.rb`, the rolling `Formula/moraebox-pre.rb`, and the `moraebox@pre` alias in `qkdxorjs1002/homebrew-tap`; stable tags also update `Formula/moraebox.rb`.
+5. On each `brew install`, Homebrew installs the pinned native dependencies, builds libkrun and the three moraebox executables on that Mac, and ad-hoc signs the installed VMM helper with `assets/moraebox-vmm.entitlements`.
 
 The workflow does not publish moraebox binaries or use Developer ID signing and Apple notarization. Each installation therefore performs its own source build; the resulting ad-hoc signature proves neither developer identity nor notarization.
 

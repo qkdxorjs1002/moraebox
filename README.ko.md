@@ -33,6 +33,7 @@ Phase 0–5 수직 기능 묶음이 구현되어 있습니다. 네이티브 실�
 
 ```sh
 brew tap qkdxorjs1002/tap
+brew trust qkdxorjs1002/tap
 
 # 안정 릴리스
 brew install moraebox
@@ -44,9 +45,11 @@ morae --version
 morae doctor --json
 ```
 
-두 formula는 checksum으로 검증된 릴리스 소스 아카이브를 내려받아 `brew install`을 실행한 Mac에서 `morae`, `morae-mcp`, `morae-vmm-helper`를 컴파일합니다. 미리 빌드된 moraebox bottle이나 바이너리는 내려받지 않습니다. Homebrew가 Rust를 빌드 의존성으로 제공하고 `e2fsprogs`를 설치하며, 로컬에서 빌드한 helper에는 Hypervisor entitlement를 포함한 ad-hoc 서명을 적용합니다. 이 서명은 개발자 신원을 나타내지 않으며 Apple 공증을 받지 않습니다.
+Homebrew 6은 타사 formula에 명시적인 신뢰를 요구합니다. 이 tap을 신뢰하면 moraebox 설치 중 고정 companion dependency formula를 함께 해석할 수 있습니다.
 
-안정 및 prerelease formula는 같은 실행 파일을 설치하므로 서로 충돌합니다. 채널을 바꾸기 전에 현재 formula를 제거해야 합니다. 네이티브 실행에는 별도로 호환되는 정식 libkrun 및 libkrunfw 라이브러리가 필요합니다. `doctor`는 호스트를 변경하지 않고 누락된 경로, 심볼, 프레임워크, 서명 기능을 정확히 보고합니다.
+두 formula는 checksum으로 검증된 릴리스 소스 아카이브를 내려받아 `brew install`을 실행한 Mac에서 `morae`, `morae-mcp`, `morae-vmm-helper`를 컴파일합니다. 미리 빌드된 moraebox bottle이나 바이너리는 내려받지 않습니다. 같은 설치에서 이 tap의 companion formula를 통해 고정된 `libkrun` 1.19.4와 `libkrunfw` 5.5.0 native runtime도 제공합니다. Homebrew가 빌드 의존성과 `e2fsprogs`를 설치하며, 로컬에서 빌드한 helper에는 Hypervisor entitlement를 포함한 ad-hoc 서명을 적용합니다. 이 서명은 개발자 신원을 나타내지 않으며 Apple 공증을 받지 않습니다.
+
+안정 및 prerelease formula는 같은 실행 파일을 설치하므로 서로 충돌합니다. 채널을 바꾸기 전에 현재 formula를 제거해야 합니다. `doctor`는 호스트를 변경하지 않고 누락된 경로, 심볼, 프레임워크, 서명 기능을 정확히 보고합니다.
 
 ### 이식 가능한 실행 경로 확인
 
@@ -58,12 +61,13 @@ morae run --backend process -- /usr/bin/printf 'hello from moraebox\n'
 
 ### 네이티브 microVM 실행
 
-moraebox가 정식 네이티브 의존성을 찾을 수 있도록 설정한 다음 전체 준비 상태 검사를 요구합니다.
+Homebrew 설치가 검증된 native library를 제공합니다. moraebox가 안정적인 Homebrew prefix에서 이들을 찾도록 설정한 다음 전체 준비 상태 검사를 요구합니다.
 
 ```sh
 export MORAE_HELPER_PATH="$(brew --prefix moraebox)/bin/morae-vmm-helper"
-export MORAE_LIBKRUN_PATH="/path/to/libkrun.dylib"
-export MORAE_LIB_DIR="/path/to/native/library-directory"
+export MORAE_LIBKRUN_PATH="$(brew --prefix libkrun)/lib/libkrun.dylib"
+export MORAE_LIBKRUNFW_PATH="$(brew --prefix libkrunfw)/lib/libkrunfw.dylib"
+export MORAE_LIB_DIR="$(brew --prefix libkrun)/lib:$(brew --prefix libkrunfw)/lib"
 
 morae doctor --strict
 morae run --image alpine@latest -- /bin/uname -a
@@ -78,7 +82,7 @@ morae run --image alpine@latest -- /bin/uname -a
 네이티브 실행:
 
 - Hypervisor.framework를 제공하는 Apple Silicon macOS
-- 호환되는 정식 libkrun 및 libkrunfw 빌드
+- 호환되는 정식 libkrun 및 libkrunfw 빌드(Homebrew formula가 자동 설치)
 - `com.apple.security.hypervisor` entitlement로 서명된 helper
 - 호스트 워크스페이스 연결 시 `e2fsprogs`의 `mke2fs`
 - 이미지 pull 시 선택한 OCI 레지스트리에 대한 네트워크 접근
@@ -194,9 +198,10 @@ JSON 보고서에는 최소, p50, p95, p99, 최대 지연 시간이 포함됩니
 morae-mcp --backend process
 
 MORAE_HELPER_PATH="$(brew --prefix moraebox)/bin/morae-vmm-helper" \
-MORAE_LIBKRUN_PATH="/path/to/libkrun.dylib" \
+MORAE_LIBKRUN_PATH="$(brew --prefix libkrun)/lib/libkrun.dylib" \
+MORAE_LIBKRUNFW_PATH="$(brew --prefix libkrunfw)/lib/libkrunfw.dylib" \
 MORAE_ROOTFS="/path/to/materialized-rootfs" \
-MORAE_LIB_DIR="/path/to/native/library-directory" \
+MORAE_LIB_DIR="$(brew --prefix libkrun)/lib:$(brew --prefix libkrunfw)/lib" \
 morae-mcp --backend libkrun
 ```
 
@@ -299,8 +304,8 @@ morae doctor --json
 1. Apple Silicon macOS runner에서 전체 Rust 품질 게이트를 실행합니다.
 2. 동기화한 workspace manifest와 잠긴 의존성 집합을 포함하는 버전별 소스 아카이브를 만들고 내용을 검증합니다.
 3. GitHub Releases에는 소스 아카이브와 SHA-256 파일만 게시하고 prerelease 태그를 그에 맞게 표시합니다.
-4. `qkdxorjs1002/homebrew-tap`의 rolling `Formula/moraebox-pre.rb`와 `moraebox@pre` alias를 갱신하며, 안정 태그일 때는 `Formula/moraebox.rb`도 갱신합니다.
-5. 각 `brew install`에서 formula가 해당 소스와 Cargo의 잠긴 의존성으로 세 실행 파일을 빌드하고, 설치된 VMM helper에 `assets/moraebox-vmm.entitlements`를 사용한 ad-hoc 서명을 적용합니다.
+4. `qkdxorjs1002/homebrew-tap`의 고정 `Formula/libkrun.rb`와 `Formula/libkrunfw.rb`, rolling `Formula/moraebox-pre.rb`, `moraebox@pre` alias를 갱신하며, 안정 태그일 때는 `Formula/moraebox.rb`도 갱신합니다.
+5. 각 `brew install`에서 Homebrew가 고정 native 의존성을 설치하고 libkrun과 moraebox 실행 파일 세 개를 해당 Mac에서 빌드한 뒤, 설치된 VMM helper에 `assets/moraebox-vmm.entitlements`를 사용한 ad-hoc 서명을 적용합니다.
 
 워크플로는 moraebox 바이너리를 게시하지 않으며 Developer ID 서명과 Apple 공증도 사용하지 않습니다. 따라서 설치할 때마다 소스를 직접 빌드하며, 결과의 ad-hoc 서명은 개발자 신원이나 공증을 증명하지 않습니다.
 
