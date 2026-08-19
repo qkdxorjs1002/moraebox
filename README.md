@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/moraebox.png" alt="moraebox sandcastle logo" width="320">
+</p>
+
 # moraebox
 
 [한국어](README.ko.md)

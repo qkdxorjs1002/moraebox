@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/moraebox.png" alt="모래성 모양의 moraebox 로고" width="320">
+</p>
+
 # moraebox
 
 [English](README.md)
