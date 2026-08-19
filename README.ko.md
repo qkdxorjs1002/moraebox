@@ -205,14 +205,16 @@ MCP 서버는 stdout을 프로토콜 메시지 전용으로 유지하며 진단 
 지원하는 에이전트에 `moraebox`를 사용자 전역 stdio MCP 서버로 등록합니다.
 
 ```sh
-morae-mcp install codex --rootfs /absolute/path/to/materialized-rootfs
-morae-mcp install claude-code --rootfs /absolute/path/to/materialized-rootfs
+morae image pull alpine@latest
+morae-mcp install codex
+morae-mcp install claude-code
 ```
 
-`--rootfs` 대신 `MORAE_ROOTFS`를 사용할 수 있습니다. 등록 명령은 에이전트의 공식 CLI를 argv 배열로 호출하며 설정 파일을 직접 편집하지 않습니다. 설정을 바꾸지 않고 실행할 프로그램과 argv를 미리 확인할 수 있습니다.
+`--rootfs`와 `MORAE_ROOTFS`가 없으면 `.moraebox/cache/rootfs/sha256`에서 완료된 rootfs가 정확히 하나인지 찾아 절대 경로로 등록합니다. 먼저 같은 디렉터리에서 `morae image pull`을 실행합니다. 다른 캐시는 `--cache-dir /path/to/cache`로 지정하고, 캐시에 이미지가 여러 개이면 `--rootfs /absolute/path/to/rootfs`로 하나를 명시합니다.
+
+등록 명령은 에이전트의 공식 CLI를 argv 배열로 호출하며 설정 파일을 직접 편집하지 않습니다. 설정을 바꾸지 않고 실행할 프로그램과 argv를 미리 확인할 수 있습니다.
 
 ```sh
-MORAE_ROOTFS="/absolute/path/to/materialized-rootfs" \
 morae-mcp install codex --dry-run
 ```
 

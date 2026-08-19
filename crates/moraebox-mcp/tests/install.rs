@@ -1,4 +1,8 @@
-use std::process::{Command, Output};
+use std::{
+    fs,
+    path::PathBuf,
+    process::{Command, Output},
+};
 
 use serde_json::{Value, json};
 
@@ -101,20 +105,57 @@ fn process_dry_run_warns_and_never_claims_isolation() {
 }
 
 #[test]
-fn libkrun_install_requires_rootfs_before_agent_execution() {
+fn libkrun_install_reports_how_to_prepare_a_missing_rootfs() {
+    let cache_dir = std::env::temp_dir().join(format!(
+        "moraebox-mcp-install-missing-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&cache_dir);
     let output = run_mcp(&[
         "install",
         "codex",
         "--server-command",
         "morae-mcp",
+        "--cache-dir",
+        cache_dir.to_str().unwrap(),
         "--dry-run",
     ]);
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("libkrun registration requires --rootfs or MORAE_ROOTFS")
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no prepared rootfs found"));
+    assert!(stderr.contains("morae image pull alpine@latest"));
+}
+
+#[test]
+fn both_agents_discover_a_single_completed_cached_rootfs() {
+    let cache = TestCache::new();
+    let expected_rootfs = cache.add_rootfs();
+
+    for agent in ["codex", "claude-code"] {
+        let output = run_mcp(&[
+            "install",
+            agent,
+            "--cache-dir",
+            cache.path.to_str().unwrap(),
+            "--server-command",
+            "morae-mcp",
+            "--dry-run",
+        ]);
+        assert!(
+            output.status.success(),
+            "unexpected stderr for {agent}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let assignment = format!("MORAE_ROOTFS={}", expected_rootfs.display());
+        assert!(
+            value["args"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(assignment))
+        );
+    }
 }
 
 #[test]
@@ -125,4 +166,30 @@ fn unconfigured_bare_invocation_prints_help() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Usage: morae-mcp [OPTIONS] [COMMAND]"));
     assert!(stdout.contains("install"));
+}
+
+struct TestCache {
+    path: PathBuf,
+}
+
+impl TestCache {
+    fn new() -> Self {
+        let path =
+            std::env::temp_dir().join(format!("moraebox-mcp-install-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        Self { path }
+    }
+
+    fn add_rootfs(&self) -> PathBuf {
+        let rootfs = self.path.join("rootfs/sha256/digest");
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::write(rootfs.join(".moraebox-rootfs-complete"), "digest").unwrap();
+        rootfs.canonicalize().unwrap()
+    }
+}
+
+impl Drop for TestCache {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }

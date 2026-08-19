@@ -205,14 +205,16 @@ The MCP server keeps stdout exclusively for protocol messages; diagnostics go to
 Register `moraebox` as a user-wide stdio MCP server with either supported agent:
 
 ```sh
-morae-mcp install codex --rootfs /absolute/path/to/materialized-rootfs
-morae-mcp install claude-code --rootfs /absolute/path/to/materialized-rootfs
+morae image pull alpine@latest
+morae-mcp install codex
+morae-mcp install claude-code
 ```
 
-`MORAE_ROOTFS` can replace `--rootfs`. The installer invokes the agent's official CLI as an argv array and does not edit its configuration files directly. Preview the exact program and argv without changing configuration:
+When `--rootfs` and `MORAE_ROOTFS` are absent, the installer searches `.moraebox/cache/rootfs/sha256` for exactly one completed root filesystem and registers its absolute path. Run `morae image pull` from the same directory first. Use `--cache-dir /path/to/cache` for a different cache, or `--rootfs /absolute/path/to/rootfs` to select explicitly when the cache contains multiple images.
+
+The installer invokes the agent's official CLI as an argv array and does not edit its configuration files directly. Preview the exact program and argv without changing configuration:
 
 ```sh
-MORAE_ROOTFS="/absolute/path/to/materialized-rootfs" \
 morae-mcp install codex --dry-run
 ```
 

@@ -1,6 +1,7 @@
 use std::{
     env,
     ffi::{OsStr, OsString},
+    fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -52,6 +53,9 @@ pub struct InstallArgs {
     /// Root filesystem registered for the libkrun backend.
     #[arg(long, env = "MORAE_ROOTFS")]
     rootfs: Option<PathBuf>,
+    /// Cache searched for a single prepared root filesystem.
+    #[arg(long, default_value = ".moraebox/cache")]
+    cache_dir: PathBuf,
     /// Override the automatically discovered signed VMM helper.
     #[arg(long, env = "MORAE_HELPER_PATH")]
     helper: Option<PathBuf>,
@@ -186,10 +190,7 @@ fn server_configuration(install: &InstallArgs) -> Result<ServerConfiguration, St
         ));
     }
 
-    let rootfs = install
-        .rootfs
-        .as_ref()
-        .ok_or("libkrun registration requires --rootfs or MORAE_ROOTFS")?;
+    let rootfs = resolve_rootfs(install)?;
     let mut environment = vec![("MORAE_ROOTFS", rootfs.as_os_str().to_owned())];
     for (name, path) in [
         ("MORAE_HELPER_PATH", install.helper.as_ref()),
@@ -209,6 +210,81 @@ fn server_configuration(install: &InstallArgs) -> Result<ServerConfiguration, St
         install.memory_mib.to_string().into(),
     ];
     Ok((environment, server_args))
+}
+
+fn resolve_rootfs(install: &InstallArgs) -> Result<PathBuf, String> {
+    if let Some(rootfs) = &install.rootfs {
+        return Ok(rootfs.clone());
+    }
+
+    discover_cached_rootfs(&install.cache_dir)
+}
+
+fn discover_cached_rootfs(cache_dir: &Path) -> Result<PathBuf, String> {
+    let directory = cache_dir.join("rootfs").join("sha256");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(no_cached_rootfs_message(&directory));
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect rootfs cache {}: {error}",
+                directory.display()
+            ));
+        }
+    };
+
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to inspect rootfs cache {}: {error}",
+                directory.display()
+            )
+        })?;
+        let path = entry.path();
+        let is_directory = entry
+            .file_type()
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?
+            .is_dir();
+        if is_directory && has_complete_marker(&path) {
+            candidates.push(path);
+        }
+    }
+    candidates.sort();
+
+    match candidates.as_slice() {
+        [] => Err(no_cached_rootfs_message(&directory)),
+        [rootfs] => rootfs.canonicalize().map_err(|error| {
+            format!(
+                "failed to resolve cached rootfs {}: {error}",
+                rootfs.display()
+            )
+        }),
+        _ => Err(format!(
+            "found {} prepared rootfs directories in {}; pass --rootfs to choose one",
+            candidates.len(),
+            directory.display()
+        )),
+    }
+}
+
+fn has_complete_marker(rootfs: &Path) -> bool {
+    [
+        ".moraebox-rootfs-complete",
+        // Compatibility with root filesystems materialized before the project rename.
+        ".fastmvm-rootfs-complete",
+    ]
+    .iter()
+    .any(|marker| rootfs.join(marker).is_file())
+}
+
+fn no_cached_rootfs_message(directory: &Path) -> String {
+    format!(
+        "no prepared rootfs found in {}; run `morae image pull alpine@latest`, or pass --rootfs",
+        directory.display()
+    )
 }
 
 fn env_assignment(key: &str, value: &OsStr) -> OsString {
@@ -278,6 +354,7 @@ mod tests {
             name: "moraebox".into(),
             backend: RegistrationBackend::Libkrun,
             rootfs: Some("/rootfs".into()),
+            cache_dir: ".moraebox/cache".into(),
             helper: None,
             libkrun: None,
             lib_dir: None,
@@ -359,18 +436,76 @@ mod tests {
     }
 
     #[test]
-    fn libkrun_registration_requires_rootfs() {
+    fn libkrun_registration_reports_missing_cached_rootfs() {
+        let cache = TestCache::new("missing");
         let mut install = install_args(Agent::Codex);
         install.rootfs = None;
-        assert_eq!(
-            server_configuration(&install).unwrap_err(),
-            "libkrun registration requires --rootfs or MORAE_ROOTFS"
-        );
+        install.cache_dir = cache.path.clone();
+        let error = server_configuration(&install).unwrap_err();
+        assert!(error.contains("no prepared rootfs found"));
+        assert!(error.contains("morae image pull alpine@latest"));
+    }
+
+    #[test]
+    fn discovers_single_completed_cached_rootfs() {
+        let cache = TestCache::new("single");
+        let rootfs = cache.add_rootfs("digest", ".moraebox-rootfs-complete");
+        let mut install = install_args(Agent::ClaudeCode);
+        install.rootfs = None;
+        install.cache_dir = cache.path.clone();
+
+        let (environment, _) = server_configuration(&install).unwrap();
+        assert_eq!(environment, [("MORAE_ROOTFS", rootfs.into_os_string())]);
+    }
+
+    #[test]
+    fn accepts_rootfs_from_legacy_complete_marker() {
+        let cache = TestCache::new("legacy");
+        let rootfs = cache.add_rootfs("digest", ".fastmvm-rootfs-complete");
+        assert_eq!(discover_cached_rootfs(&cache.path).unwrap(), rootfs);
+    }
+
+    #[test]
+    fn refuses_to_choose_between_multiple_cached_rootfs_directories() {
+        let cache = TestCache::new("multiple");
+        cache.add_rootfs("digest-a", ".moraebox-rootfs-complete");
+        cache.add_rootfs("digest-b", ".moraebox-rootfs-complete");
+        let error = discover_cached_rootfs(&cache.path).unwrap_err();
+        assert!(error.contains("found 2 prepared rootfs directories"));
+        assert!(error.contains("pass --rootfs"));
     }
 
     #[test]
     fn validates_portable_server_names() {
         assert_eq!(parse_server_name("moraebox_2").unwrap(), "moraebox_2");
         assert!(parse_server_name("morae box").is_err());
+    }
+
+    struct TestCache {
+        path: PathBuf,
+    }
+
+    impl TestCache {
+        fn new(label: &str) -> Self {
+            let path = env::temp_dir().join(format!(
+                "moraebox-mcp-registration-{label}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            Self { path }
+        }
+
+        fn add_rootfs(&self, digest: &str, marker: &str) -> PathBuf {
+            let rootfs = self.path.join("rootfs/sha256").join(digest);
+            fs::create_dir_all(&rootfs).unwrap();
+            fs::write(rootfs.join(marker), digest).unwrap();
+            rootfs.canonicalize().unwrap()
+        }
+    }
+
+    impl Drop for TestCache {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
