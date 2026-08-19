@@ -24,6 +24,7 @@ type SetWorkdir = unsafe extern "C" fn(u32, *const c_char) -> i32;
 type DisableImplicitVsock = unsafe extern "C" fn(u32) -> i32;
 type AddVsock = unsafe extern "C" fn(u32, u32) -> i32;
 type AddDisk = unsafe extern "C" fn(u32, *const c_char, *const c_char, bool) -> i32;
+type DisableImplicitConsole = unsafe extern "C" fn(u32) -> i32;
 type AddVirtioConsoleDefault = unsafe extern "C" fn(u32, i32, i32, i32) -> i32;
 type StartEnter = unsafe extern "C" fn(u32) -> i32;
 
@@ -153,6 +154,7 @@ struct KrunApi {
     disable_implicit_vsock: Option<DisableImplicitVsock>,
     add_vsock: AddVsock,
     add_disk: Option<AddDisk>,
+    disable_implicit_console: Option<DisableImplicitConsole>,
     add_virtio_console_default: Option<AddVirtioConsoleDefault>,
     start_enter: StartEnter,
 }
@@ -175,6 +177,7 @@ impl KrunApi {
             disable_implicit_vsock: optional(&library, b"krun_disable_implicit_vsock\0"),
             add_vsock: required(&library, b"krun_add_vsock\0")?,
             add_disk: optional(&library, b"krun_add_disk\0"),
+            disable_implicit_console: optional(&library, b"krun_disable_implicit_console\0"),
             add_virtio_console_default: optional(&library, b"krun_add_virtio_console_default\0"),
             start_enter: required(&library, b"krun_start_enter\0")?,
             _library: library,
@@ -235,9 +238,26 @@ impl KrunApi {
     }
 
     fn configure_console(&self, context: u32) -> Result<(), HelperError> {
-        let Some(add_console) = self.add_virtio_console_default else {
+        Self::configure_console_with(
+            context,
+            self.disable_implicit_console,
+            self.add_virtio_console_default,
+        )
+    }
+
+    fn configure_console_with(
+        context: u32,
+        disable_implicit: Option<DisableImplicitConsole>,
+        add_console: Option<AddVirtioConsoleDefault>,
+    ) -> Result<(), HelperError> {
+        let (Some(disable_implicit), Some(add_console)) = (disable_implicit, add_console) else {
+            // Older libkrun releases still provide one implicit console wired to stdio.
             return Ok(());
         };
+        Self::check("krun_disable_implicit_console", unsafe {
+            // SAFETY: the function ABI and live context are validated by construction.
+            disable_implicit(context)
+        })?;
         Self::check("krun_add_virtio_console_default", unsafe {
             // SAFETY: descriptors 0/1/2 are owned by this helper and remain valid for VM life.
             add_console(context, 0, 1, 2)
@@ -402,6 +422,34 @@ enum HelperError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    static CONSOLE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static CONSOLE_CALL_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn record_disable_implicit_console(context: u32) -> i32 {
+        if context == 7 {
+            let _ =
+                CONSOLE_CALL_SEQUENCE.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
+        }
+        0
+    }
+
+    unsafe extern "C" fn record_add_console(
+        context: u32,
+        input_fd: i32,
+        output_fd: i32,
+        err_fd: i32,
+    ) -> i32 {
+        if (context, input_fd, output_fd, err_fd) == (7, 0, 1, 2) {
+            let _ =
+                CONSOLE_CALL_SEQUENCE.compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst);
+        }
+        0
+    }
 
     #[test]
     fn builds_null_terminated_arrays() {
@@ -421,5 +469,30 @@ mod tests {
         let wrapped = workspace_command(&["/bin/echo".into(), "hello".into()]);
         assert_eq!(&wrapped[4..], ["/bin/echo", "hello"]);
         assert!(wrapped[2].contains("-o ro"));
+    }
+
+    #[test]
+    fn disables_implicit_console_before_adding_explicit_console() {
+        let _guard = CONSOLE_TEST_LOCK.lock().unwrap();
+        CONSOLE_CALL_SEQUENCE.store(0, Ordering::SeqCst);
+
+        KrunApi::configure_console_with(
+            7,
+            Some(record_disable_implicit_console),
+            Some(record_add_console),
+        )
+        .unwrap();
+
+        assert_eq!(CONSOLE_CALL_SEQUENCE.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn keeps_implicit_console_when_disable_api_is_unavailable() {
+        let _guard = CONSOLE_TEST_LOCK.lock().unwrap();
+        CONSOLE_CALL_SEQUENCE.store(0, Ordering::SeqCst);
+
+        KrunApi::configure_console_with(7, None, Some(record_add_console)).unwrap();
+
+        assert_eq!(CONSOLE_CALL_SEQUENCE.load(Ordering::SeqCst), 0);
     }
 }
