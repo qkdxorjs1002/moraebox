@@ -17,6 +17,16 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 
 const PROTOCOL_VERSION: &str = "2026-07-28";
+const SERVER_INSTRUCTIONS: &str = concat!(
+    "Use sandbox_exec when a command benefits from a disposable execution environment, ",
+    "including untrusted code, dependency installation, isolated experiments, reproducible ",
+    "Linux checks, or long-running sessions. Use wait=true for one-shot commands and ",
+    "wait=false to start sessions; use sandbox_io for cursor-based I/O and sandbox_stop to ",
+    "terminate and clean up sessions. Only the libkrun backend provides VM isolation; the ",
+    "process backend is for deterministic development and is not isolated. Host workspace ",
+    "files are not attached automatically, so use this server only when required inputs ",
+    "already exist in the guest."
+);
 
 #[derive(Debug, Parser)]
 #[command(name = "morae-mcp", about = "stdio MCP server for moraebox")]
@@ -212,7 +222,7 @@ async fn handle_request(sdk: &SandboxSdk, request: Value) -> Value {
                 "protocolVersion": request.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION),
                 "capabilities": { "tools": { "listChanged": false } },
                 "serverInfo": { "name": "moraebox", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "Use sandbox_exec for one-shot or session execution, sandbox_io for cursor I/O, and sandbox_stop for cleanup."
+                "instructions": SERVER_INSTRUCTIONS
             }),
         ),
         "ping" => success(id, json!({})),
@@ -374,8 +384,8 @@ fn tools_list() -> Value {
         "tools": [
             {
                 "name": "sandbox_exec",
-                "title": "Execute in sandbox",
-                "description": "Start a disposable sandbox command. Set wait=false for an interactive/long-running session.",
+                "title": "Execute in configured runtime",
+                "description": "Start a command in the configured runtime. With the libkrun backend, prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Set wait=false to start a session.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -499,12 +509,36 @@ mod tests {
             initialized.pointer("/result/protocolVersion"),
             Some(&json!("2025-11-25"))
         );
+        let instructions = initialized
+            .pointer("/result/instructions")
+            .and_then(Value::as_str)
+            .unwrap();
+        for expected in [
+            "untrusted code",
+            "dependency installation",
+            "long-running sessions",
+            "Only the libkrun backend provides VM isolation",
+            "process backend is for deterministic development and is not isolated",
+            "Host workspace files are not attached automatically",
+        ] {
+            assert!(instructions.contains(expected), "missing {expected:?}");
+        }
         let list =
             handle_request(&sdk, json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).await;
         assert_eq!(
             list.pointer("/result/tools/0/name"),
             Some(&json!("sandbox_exec"))
         );
+        assert_eq!(
+            list.pointer("/result/tools/0/title"),
+            Some(&json!("Execute in configured runtime"))
+        );
+        let exec_description = list
+            .pointer("/result/tools/0/description")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(exec_description.contains("With the libkrun backend"));
+        assert!(exec_description.contains("reproducible Linux checks"));
         let call = handle_request(
             &sdk,
             json!({
