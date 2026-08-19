@@ -420,7 +420,7 @@ mod tests {
             &sdk,
             json!({
                 "jsonrpc":"2.0","id":3,"method":"tools/call",
-                "params":{"name":"sandbox_exec","arguments":{"argv":["/usr/bin/printf","mcp"]}}
+                "params":{"name":"sandbox_exec","arguments":{"argv":successful_command()}}
             }),
         )
         .await;
@@ -429,5 +429,26 @@ mod tests {
             call.pointer("/result/structuredContent/status/exit_code"),
             Some(&json!(0))
         );
+    }
+
+    #[cfg(unix)]
+    fn successful_command() -> Vec<String> {
+        ["/usr/bin/printf", "mcp"].map(String::from).into()
+    }
+
+    #[cfg(windows)]
+    fn successful_command() -> Vec<String> {
+        vec![
+            std::path::PathBuf::from(
+                std::env::var_os("SystemRoot").expect("Windows must define SystemRoot"),
+            )
+            .join("System32")
+            .join("cmd.exe")
+            .to_string_lossy()
+            .into_owned(),
+            "/D".into(),
+            "/C".into(),
+            "exit /b 0".into(),
+        ]
     }
 }
