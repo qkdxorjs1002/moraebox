@@ -488,4 +488,22 @@ jobs:
           fi
 
           git -C homebrew-tap commit -m "moraebox ${RELEASE_TAG} (${release_channel})"
-          git -C homebrew-tap push
+          for attempt in 1 2 3; do
+            git -C homebrew-tap fetch --no-tags origin main
+            if ! git -C homebrew-tap rebase origin/main; then
+              echo "Homebrew tap update conflicts with origin/main; refusing to resolve it automatically." >&2
+              git -C homebrew-tap rebase --abort
+              exit 1
+            fi
+
+            if git -C homebrew-tap push origin HEAD:main; then
+              exit 0
+            fi
+            if [[ "${attempt}" -eq 3 ]]; then
+              echo "Could not push the Homebrew tap after ${attempt} attempts." >&2
+              exit 1
+            fi
+
+            echo "Homebrew tap changed during push; retrying (${attempt}/3)." >&2
+            sleep $((attempt * 2))
+          done
