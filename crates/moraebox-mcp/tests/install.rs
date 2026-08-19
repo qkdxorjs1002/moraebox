@@ -141,6 +141,13 @@ fn unconfigured_bare_invocation_prints_help() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Usage: morae-mcp [OPTIONS] [COMMAND]"));
+    let expected_usage = format!(
+        "Usage: morae-mcp{} [OPTIONS] [COMMAND]",
+        std::env::consts::EXE_SUFFIX
+    );
+    assert!(
+        stdout.contains(&expected_usage),
+        "unexpected help output:\n{stdout}"
+    );
     assert!(stdout.contains("install"));
 }
