@@ -3,96 +3,249 @@
 [한국어](README.ko.md)
 
 [![GitHub release](https://img.shields.io/github/v/release/qkdxorjs1002/moraebox?include_prereleases)](https://github.com/qkdxorjs1002/moraebox/releases)
-[![Rust 1.85+](https://img.shields.io/badge/Rust-1.85%2B-000000?logo=rust&logoColor=white)](Cargo.toml)
 [![CI](https://github.com/qkdxorjs1002/moraebox/actions/workflows/ci.yml/badge.svg)](https://github.com/qkdxorjs1002/moraebox/actions/workflows/ci.yml)
+[![Rust 1.85+](https://img.shields.io/badge/Rust-1.85%2B-000000?logo=rust&logoColor=white)](Cargo.toml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](#license)
 
-**Disposable microVM execution for coding agents.** moraebox is a daemonless Rust runtime that gives each one-shot command its own Linux microVM, streams its output, and destroys the sandbox on completion, timeout, cancellation, backend failure, or owner loss.
+**A disposable Linux microVM for every coding-agent command.**
 
-The Phase 0–5 vertical slice is implemented. Native execution is currently release-qualified only on Apple Silicon macOS with compatible released libkrun and libkrunfw builds. Linux and Windows remain compile-and-test targets; the process backend is a deterministic test double and does **not** provide VM isolation.
+moraebox is a daemonless Rust runtime that starts one fresh microVM for one command, streams its output, and tears the sandbox down when the command finishes—or when its timeout, owner, or backend fails.
 
-[Get started](#quick-start) · [Install](#installation) · [Run a sandbox](#run-a-sandbox) · [Use the MCP server](#mcp-server) · [Review the security model](#security-model)
+> [!IMPORTANT]
+> Native microVM execution is currently release-qualified on Apple Silicon macOS. The portable `process` backend is a test and development aid; it runs commands directly on the host and provides **no VM isolation**.
 
-## Why moraebox?
+## Why moraebox
 
-Coding-agent harnesses need more than a child process, but they should not need a long-running privileged daemon or a reusable VM that retains untrusted state.
+Coding agents execute unfamiliar code, install dependencies, and run build tools. A child process is convenient, but it is not an isolation boundary. Long-lived VMs, on the other hand, can retain untrusted state between jobs.
 
-| Need | moraebox behavior |
-| --- | --- |
-| Strong one-shot ownership | One helper process and one fresh microVM belong to one sandbox run |
-| Predictable cleanup | Completion, timeout, cancellation, failure, and parent loss all converge on cleanup |
-| Safe command handling | Commands are argv arrays; no implicit shell parsing is introduced |
-| Conservative host access | Host workspaces become immutable ext4 images instead of direct virtio-fs exports |
-| Bounded execution | The default wall timeout is one hour; unlimited execution is explicit |
-| Agent-friendly integration | The CLI, async Rust SDK, and stdio MCP server share the same lifecycle model |
+moraebox is built around a smaller lifecycle: one owner, one command, one VM, then cleanup.
+
+- **Disposable by design.** A prepared sandbox is consumed once and is never returned to an untrusted VM pool.
+- **Cleanup on every exit path.** Success, timeout, cancellation, backend failure, and parent loss all converge on teardown.
+- **No hidden shell.** Commands stay argv arrays unless you explicitly invoke a shell.
+- **No inherited host environment.** The guest starts with an empty environment by default.
+- **Conservative workspace access.** Host source trees become immutable, read-only ext4 images instead of direct virtio-fs shares.
+- **Agent-ready interfaces.** The CLI, async Rust SDK, and stdio MCP server use the same runtime lifecycle.
 
 ## Quick start
 
-### Install with Homebrew
+### 1. Install
 
-The Homebrew release currently targets Apple Silicon macOS:
+The current prerelease channel targets Apple Silicon macOS. The tap also provides the pinned libkrun and libkrunfw versions required by moraebox.
 
 ```sh
 brew tap qkdxorjs1002/tap
-brew trust qkdxorjs1002/tap
-
-# Stable release
-brew install moraebox
-
-# Newest stable or prerelease
+brew trust --tap qkdxorjs1002/tap
 brew install moraebox@pre
+```
 
+Homebrew 6 requires trust for non-official taps. Whole-tap trust is used here because the moraebox formula depends on companion formulae from the same tap. Review the tap before trusting it; see Homebrew's [Tap Trust documentation](https://docs.brew.sh/Tap-Trust) for narrower trust options.
+
+The formula builds `morae`, `morae-mcp`, and `morae-vmm-helper` from the checksummed release source. It also ad-hoc signs the helper with the Hypervisor entitlement. No prebuilt moraebox binary is installed.
+
+### 2. Check the native runtime
+
+```sh
 morae --version
-morae doctor --json
-```
-
-Homebrew 6 requires explicit trust for third-party formulae. Trusting this tap allows Homebrew to resolve the pinned companion dependency formulae during the moraebox install.
-
-Both formulae download a checksummed release source archive and compile `morae`, `morae-mcp`, and `morae-vmm-helper` on the Mac running `brew install`; no prebuilt moraebox bottle or binary is downloaded. The same install also provides the pinned native runtime through companion `libkrun` 1.19.4 and `libkrunfw` 5.5.0 formulae in this tap. Homebrew supplies the build dependencies, installs `e2fsprogs`, and ad-hoc signs the locally built helper with the Hypervisor entitlement. This signature does not identify a developer and is not Apple-notarized.
-
-The stable and prerelease formulae conflict because they install the same executables; uninstall the current formula before switching channels. `doctor` reports the exact missing path, symbol, framework, or signing capability without changing the host.
-
-### Verify the portable path
-
-```sh
-morae run --backend process -- /usr/bin/printf 'hello from moraebox\n'
-```
-
-This verifies the lifecycle and output path only. The process backend runs directly on the host and is **not a security sandbox**.
-
-### Run a native microVM
-
-The Homebrew install supplies the validated native libraries and a signed sibling helper. moraebox discovers them automatically, so no shell configuration is required:
-
-```sh
 morae doctor --strict
-morae run -- python3 --version
 ```
 
-The built-in default is `docker.io/library/python:3.12`. `run` checks the local cache first and pulls and materializes that image only when it is missing.
+`doctor` is read-only. Use `morae doctor --json` for a machine-readable report of missing libraries, symbols, frameworks, tools, or signing capabilities.
 
-`--helper`, `--libkrun`, `MORAE_HELPER_PATH`, `MORAE_LIBKRUN_PATH`, `MORAE_LIBKRUNFW_PATH`, and `MORAE_LIB_DIR` remain available as explicit overrides for nonstandard installations.
+### 3. Run a command
 
-The currently validated development stack is libkrun 1.19.4 with libkrunfw 5.5.0 on Apple Silicon macOS. The adapter detects the released libkrun 1.x root API and the explicit-resource 2.0 ABI at runtime; unreleased `main` ABI changes are not a compatibility target.
+```sh
+morae run -- python3 -c 'print("hello from moraebox")'
+```
 
-## Installation
+The built-in default image is `docker.io/library/python:3.12`. moraebox pulls and verifies it on the first run, then reuses the materialized local cache. Each execution still gets a fresh VM.
 
-### Requirements
+## Using the CLI
 
-For native execution:
+### Choose resources and a timeout
 
-- Apple Silicon macOS with Hypervisor.framework.
-- Compatible released libkrun and libkrunfw builds (installed automatically by the Homebrew formula).
-- A helper signed with the `com.apple.security.hypervisor` entitlement.
-- `mke2fs` from `e2fsprogs` when attaching a host workspace.
-- Network access to the selected OCI registry when pulling an image.
+```sh
+morae run \
+  --cpus 2 \
+  --memory-mib 512 \
+  --timeout 30s \
+  -- python3 -c 'print("isolated")'
+```
 
-For source development:
+The default wall-clock timeout is one hour. Unlimited execution must be explicit with `--timeout none` or `--timeout 0`.
 
-- Rust 1.85 or newer.
-- The platform build tools required by Rust.
-- The native dependencies above only for real-backend checks.
+Everything after `--` is passed as argv. Shell syntax is interpreted only if a shell is the command:
 
-### Build from source
+```sh
+morae run --image alpine:latest --env MESSAGE=hello \
+  -- /bin/sh -c 'printf "%s\n" "$MESSAGE"'
+```
+
+Use `--env KEY=VALUE` to add individual values. `--inherit-env` forwards the host environment and should be used only when that exposure is intentional.
+
+### Select an OCI image
+
+```sh
+# Use another image once
+morae run --image debian:bookworm -- cat /etc/os-release
+
+# Change the default for future runs
+morae image default debian:bookworm
+
+# Restore the built-in python:3.12 default
+morae image default --unset
+```
+
+Registry manifests and blobs are digest-verified before layers are materialized. Private registries accept an explicit username/password pair through CLI options or `MORAE_REGISTRY_USERNAME` and `MORAE_REGISTRY_PASSWORD`.
+
+`--rootfs /path/to/rootfs` is an advanced alternative for an already materialized guest root directory. It bypasses image resolution and is mutually exclusive with `--image`.
+
+### Attach a read-only workspace
+
+```sh
+morae run \
+  --workspace ./my-project \
+  -- /bin/sh -c 'ls -la /workspace'
+```
+
+moraebox walks the host tree without following symlinks, rejects unsafe entries, creates a read-only ext4 snapshot, and attaches it at `/workspace`. It does not expose the original host directory to the VM.
+
+### Use an interactive terminal
+
+```sh
+morae run --image alpine:latest --tty --interactive -- /bin/sh
+```
+
+PTY allocation is supported by the native backend. Live terminal resize is not implemented yet.
+
+### Manage local storage
+
+```sh
+morae image pull python:3.12
+morae image list
+morae image remove python:3.12
+
+morae cache info
+morae cache prune --dry-run
+morae cache prune --yes
+morae cache clean --all --dry-run
+morae cache clean --all --yes
+```
+
+Destructive cache operations require either `--dry-run` or `--yes`. Image and cache commands support `--json` where structured output is useful.
+
+### Exercise the lifecycle without isolation
+
+```sh
+morae run --backend process -- /usr/bin/printf 'portable path\n'
+morae benchmark --backend process --iterations 100 -- /usr/bin/true
+```
+
+The `process` backend is useful for deterministic tests, CI, and integration development. It is not a sandbox and must not be presented as one.
+
+## Connect a coding agent
+
+`morae-mcp` is a newline-delimited stdio MCP server. Its stdout is reserved for protocol messages; diagnostics go to stderr.
+
+Register the native server with Codex or Claude Code:
+
+```sh
+morae-mcp install codex
+morae-mcp install claude-code
+```
+
+Preview the exact command and argv without changing agent configuration:
+
+```sh
+morae-mcp install codex --dry-run
+```
+
+The installer uses the agent's official CLI and does not edit configuration files directly. Use `--image`, `--cache-dir`, `--cpus`, or `--memory-mib` to customize the registration. For lifecycle testing without isolation, opt in with `--backend process`.
+
+The server exposes three tools:
+
+| Tool | Purpose |
+| --- | --- |
+| `sandbox_exec` | Run one command or start an asynchronous session |
+| `sandbox_io` | Read bounded output, write or close stdin, resize, or send a signal |
+| `sandbox_stop` | Stop a session and wait for cleanup |
+
+Commands remain argv arrays in the MCP schema. Output and stdin bytes are base64-encoded.
+
+## How it works
+
+```text
+CLI / Rust SDK / MCP server
+             │
+      runtime supervisor
+   lifecycle · deadline · I/O
+             │
+    one VMM helper process
+       released libkrun ABI
+             │
+   console + vsock (TSI off)
+             │
+      one Linux microVM
+```
+
+The helper is a process boundary because libkrun's start operation consumes its context and exits the calling process. Keeping it outside the CLI, SDK host, and MCP server gives the supervisor one unambiguous ownership handle for the VM.
+
+Every one-shot run follows the same state machine:
+
+```text
+prepare → start → ready → running → stop → dead
+   └──────── failure / timeout / cancellation ───────┘
+```
+
+`dead` means that helper processes, control sockets, I/O pumps, temporary files, and VM resources have been reclaimed.
+
+### Workspace layout
+
+| Crate | Responsibility |
+| --- | --- |
+| `moraebox-core` | Run specification, lifecycle states, signals, and bounded output |
+| `moraebox-image` | OCI registry access, digest verification, cache, and workspace snapshots |
+| `moraebox-runtime` | Backends, supervision, sessions, diagnostics, and traces |
+| `moraebox-sdk` | Async embedding API |
+| `moraebox-cli` | The `morae` command-line interface |
+| `moraebox-mcp` | Stdio MCP server and agent registration |
+| `moraebox-vmm-helper` | Signed native boundary around libkrun |
+| `moraebox-protocol` | Bounded host/guest protocol types |
+
+## Security model
+
+The current threat model is untrusted Linux guest code launched by a local user on that same user's macOS host.
+
+Security-relevant defaults include:
+
+- no guest network interface;
+- a control vsock with Transparent Socket Impersonation flags set to zero;
+- no host environment forwarding;
+- no implicit shell parsing;
+- immutable, read-only workspace snapshots;
+- digest-verified OCI content with traversal, device, unsafe-link, and symlink-parent checks;
+- a one-hour default deadline with TERM-to-KILL escalation;
+- single-use prepared units and cleanup after parent loss.
+
+moraebox does **not** claim to protect against a hostile host user, a compromised hypervisor or VMM, or hostile multi-tenant operation. The process backend does not provide isolation.
+
+## Platform support and current limits
+
+| Area | Status |
+| --- | --- |
+| Apple Silicon macOS | Native libkrun execution; current release-qualified target |
+| Linux and Windows | Compile-and-test targets; no native release runtime |
+| libkrun stack | Validated with released libkrun 1.19.4 and libkrunfw 5.5.0 |
+| Image sources | Remote OCI registries; local OCI layouts and Docker archives are not imported yet |
+| VM reuse | Materialized artifacts may be cached; booted untrusted VMs are never reused |
+| Workspaces | Read-only snapshots; writable overlays and copy-out/diff are future work |
+| Interactive I/O | PTY supported; live resize is future work |
+
+This is an early-stage project. Review the boundaries above before using it for security-sensitive workloads.
+
+## Build from source
+
+Rust 1.85 or newer is required.
 
 ```sh
 cargo build --release --locked \
@@ -105,247 +258,7 @@ codesign --force --sign - \
   target/release/morae-vmm-helper
 ```
 
-This is also the signing model used by the Homebrew formula: the helper is built and ad-hoc signed on the installation Mac. It carries the required entitlement but no Developer ID identity or Apple notarization.
-
-## Run a sandbox
-
-### Inspect native readiness
-
-```sh
-morae doctor
-morae doctor --json
-morae doctor --strict
-```
-
-`--strict` returns a failure status unless the native backend is ready.
-
-### Manage OCI images and caches
-
-```sh
-morae image default
-morae image default python:3.12
-morae image pull python:3.12 --json
-morae image list                       # alias: image ls
-morae image remove python:3.12         # alias: image rm
-morae image pull ghcr.io/example/image:tag \
-  --cache-dir .moraebox/cache
-```
-
-Registry manifests and blobs are digest-verified before layers are materialized. Registry credentials are accepted only as an explicit username/password pair through options or `MORAE_REGISTRY_USERNAME` and `MORAE_REGISTRY_PASSWORD`.
-
-`morae image default IMAGE` changes the image used when `run` has neither `--rootfs` nor `--image`; `morae image default --unset` restores `python:3.12`. Setting a default does not pull immediately. `run` reuses a matching local image and automatically pulls a cache miss. Removing the cached copy of the default preserves the setting, so the next run pulls it again.
-
-Inspect and reclaim managed storage with:
-
-```sh
-morae cache info
-morae cache prune --dry-run
-morae cache prune --yes
-morae cache clean --all --dry-run
-morae cache clean --all --yes
-```
-
-`prune` removes unreferenced OCI blobs, incomplete root filesystems, and stale image records. `clean --all` removes all managed image, OCI, rootfs, and workspace cache entries and clears the configured default. Destructive cache commands require either `--dry-run` or `--yes`; all image and cache reports also support `--json`.
-
-`oci-layout:` and `docker-archive:` references are parsed by the image layer but are not yet imported by the public CLI.
-
-### Execute a command
-
-```sh
-morae run \
-  --cpus 2 \
-  --memory-mib 512 \
-  --timeout 30s \
-  -- python3 -c 'print("hello")'
-```
-
-Use `--image debian:bookworm` to select a different managed OCI image for one run. `--image` is a registry reference: moraebox owns its verified cache and pulls it automatically when absent. `--rootfs` instead points directly to an already materialized guest root directory. It bypasses image selection, pulling, and cache indexing. The two options are mutually exclusive; `--rootfs` is not a way to expose a host source directory.
-
-Everything after `--` is passed as an argv array. Shell syntax is interpreted only when you explicitly run a shell:
-
-```sh
-morae run --image alpine@latest -- /bin/sh -c 'printf "%s\n" "$HOME"'
-```
-
-The guest environment is empty by default. Add individual values with `--env KEY=VALUE`, or use `--inherit-env` only when host environment forwarding is intentional.
-
-The default timeout is one hour:
-
-```sh
-morae run --backend process --timeout 10m -- /usr/bin/true
-morae run --backend process --timeout none -- /usr/bin/true
-```
-
-`none` (or `0`) is the explicit unlimited setting.
-
-### Attach a read-only workspace
-
-```sh
-morae run \
-  --rootfs /path/to/materialized-rootfs \
-  --workspace ./project \
-  -- /bin/sh -c 'cat /workspace/Cargo.toml'
-```
-
-moraebox walks the host tree without following symlinks, rejects unsafe entries, creates a mode-0444 ext4 image, and attaches it read-only at `/workspace`. The original host directory is never exposed directly through virtio-fs.
-
-### Stream through a PTY
-
-```sh
-morae run --image alpine@latest --tty --interactive -- /bin/sh
-```
-
-PTY allocation is available on the native backend. Live PTY resize on the macOS controller is not implemented yet.
-
-### Benchmark the lifecycle
-
-```sh
-morae benchmark \
-  --backend process \
-  --iterations 100 \
-  -- /usr/bin/true
-```
-
-The JSON report includes minimum, p50, p95, p99, and maximum latency. The current prepared pool caches verified and materialized artifacts rather than booted guest-agent VMs, so reports call this mode `cached-cold`.
-
-## MCP server
-
-Start the newline-delimited stdio server with either backend:
-
-```sh
-morae-mcp --backend process
-
-morae-mcp --backend libkrun --image python:3.12
-```
-
-The libkrun server uses the same selection as `morae run`: explicit `--rootfs`, then explicit `--image`, then the configured or built-in `python:3.12` default. Image cache misses are pulled automatically. The MCP server keeps stdout exclusively for protocol messages; diagnostics go to stderr.
-
-### Register with coding agents
-
-Register `moraebox` as a user-wide stdio MCP server with either supported agent:
-
-```sh
-morae-mcp install codex
-morae-mcp install claude-code
-```
-
-No pre-pull is required. The installer registers the current configured image, or `python:3.12` by default, plus an absolute cache path. The MCP server reuses a local match or pulls it on first use. Use `--image debian:bookworm` to pin another managed image, `--cache-dir /path/to/cache` for another cache, or `--rootfs /absolute/path/to/rootfs` for an advanced unmanaged rootfs. `--image` and `--rootfs` are mutually exclusive.
-
-The installer invokes the agent's official CLI as an argv array and does not edit its configuration files directly. Preview the exact program and argv without changing configuration:
-
-```sh
-morae-mcp install codex --dry-run
-```
-
-The installed server command is resolved from the current `morae-mcp` invocation. Use `--server-command /absolute/path/to/morae-mcp` when the agent will not inherit the same `PATH`. Explicit `--helper`, `--libkrun`, and `--lib-dir` overrides, or their `MORAE_*` environment equivalents, are copied into the registration. Homebrew installations normally auto-discover those native runtime paths.
-
-For deterministic development without isolation, opt in explicitly:
-
-```sh
-morae-mcp install codex --backend process
-```
-
-This prints a warning because the process backend does **not** provide VM isolation.
-
-Verify or remove the user-wide registration with the agent CLI:
-
-| Agent | Verify | Remove |
-| --- | --- | --- |
-| Codex | `codex mcp list` | `codex mcp remove moraebox` |
-| Claude Code | `claude mcp get moraebox` | `claude mcp remove --scope user moraebox` |
-
-The commands follow the official [Codex MCP](https://developers.openai.com/codex/mcp) and [Claude Code MCP](https://code.claude.com/docs/en/mcp) configuration formats.
-
-### Manual registration
-
-For Codex, add this user-wide entry to `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.moraebox]
-command = "morae-mcp"
-args = ["--backend", "libkrun", "--image", "docker.io/library/python:3.12", "--cache-dir", "/absolute/path/to/moraebox-cache", "--cpus", "2", "--memory-mib", "512"]
-```
-
-For Claude Code project scope, or another client that accepts the common `mcpServers` JSON shape, use:
-
-```json
-{
-  "mcpServers": {
-    "moraebox": {
-      "command": "morae-mcp",
-      "args": ["--backend", "libkrun", "--image", "docker.io/library/python:3.12", "--cache-dir", "/absolute/path/to/moraebox-cache", "--cpus", "2", "--memory-mib", "512"]
-    }
-  }
-}
-```
-
-Claude Code reads this project-scoped shape from `.mcp.json` and asks for project approval. Other clients may use a different settings-file location. As an advanced alternative, replace `--image ... --cache-dir ...` with `--rootfs /absolute/path/to/materialized-rootfs`. To configure the non-isolated process backend manually, use `args: ["--backend", "process"]` and omit image and native runtime options.
-
-| Tool | Purpose |
-| --- | --- |
-| `sandbox_exec` | Start a one-shot command or an asynchronous session |
-| `sandbox_io` | Read cursor-based output, write or close stdin, resize, or signal |
-| `sandbox_stop` | Stop a session and wait for cleanup |
-
-Commands remain argv arrays in the MCP schema. Output bytes and stdin are base64-encoded, and output reads are bounded.
-
-## Architecture
-
-```text
-CLI / Rust SDK / MCP
-          |
-   runtime supervisor
-state, deadline, I/O, cleanup
-          |
- per-VM vmm-helper process
-     stable libkrun ABI
-          |
- console + vsock (TSI off)
-          |
-    one Linux microVM
-```
-
-The helper is a process boundary because `krun_start_enter()` consumes the libkrun context and exits its calling process. Keeping it outside the CLI, SDK host, and MCP server gives the supervisor an unambiguous ownership handle.
-
-The public one-shot lifecycle is:
-
-```text
-New → Preparing → Starting → Ready → Running → Stopping → Dead
-                      \          \       \
-                       └─────────── Failed ─────→ Dead
-                                   TimedOut ────→ Dead
-```
-
-`Dead` means process handles, control sockets, I/O pumps, temporary files, and VM resources have been reclaimed. See [the architecture document](docs/architecture.md) for crate ownership and storage flow.
-
-## Security model
-
-The v1 threat model is untrusted Linux guest code invoked by a local user on that same user's macOS host. It does not claim protection from a hostile host user, a compromised hypervisor/VMM, or hostile multi-tenant operation.
-
-Security defaults:
-
-- No guest network interface is added by default.
-- The control vsock is created with Transparent Socket Impersonation flags set to zero.
-- Host source directories are converted to immutable read-only block images.
-- The guest environment starts empty.
-- Commands never gain implicit shell parsing.
-- The default wall deadline is one hour.
-- Stop escalates from TERM to KILL after a five-second grace period.
-- OCI content is digest-verified and layers reject traversal, devices, unsafe links, and symlink-parent escapes.
-- A prepared unit is consumed once; an untrusted VM is never reused after its lease.
-- Parent loss terminates the helper and converges on cleanup.
-
-Read [docs/security.md](docs/security.md) for trust boundaries and [docs/protocol.md](docs/protocol.md) for the bounded host/guest frame contract.
-
-## Current boundaries
-
-- Native execution is release-qualified only on Apple Silicon macOS.
-- Linux and Windows compile and test in CI but do not ship native release binaries.
-- The process backend is useful for deterministic tests, not isolation.
-- Registry images are materialized; local OCI layouts and Docker archives are not yet imported.
-- Native root filesystems use dedicated materialized virtio-fs directories, while host workspaces use read-only block images.
-- Writable workspace overlays, copy-out/diff, a custom guest-agent handshake, and live PTY resize remain follow-up work.
-- The artifact pool is `cached-cold`; it does not claim a pool of already booted reusable VMs.
+Native execution additionally needs compatible released libkrun/libkrunfw builds, Hypervisor.framework, and `mke2fs` from `e2fsprogs` when a workspace is attached. `morae doctor --json` reports what the current host is missing.
 
 ## Development
 
@@ -355,40 +268,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Native macOS changes additionally require:
+Native macOS changes also require `morae doctor --json` and the real-backend smoke suite when the signed helper and native dependencies are available. CI runs the portable quality gate on macOS, Linux, and Windows.
 
-```sh
-morae doctor --json
-```
-
-Run the real-backend smoke suite when the signed helper, released libkrun/libkrunfw builds, and Hypervisor.framework capability are available. A skipped native check should name the exact missing capability.
-
-More project detail:
-
-- [Implementation plan](docs/implementation-plan.md)
-- [Architecture](docs/architecture.md)
-- [Security model](docs/security.md)
-- [Protocol](docs/protocol.md)
-- [Performance](docs/performance.md)
-
-## Release
-
-Pushing a validated tag without a leading `v` starts [the release workflow](.github/workflows/release.yml). Stable tags use `x.y.z`; prerelease tags use `x.y.z-alphaN`, `x.y.z-betaN`, or `x.y.z-rcN`, for example `0.0.0-alpha1`. The tag is the release version and is synchronized into the runner's temporary workspace before the quality gate; the source commit is not rewritten. The workflow:
-
-1. Runs the full Rust quality gate on an Apple Silicon macOS runner.
-2. Creates a versioned source archive containing the synchronized workspace manifest and locked dependency set, then verifies its contents.
-3. Publishes only the source archive and SHA-256 file to GitHub Releases, marking prerelease tags accordingly.
-4. Updates pinned `Formula/libkrun.rb` and `Formula/libkrunfw.rb`, the rolling `Formula/moraebox-pre.rb`, and the `moraebox@pre` alias in `qkdxorjs1002/homebrew-tap`; stable tags also update `Formula/moraebox.rb`.
-5. On each `brew install`, Homebrew installs the pinned native dependencies, builds libkrun and the three moraebox executables on that Mac, and ad-hoc signs the installed VMM helper with `assets/moraebox-vmm.entitlements`.
-
-The workflow does not publish moraebox binaries or use Developer ID signing and Apple notarization. Each installation therefore performs its own source build; the resulting ad-hoc signature proves neither developer identity nor notarization.
-
-Repository release secrets:
-
-| Secret | Purpose |
-| --- | --- |
-| `HOMEBREW_TAP_TOKEN` | Write access to `qkdxorjs1002/homebrew-tap` |
+Bug reports and focused pull requests are welcome. Please include the backend, host platform, exact command, and `morae doctor --json` output when reporting native runtime problems. Remove local paths or other sensitive values before sharing diagnostics.
 
 ## License
 
-moraebox is licensed under Apache-2.0.
+moraebox is licensed under the Apache License 2.0.
