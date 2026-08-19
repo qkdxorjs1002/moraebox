@@ -395,6 +395,7 @@ mod tests {
             .await
             .unwrap();
         session.write(b"hello\n".to_vec()).await.unwrap();
+        session.close_stdin().await.unwrap();
         let status = session.wait().await.unwrap();
         assert_eq!(status.exit_code, Some(0));
         let output = session.read_output(0, 1024).await.unwrap();
