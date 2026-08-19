@@ -5,7 +5,9 @@ use std::{path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
 use moraebox_core::{OutputChunk, RunSpec, SessionId, Signal, TimeoutPolicy};
-use moraebox_runtime::{Backend, LibkrunBackend, LibkrunConfig, ProcessBackend};
+use moraebox_runtime::{
+    Backend, LibkrunBackend, LibkrunConfig, NativeRuntimePaths, ProcessBackend,
+};
 use moraebox_sdk::{ExecutionResult, IoRequest, IoResult, SandboxSdk};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -53,17 +55,18 @@ fn create_sdk(args: Args) -> Result<SandboxSdk, String> {
     let backend: Arc<dyn Backend> = match args.backend.as_str() {
         "process" => Arc::new(ProcessBackend),
         "libkrun" => {
-            let helper = args
-                .helper
-                .ok_or("libkrun backend requires --helper or MORAE_HELPER_PATH")?;
-            let library = args
-                .libkrun
-                .ok_or("libkrun backend requires --libkrun or MORAE_LIBKRUN_PATH")?;
+            let paths = NativeRuntimePaths::discover(args.helper, args.libkrun, args.lib_dir);
+            let helper = paths.helper.ok_or(
+                "libkrun backend requires --helper, MORAE_HELPER_PATH, or a sibling morae-vmm-helper",
+            )?;
+            let library = paths.libkrun.ok_or(
+                "libkrun backend requires --libkrun, MORAE_LIBKRUN_PATH, or a supported Homebrew libkrun",
+            )?;
             let root = args
                 .rootfs
                 .ok_or("libkrun backend requires --rootfs or MORAE_ROOTFS")?;
             let mut config = LibkrunConfig::new(helper, library, root);
-            config.library_search_path = args.lib_dir;
+            config.library_search_path = paths.library_search_path;
             config.vcpus = args.cpus;
             config.memory_mib = args.memory_mib;
             Arc::new(LibkrunBackend::new(config))

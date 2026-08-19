@@ -18,6 +18,16 @@ const REQUIRED_LIBKRUN_SYMBOLS: &[&str] = &[
     "krun_add_virtio_console_default",
     "krun_start_enter",
 ];
+const LIBKRUN_CANDIDATES: &[&str] = &[
+    "/opt/homebrew/lib/libkrun.dylib",
+    "/opt/homebrew/opt/libkrun/lib/libkrun.dylib",
+    "/usr/local/lib/libkrun.dylib",
+];
+const LIBKRUNFW_CANDIDATES: &[&str] = &[
+    "/opt/homebrew/lib/libkrunfw.dylib",
+    "/opt/homebrew/opt/libkrunfw/lib/libkrunfw.dylib",
+    "/usr/local/lib/libkrunfw.dylib",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -53,6 +63,42 @@ pub struct ToolProbe {
     pub version: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeRuntimePaths {
+    pub helper: Option<PathBuf>,
+    pub libkrun: Option<PathBuf>,
+    pub libkrunfw: Option<PathBuf>,
+    pub library_search_path: Option<PathBuf>,
+}
+
+impl NativeRuntimePaths {
+    /// Resolve native runtime paths without overriding explicit caller configuration.
+    pub fn discover(
+        helper: Option<PathBuf>,
+        libkrun: Option<PathBuf>,
+        library_search_path: Option<PathBuf>,
+    ) -> Self {
+        let helper = helper
+            .or_else(|| configured_path("MORAE_HELPER_PATH"))
+            .or_else(find_sibling_helper);
+        let libkrun = libkrun
+            .or_else(|| configured_path("MORAE_LIBKRUN_PATH"))
+            .or_else(|| find_candidate(LIBKRUN_CANDIDATES));
+        let libkrunfw = configured_path("MORAE_LIBKRUNFW_PATH")
+            .or_else(|| find_sibling_library(libkrun.as_deref(), "libkrunfw.dylib"))
+            .or_else(|| find_candidate(LIBKRUNFW_CANDIDATES));
+        let library_search_path = library_search_path
+            .or_else(|| configured_path("MORAE_LIB_DIR"))
+            .or_else(|| library_parent_path(libkrun.as_deref(), libkrunfw.as_deref()));
+        Self {
+            helper,
+            libkrun,
+            libkrunfw,
+            library_search_path,
+        }
+    }
+}
+
 impl DoctorReport {
     pub fn collect() -> Self {
         let os = env::consts::OS.to_owned();
@@ -69,22 +115,10 @@ impl DoctorReport {
             .is_some_and(binary_has_hypervisor_entitlement);
         let libkrun = probe_library(
             "MORAE_LIBKRUN_PATH",
-            &[
-                "/opt/homebrew/lib/libkrun.dylib",
-                "/opt/homebrew/opt/libkrun/lib/libkrun.dylib",
-                "/usr/local/lib/libkrun.dylib",
-            ],
+            LIBKRUN_CANDIDATES,
             REQUIRED_LIBKRUN_SYMBOLS,
         );
-        let libkrunfw = probe_library(
-            "MORAE_LIBKRUNFW_PATH",
-            &[
-                "/opt/homebrew/lib/libkrunfw.dylib",
-                "/opt/homebrew/opt/libkrunfw/lib/libkrunfw.dylib",
-                "/usr/local/lib/libkrunfw.dylib",
-            ],
-            &[],
-        );
+        let libkrunfw = probe_library("MORAE_LIBKRUNFW_PATH", LIBKRUNFW_CANDIDATES, &[]);
         let krunvm = probe_tool("krunvm");
         let native_backend_ready = host_supported
             && hypervisor_framework
@@ -207,17 +241,50 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
 }
 
 fn find_helper() -> Option<PathBuf> {
-    if let Some(configured) = env::var_os("MORAE_HELPER_PATH").map(PathBuf::from)
-        && configured.is_file()
-    {
-        return Some(configured);
-    }
+    configured_path("MORAE_HELPER_PATH")
+        .filter(|path| path.is_file())
+        .or_else(find_sibling_helper)
+}
+
+fn configured_path(key: &str) -> Option<PathBuf> {
+    env::var_os(key).map(PathBuf::from)
+}
+
+fn find_sibling_helper() -> Option<PathBuf> {
     let sibling = env::current_exe().ok()?.with_file_name(if cfg!(windows) {
         "morae-vmm-helper.exe"
     } else {
         "morae-vmm-helper"
     });
     sibling.is_file().then_some(sibling)
+}
+
+fn find_candidate(candidates: &[&str]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+}
+
+fn find_sibling_library(library: Option<&Path>, name: &str) -> Option<PathBuf> {
+    let sibling = library?.parent()?.join(name);
+    sibling.is_file().then_some(sibling)
+}
+
+fn library_parent_path(libkrun: Option<&Path>, libkrunfw: Option<&Path>) -> Option<PathBuf> {
+    let mut directories = Vec::new();
+    for directory in [libkrun, libkrunfw]
+        .into_iter()
+        .flatten()
+        .filter_map(Path::parent)
+    {
+        if !directories.iter().any(|existing| existing == directory) {
+            directories.push(directory.to_path_buf());
+        }
+    }
+    (!directories.is_empty())
+        .then(|| env::join_paths(directories).ok().map(PathBuf::from))
+        .flatten()
 }
 
 fn binary_has_hypervisor_entitlement(executable: &Path) -> bool {
@@ -254,5 +321,32 @@ mod tests {
         );
         assert!(!probe.found);
         assert_eq!(probe.required_symbols_present, None);
+    }
+
+    #[test]
+    fn explicit_native_paths_take_precedence() {
+        let paths = NativeRuntimePaths::discover(
+            Some(PathBuf::from("/configured/helper")),
+            Some(PathBuf::from("/configured/lib/libkrun.dylib")),
+            Some(PathBuf::from("/configured/search")),
+        );
+        assert_eq!(paths.helper, Some(PathBuf::from("/configured/helper")));
+        assert_eq!(
+            paths.libkrun,
+            Some(PathBuf::from("/configured/lib/libkrun.dylib"))
+        );
+        assert_eq!(
+            paths.library_search_path,
+            Some(PathBuf::from("/configured/search"))
+        );
+    }
+
+    #[test]
+    fn library_search_path_uses_unique_library_parents() {
+        let joined = library_parent_path(
+            Some(Path::new("/opt/native/lib/libkrun.dylib")),
+            Some(Path::new("/opt/native/lib/libkrunfw.dylib")),
+        );
+        assert_eq!(joined, Some(PathBuf::from("/opt/native/lib")));
     }
 }

@@ -61,17 +61,14 @@ morae run --backend process -- /usr/bin/printf 'hello from moraebox\n'
 
 ### 네이티브 microVM 실행
 
-Homebrew 설치가 검증된 native library를 제공합니다. moraebox가 안정적인 Homebrew prefix에서 이들을 찾도록 설정한 다음 전체 준비 상태 검사를 요구합니다.
+Homebrew 설치가 검증된 native library와 서명된 sibling helper를 제공합니다. moraebox가 이를 자동 탐색하므로 별도의 셸 설정이 필요하지 않습니다.
 
 ```sh
-export MORAE_HELPER_PATH="$(brew --prefix moraebox)/bin/morae-vmm-helper"
-export MORAE_LIBKRUN_PATH="$(brew --prefix libkrun)/lib/libkrun.dylib"
-export MORAE_LIBKRUNFW_PATH="$(brew --prefix libkrunfw)/lib/libkrunfw.dylib"
-export MORAE_LIB_DIR="$(brew --prefix libkrun)/lib:$(brew --prefix libkrunfw)/lib"
-
 morae doctor --strict
 morae run --image alpine@latest -- /bin/uname -a
 ```
+
+`--helper`, `--libkrun`, `MORAE_HELPER_PATH`, `MORAE_LIBKRUN_PATH`, `MORAE_LIBKRUNFW_PATH`, `MORAE_LIB_DIR`는 비표준 설치를 위한 명시적 override로 계속 사용할 수 있습니다.
 
 현재 검증된 개발 스택은 Apple Silicon macOS의 libkrun 1.19.4와 libkrunfw 5.5.0입니다. 어댑터는 정식 libkrun 1.x root API와 명시적 리소스를 사용하는 2.0 ABI를 런타임에 감지합니다. 아직 릴리스되지 않은 `main` 브랜치 ABI 변경은 호환 대상이 아닙니다.
 
@@ -197,11 +194,7 @@ JSON 보고서에는 최소, p50, p95, p99, 최대 지연 시간이 포함됩니
 ```sh
 morae-mcp --backend process
 
-MORAE_HELPER_PATH="$(brew --prefix moraebox)/bin/morae-vmm-helper" \
-MORAE_LIBKRUN_PATH="$(brew --prefix libkrun)/lib/libkrun.dylib" \
-MORAE_LIBKRUNFW_PATH="$(brew --prefix libkrunfw)/lib/libkrunfw.dylib" \
 MORAE_ROOTFS="/path/to/materialized-rootfs" \
-MORAE_LIB_DIR="$(brew --prefix libkrun)/lib:$(brew --prefix libkrunfw)/lib" \
 morae-mcp --backend libkrun
 ```
 

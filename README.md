@@ -61,17 +61,14 @@ This verifies the lifecycle and output path only. The process backend runs direc
 
 ### Run a native microVM
 
-The Homebrew install supplies the validated native libraries. Point moraebox at their stable Homebrew prefixes, then require the full readiness gate:
+The Homebrew install supplies the validated native libraries and a signed sibling helper. moraebox discovers them automatically, so no shell configuration is required:
 
 ```sh
-export MORAE_HELPER_PATH="$(brew --prefix moraebox)/bin/morae-vmm-helper"
-export MORAE_LIBKRUN_PATH="$(brew --prefix libkrun)/lib/libkrun.dylib"
-export MORAE_LIBKRUNFW_PATH="$(brew --prefix libkrunfw)/lib/libkrunfw.dylib"
-export MORAE_LIB_DIR="$(brew --prefix libkrun)/lib:$(brew --prefix libkrunfw)/lib"
-
 morae doctor --strict
 morae run --image alpine@latest -- /bin/uname -a
 ```
+
+`--helper`, `--libkrun`, `MORAE_HELPER_PATH`, `MORAE_LIBKRUN_PATH`, `MORAE_LIBKRUNFW_PATH`, and `MORAE_LIB_DIR` remain available as explicit overrides for nonstandard installations.
 
 The currently validated development stack is libkrun 1.19.4 with libkrunfw 5.5.0 on Apple Silicon macOS. The adapter detects the released libkrun 1.x root API and the explicit-resource 2.0 ABI at runtime; unreleased `main` ABI changes are not a compatibility target.
 
@@ -197,11 +194,7 @@ Start the newline-delimited stdio server with either backend:
 ```sh
 morae-mcp --backend process
 
-MORAE_HELPER_PATH="$(brew --prefix moraebox)/bin/morae-vmm-helper" \
-MORAE_LIBKRUN_PATH="$(brew --prefix libkrun)/lib/libkrun.dylib" \
-MORAE_LIBKRUNFW_PATH="$(brew --prefix libkrunfw)/lib/libkrunfw.dylib" \
 MORAE_ROOTFS="/path/to/materialized-rootfs" \
-MORAE_LIB_DIR="$(brew --prefix libkrun)/lib:$(brew --prefix libkrunfw)/lib" \
 morae-mcp --backend libkrun
 ```
 

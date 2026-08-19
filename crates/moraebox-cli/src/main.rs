@@ -14,7 +14,8 @@ use moraebox_image::{
     Cas, Credentials, ImageReference, Platform, RegistryClient, WorkspaceSnapshot,
 };
 use moraebox_runtime::{
-    Backend, DoctorReport, LibkrunBackend, LibkrunConfig, ProcessBackend, Supervisor,
+    Backend, DoctorReport, LibkrunBackend, LibkrunConfig, NativeRuntimePaths, ProcessBackend,
+    Supervisor,
 };
 use serde::Serialize;
 
@@ -65,10 +66,10 @@ struct RunArgs {
     /// Execution backend. `process` is deterministic but is not isolated.
     #[arg(long, default_value = "libkrun", value_parser = ["process", "libkrun"])]
     backend: String,
-    /// Path to the signed VMM helper (required by the libkrun backend).
+    /// Override the automatically discovered signed VMM helper.
     #[arg(long, env = "MORAE_HELPER_PATH")]
     helper: Option<PathBuf>,
-    /// Path to libkrun (required by the libkrun backend).
+    /// Override the automatically discovered libkrun library.
     #[arg(long, env = "MORAE_LIBKRUN_PATH")]
     libkrun: Option<PathBuf>,
     /// Dedicated guest root filesystem directory (required by the libkrun backend).
@@ -77,7 +78,7 @@ struct RunArgs {
     /// OCI registry reference such as alpine@latest or debian:bookworm.
     #[arg(long)]
     image: Option<String>,
-    /// Dynamic library dependency directory for libkrun.
+    /// Override the automatically discovered libkrun dependency directories.
     #[arg(long, env = "MORAE_LIB_DIR")]
     lib_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 2)]
@@ -288,14 +289,13 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let report = match args.backend.as_str() {
         "process" => Supervisor::new(ProcessBackend).run(spec).await?,
         "libkrun" => {
-            let helper = required_path(args.helper, "--helper or MORAE_HELPER_PATH")?;
-            let library = required_path(args.libkrun, "--libkrun or MORAE_LIBKRUN_PATH")?;
-            let root = required_path(
+            let mut config = native_config(
+                args.helper,
+                args.libkrun,
+                args.lib_dir,
                 args.rootfs.or(image_root),
                 "--rootfs, --image, or MORAE_ROOTFS",
             )?;
-            let mut config = LibkrunConfig::new(helper, library, root);
-            config.library_search_path = args.lib_dir;
             config.vcpus = args.cpus;
             config.memory_mib = args.memory_mib;
             config.workspace_disk = workspace
@@ -398,11 +398,13 @@ async fn benchmark(args: BenchmarkArgs) -> Result<i32, Box<dyn std::error::Error
             run_benchmark(&Supervisor::new(ProcessBackend), command, args.iterations).await?
         }
         "libkrun" => {
-            let helper = required_path(args.helper, "--helper or MORAE_HELPER_PATH")?;
-            let library = required_path(args.libkrun, "--libkrun or MORAE_LIBKRUN_PATH")?;
-            let root = required_path(args.rootfs, "--rootfs or MORAE_ROOTFS")?;
-            let mut config = LibkrunConfig::new(helper, library, root);
-            config.library_search_path = args.lib_dir;
+            let mut config = native_config(
+                args.helper,
+                args.libkrun,
+                args.lib_dir,
+                args.rootfs,
+                "--rootfs or MORAE_ROOTFS",
+            )?;
             config.vcpus = args.cpus;
             config.memory_mib = args.memory_mib;
             run_benchmark(
@@ -469,6 +471,27 @@ struct BenchmarkReport {
     p95_micros: u64,
     p99_micros: u64,
     max_micros: u64,
+}
+
+fn native_config(
+    helper: Option<PathBuf>,
+    libkrun: Option<PathBuf>,
+    lib_dir: Option<PathBuf>,
+    root: Option<PathBuf>,
+    root_description: &'static str,
+) -> Result<LibkrunConfig, Box<dyn std::error::Error>> {
+    let paths = NativeRuntimePaths::discover(helper, libkrun, lib_dir);
+    let helper = required_path(
+        paths.helper,
+        "--helper, MORAE_HELPER_PATH, or a sibling morae-vmm-helper",
+    )?;
+    let library = required_path(
+        paths.libkrun,
+        "--libkrun, MORAE_LIBKRUN_PATH, or a supported Homebrew libkrun",
+    )?;
+    let mut config = LibkrunConfig::new(helper, library, required_path(root, root_description)?);
+    config.library_search_path = paths.library_search_path;
+    Ok(config)
 }
 
 fn required_path(
