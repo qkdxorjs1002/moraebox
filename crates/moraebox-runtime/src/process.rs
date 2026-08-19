@@ -1,8 +1,12 @@
-use std::{process::Stdio, sync::Arc};
+use std::{io, process::Stdio};
+
+#[cfg(unix)]
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use moraebox_core::{OutputChannel, RunSpec, Signal};
 use tokio::process::Command;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{Backend, BackendController, BackendError, SpawnedSandbox};
 
@@ -52,8 +56,7 @@ impl Backend for ProcessBackend {
             .map(|reader| Box::pin(reader) as _)
             .ok_or_else(|| BackendError::Control("stdout pipe was not created".into()))?;
         let stderr = child.stderr.take().map(|reader| Box::pin(reader) as _);
-        let exit = Box::pin(async move { child.wait().await });
-        let controller = Box::new(ProcessController { pid: Arc::new(pid) });
+        let (exit, controller) = controlled_process(child, pid);
 
         Ok(SpawnedSandbox {
             stdin,
@@ -68,11 +71,67 @@ impl Backend for ProcessBackend {
 
 #[derive(Debug)]
 struct ProcessController {
-    #[cfg_attr(
-        not(unix),
-        expect(dead_code, reason = "process signals are unsupported on this platform")
-    )]
+    #[cfg(unix)]
     pid: Arc<u32>,
+    commands: mpsc::Sender<ProcessCommand>,
+}
+
+#[derive(Debug)]
+enum ProcessCommand {
+    Stop(Option<oneshot::Sender<io::Result<()>>>),
+}
+
+fn controlled_process(
+    mut child: tokio::process::Child,
+    pid: u32,
+) -> (crate::backend::ExitFuture, Box<ProcessController>) {
+    let (command_sender, mut command_receiver) = mpsc::channel(4);
+    let process_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                status = child.wait() => return status,
+                command = command_receiver.recv() => {
+                    let Some(ProcessCommand::Stop(reply)) = command else {
+                        let _ = child.start_kill();
+                        return child.wait().await;
+                    };
+                    match child.start_kill() {
+                        Ok(()) => {
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Ok(()));
+                            }
+                        }
+                        Err(error) => {
+                            let reply_error = io::Error::new(error.kind(), error.to_string());
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Err(reply_error));
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    let exit = Box::pin(async move {
+        process_task
+            .await
+            .map_err(|error| io::Error::other(format!("process task failed: {error}")))?
+    });
+    let controller = Box::new(ProcessController {
+        #[cfg(unix)]
+        pid: Arc::new(pid),
+        commands: command_sender,
+    });
+    #[cfg(not(unix))]
+    let _ = pid;
+    (exit, controller)
+}
+
+impl Drop for ProcessController {
+    fn drop(&mut self) {
+        let _ = self.commands.try_send(ProcessCommand::Stop(None));
+    }
 }
 
 #[async_trait]
@@ -101,10 +160,26 @@ impl BackendController for ProcessController {
         }
         #[cfg(not(unix))]
         {
-            let _ = signal;
-            Err(BackendError::Unsupported(
-                "process signals on this platform",
-            ))
+            match signal {
+                Signal::Terminate | Signal::Kill => {
+                    let (reply_sender, reply_receiver) = oneshot::channel();
+                    if self
+                        .commands
+                        .send(ProcessCommand::Stop(Some(reply_sender)))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                    match reply_receiver.await {
+                        Ok(result) => result.map_err(BackendError::Io),
+                        Err(_) => Ok(()),
+                    }
+                }
+                Signal::Interrupt | Signal::Hangup => Err(BackendError::Unsupported(
+                    "interrupt and hangup process signals on this platform",
+                )),
+            }
         }
     }
 }

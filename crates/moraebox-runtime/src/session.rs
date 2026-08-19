@@ -391,25 +391,23 @@ mod tests {
     async fn supports_incremental_stdin_and_cursor_output() {
         let manager = SessionManager::new(Arc::new(ProcessBackend));
         let session = manager
-            .start(RunSpec::command([
-                "/bin/sh",
-                "-c",
-                "read line; printf '%s' \"$line\"",
-            ]))
+            .start(RunSpec::command(stdin_echo_command()))
             .await
             .unwrap();
         session.write(b"hello\n".to_vec()).await.unwrap();
         let status = session.wait().await.unwrap();
         assert_eq!(status.exit_code, Some(0));
         let output = session.read_output(0, 1024).await.unwrap();
-        assert_eq!(output.chunks[0].data, b"hello");
+        assert!(output.chunks.iter().any(|chunk| {
+            chunk.channel == OutputChannel::Stdout && chunk.data.starts_with(b"hello")
+        }));
     }
 
     #[tokio::test]
     async fn stop_terminates_a_long_running_session() {
         let manager = SessionManager::new(Arc::new(ProcessBackend));
         let session = manager
-            .start(RunSpec::command(["/bin/sh", "-c", "sleep 30"]))
+            .start(RunSpec::command(long_running_command()))
             .await
             .unwrap();
         session.stop().await.unwrap();
@@ -418,5 +416,47 @@ mod tests {
             status.termination_reason,
             Some(TerminationReason::Cancelled)
         );
+    }
+
+    #[cfg(unix)]
+    fn stdin_echo_command() -> Vec<String> {
+        ["/bin/sh", "-c", "read line; printf '%s' \"$line\""]
+            .map(String::from)
+            .into()
+    }
+
+    #[cfg(windows)]
+    fn stdin_echo_command() -> Vec<String> {
+        vec![
+            windows_system_executable("findstr.exe"),
+            "/R".into(),
+            ".*".into(),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn long_running_command() -> Vec<String> {
+        ["/bin/sh", "-c", "sleep 30"].map(String::from).into()
+    }
+
+    #[cfg(windows)]
+    fn long_running_command() -> Vec<String> {
+        vec![
+            windows_system_executable("ping.exe"),
+            "-n".into(),
+            "31".into(),
+            "127.0.0.1".into(),
+        ]
+    }
+
+    #[cfg(windows)]
+    fn windows_system_executable(name: &str) -> String {
+        std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").expect("Windows must define SystemRoot"),
+        )
+        .join("System32")
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
     }
 }
