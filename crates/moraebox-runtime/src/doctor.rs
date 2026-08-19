@@ -33,7 +33,6 @@ pub struct DoctorReport {
     pub hypervisor_entitlement: bool,
     pub libkrun: LibraryProbe,
     pub libkrunfw: LibraryProbe,
-    pub smolvm: ToolProbe,
     pub krunvm: ToolProbe,
     pub native_backend_ready: bool,
     pub warnings: Vec<String>,
@@ -86,7 +85,6 @@ impl DoctorReport {
             ],
             &[],
         );
-        let smolvm = probe_tool("smolvm");
         let krunvm = probe_tool("krunvm");
         let native_backend_ready = host_supported
             && hypervisor_framework
@@ -107,9 +105,6 @@ impl DoctorReport {
                     .into(),
             );
         }
-        if !smolvm.found {
-            warnings.push("smolvm is unavailable for the Phase 0 performance baseline".into());
-        }
         Self {
             expected_libkrun_version: "1.19.4".into(),
             expected_libkrunfw_version: "5.5.0".into(),
@@ -122,7 +117,6 @@ impl DoctorReport {
             hypervisor_entitlement,
             libkrun,
             libkrunfw,
-            smolvm,
             krunvm,
             native_backend_ready,
             warnings,
