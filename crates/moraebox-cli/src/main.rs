@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     io::{self, IsTerminal, Read, Write},
     path::PathBuf,
     process::ExitCode,
@@ -172,13 +173,26 @@ struct BenchmarkArgs {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match execute(Cli::parse()).await {
+    let cli = Cli::parse_from(normalize_help_alias(std::env::args_os()));
+    match execute(cli).await {
         Ok(code) => exit_code(code),
         Err(error) => {
             eprintln!("morae: {error}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn normalize_help_alias<I, T>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let mut args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    if args.len() == 3 && args[1] == "run" && args[2] == "help" {
+        args[2] = "--help".into();
+    }
+    args
 }
 
 async fn execute(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
@@ -563,5 +577,25 @@ mod tests {
             ("A".into(), "hello world".into())
         );
         assert!(parse_env("MISSING").is_err());
+    }
+
+    #[test]
+    fn run_help_alias_preserves_literal_help_command() {
+        for args in [["morae", "run", "help"], ["morae", "run", "--help"]] {
+            let error = Cli::try_parse_from(normalize_help_alias(args)).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+            assert!(
+                error
+                    .to_string()
+                    .contains("Usage: morae run [OPTIONS] <COMMAND>...")
+            );
+        }
+
+        let cli =
+            Cli::try_parse_from(normalize_help_alias(["morae", "run", "--", "help"])).unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.command, ["help"]);
     }
 }

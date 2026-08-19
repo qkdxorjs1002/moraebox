@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
+use std::{ffi::OsString, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
@@ -36,7 +36,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match create_sdk(Args::parse()) {
+    let args = parse_args_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
+    match create_sdk(args) {
         Ok(sdk) => match serve(sdk).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -49,6 +50,27 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn parse_args_from<I, T>(args: I) -> Result<Args, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let raw_args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    let parsed = Args::try_parse_from(raw_args.clone())?;
+    if should_show_bare_help(&raw_args, &parsed) {
+        let program = raw_args
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "morae-mcp".into());
+        return Args::try_parse_from([program, "--help".into()]);
+    }
+    Ok(parsed)
+}
+
+fn should_show_bare_help(raw_args: &[OsString], parsed: &Args) -> bool {
+    raw_args.len() == 1 && parsed.rootfs.is_none()
 }
 
 fn create_sdk(args: Args) -> Result<SandboxSdk, String> {
@@ -429,6 +451,21 @@ mod tests {
             call.pointer("/result/structuredContent/status/exit_code"),
             Some(&json!(0))
         );
+    }
+
+    #[test]
+    fn bare_invocation_shows_help_unless_runtime_is_configured() {
+        let error = parse_args_from(["morae-mcp"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+
+        let raw_args = [OsString::from("morae-mcp")];
+        let mut configured = Args::try_parse_from(["morae-mcp"]).unwrap();
+        assert!(should_show_bare_help(&raw_args, &configured));
+        configured.rootfs = Some("rootfs".into());
+        assert!(!should_show_bare_help(&raw_args, &configured));
+
+        let process = parse_args_from(["morae-mcp", "--backend", "process"]).unwrap();
+        assert_eq!(process.backend, "process");
     }
 
     #[cfg(unix)]
