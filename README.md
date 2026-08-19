@@ -65,8 +65,10 @@ The Homebrew install supplies the validated native libraries and a signed siblin
 
 ```sh
 morae doctor --strict
-morae run --image alpine@latest -- /bin/uname -a
+morae run -- python3 --version
 ```
+
+The built-in default is `docker.io/library/python:3.12`. `run` checks the local cache first and pulls and materializes that image only when it is missing.
 
 `--helper`, `--libkrun`, `MORAE_HELPER_PATH`, `MORAE_LIBKRUN_PATH`, `MORAE_LIBKRUNFW_PATH`, and `MORAE_LIB_DIR` remain available as explicit overrides for nonstandard installations.
 
@@ -117,15 +119,33 @@ morae doctor --strict
 
 `--strict` returns a failure status unless the native backend is ready.
 
-### Pull an OCI image
+### Manage OCI images and caches
 
 ```sh
-morae image pull alpine@latest --json
+morae image default
+morae image default python:3.12
+morae image pull python:3.12 --json
+morae image list                       # alias: image ls
+morae image remove python:3.12         # alias: image rm
 morae image pull ghcr.io/example/image:tag \
   --cache-dir .moraebox/cache
 ```
 
 Registry manifests and blobs are digest-verified before layers are materialized. Registry credentials are accepted only as an explicit username/password pair through options or `MORAE_REGISTRY_USERNAME` and `MORAE_REGISTRY_PASSWORD`.
+
+`morae image default IMAGE` changes the image used when `run` has neither `--rootfs` nor `--image`; `morae image default --unset` restores `python:3.12`. Setting a default does not pull immediately. `run` reuses a matching local image and automatically pulls a cache miss. Removing the cached copy of the default preserves the setting, so the next run pulls it again.
+
+Inspect and reclaim managed storage with:
+
+```sh
+morae cache info
+morae cache prune --dry-run
+morae cache prune --yes
+morae cache clean --all --dry-run
+morae cache clean --all --yes
+```
+
+`prune` removes unreferenced OCI blobs, incomplete root filesystems, and stale image records. `clean --all` removes all managed image, OCI, rootfs, and workspace cache entries and clears the configured default. Destructive cache commands require either `--dry-run` or `--yes`; all image and cache reports also support `--json`.
 
 `oci-layout:` and `docker-archive:` references are parsed by the image layer but are not yet imported by the public CLI.
 
@@ -133,12 +153,13 @@ Registry manifests and blobs are digest-verified before layers are materialized.
 
 ```sh
 morae run \
-  --image alpine@latest \
   --cpus 2 \
   --memory-mib 512 \
   --timeout 30s \
-  -- /bin/echo hello
+  -- python3 -c 'print("hello")'
 ```
+
+Use `--image debian:bookworm` to select a different managed OCI image for one run. `--image` is a registry reference: moraebox owns its verified cache and pulls it automatically when absent. `--rootfs` instead points directly to an already materialized guest root directory. It bypasses image selection, pulling, and cache indexing. The two options are mutually exclusive; `--rootfs` is not a way to expose a host source directory.
 
 Everything after `--` is passed as an argv array. Shell syntax is interpreted only when you explicitly run a shell:
 
@@ -194,23 +215,21 @@ Start the newline-delimited stdio server with either backend:
 ```sh
 morae-mcp --backend process
 
-MORAE_ROOTFS="/path/to/materialized-rootfs" \
-morae-mcp --backend libkrun
+morae-mcp --backend libkrun --image python:3.12
 ```
 
-The MCP server keeps stdout exclusively for protocol messages; diagnostics go to stderr.
+The libkrun server uses the same selection as `morae run`: explicit `--rootfs`, then explicit `--image`, then the configured or built-in `python:3.12` default. Image cache misses are pulled automatically. The MCP server keeps stdout exclusively for protocol messages; diagnostics go to stderr.
 
 ### Register with coding agents
 
 Register `moraebox` as a user-wide stdio MCP server with either supported agent:
 
 ```sh
-morae image pull alpine@latest
 morae-mcp install codex
 morae-mcp install claude-code
 ```
 
-When `--rootfs` and `MORAE_ROOTFS` are absent, the installer searches `.moraebox/cache/rootfs/sha256` for exactly one completed root filesystem and registers its absolute path. Run `morae image pull` from the same directory first. Use `--cache-dir /path/to/cache` for a different cache, or `--rootfs /absolute/path/to/rootfs` to select explicitly when the cache contains multiple images.
+No pre-pull is required. The installer registers the current configured image, or `python:3.12` by default, plus an absolute cache path. The MCP server reuses a local match or pulls it on first use. Use `--image debian:bookworm` to pin another managed image, `--cache-dir /path/to/cache` for another cache, or `--rootfs /absolute/path/to/rootfs` for an advanced unmanaged rootfs. `--image` and `--rootfs` are mutually exclusive.
 
 The installer invokes the agent's official CLI as an argv array and does not edit its configuration files directly. Preview the exact program and argv without changing configuration:
 
@@ -244,10 +263,7 @@ For Codex, add this user-wide entry to `~/.codex/config.toml`:
 ```toml
 [mcp_servers.moraebox]
 command = "morae-mcp"
-args = ["--backend", "libkrun", "--cpus", "2", "--memory-mib", "512"]
-
-[mcp_servers.moraebox.env]
-MORAE_ROOTFS = "/absolute/path/to/materialized-rootfs"
+args = ["--backend", "libkrun", "--image", "docker.io/library/python:3.12", "--cache-dir", "/absolute/path/to/moraebox-cache", "--cpus", "2", "--memory-mib", "512"]
 ```
 
 For Claude Code project scope, or another client that accepts the common `mcpServers` JSON shape, use:
@@ -257,16 +273,13 @@ For Claude Code project scope, or another client that accepts the common `mcpSer
   "mcpServers": {
     "moraebox": {
       "command": "morae-mcp",
-      "args": ["--backend", "libkrun", "--cpus", "2", "--memory-mib", "512"],
-      "env": {
-        "MORAE_ROOTFS": "/absolute/path/to/materialized-rootfs"
-      }
+      "args": ["--backend", "libkrun", "--image", "docker.io/library/python:3.12", "--cache-dir", "/absolute/path/to/moraebox-cache", "--cpus", "2", "--memory-mib", "512"]
     }
   }
 }
 ```
 
-Claude Code reads this project-scoped shape from `.mcp.json` and asks for project approval. Other clients may use a different settings-file location. To configure the non-isolated process backend manually, use `args: ["--backend", "process"]` and omit the native runtime environment.
+Claude Code reads this project-scoped shape from `.mcp.json` and asks for project approval. Other clients may use a different settings-file location. As an advanced alternative, replace `--image ... --cache-dir ...` with `--rootfs /absolute/path/to/materialized-rootfs`. To configure the non-isolated process backend manually, use `args: ["--backend", "process"]` and omit image and native runtime options.
 
 | Tool | Purpose |
 | --- | --- |

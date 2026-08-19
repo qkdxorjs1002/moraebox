@@ -7,6 +7,7 @@ use std::{ffi::OsString, path::PathBuf, process::ExitCode, str::FromStr, sync::A
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand};
 use moraebox_core::{OutputChunk, RunSpec, SessionId, Signal, TimeoutPolicy};
+use moraebox_image::{Credentials, ImageCache, Platform};
 use moraebox_runtime::{
     Backend, LibkrunBackend, LibkrunConfig, NativeRuntimePaths, ProcessBackend,
 };
@@ -40,8 +41,23 @@ struct ServerArgs {
     helper: Option<PathBuf>,
     #[arg(long, env = "MORAE_LIBKRUN_PATH")]
     libkrun: Option<PathBuf>,
+    /// Use an already materialized guest root directory instead of a managed image.
     #[arg(long, env = "MORAE_ROOTFS")]
     rootfs: Option<PathBuf>,
+    /// OCI image reference. Uses the configured default image when omitted.
+    #[arg(long, conflicts_with = "rootfs")]
+    image: Option<String>,
+    #[arg(long, default_value = ".moraebox/cache")]
+    cache_dir: PathBuf,
+    #[arg(long, env = "MORAE_REGISTRY_USERNAME", requires = "registry_password")]
+    registry_username: Option<String>,
+    #[arg(
+        long,
+        env = "MORAE_REGISTRY_PASSWORD",
+        requires = "registry_username",
+        hide_env_values = true
+    )]
+    registry_password: Option<String>,
     #[arg(long, env = "MORAE_LIB_DIR")]
     lib_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 2)]
@@ -63,7 +79,7 @@ async fn main() -> ExitCode {
             }
         };
     }
-    match create_sdk(server) {
+    match create_sdk(server).await {
         Ok(sdk) => match serve(sdk).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -96,12 +112,20 @@ where
 }
 
 fn should_show_bare_help(raw_args: &[OsString], parsed: &Args) -> bool {
-    raw_args.len() == 1 && parsed.command.is_none() && parsed.server.rootfs.is_none()
+    raw_args.len() == 1
+        && parsed.command.is_none()
+        && parsed.server.rootfs.is_none()
+        && parsed.server.image.is_none()
 }
 
-fn create_sdk(args: ServerArgs) -> Result<SandboxSdk, String> {
+async fn create_sdk(args: ServerArgs) -> Result<SandboxSdk, Box<dyn std::error::Error>> {
     let backend: Arc<dyn Backend> = match args.backend.as_str() {
-        "process" => Arc::new(ProcessBackend),
+        "process" => {
+            if args.image.is_some() {
+                return Err("--image requires --backend libkrun".into());
+            }
+            Arc::new(ProcessBackend)
+        }
         "libkrun" => {
             let paths = NativeRuntimePaths::discover(args.helper, args.libkrun, args.lib_dir);
             let helper = paths.helper.ok_or(
@@ -110,9 +134,25 @@ fn create_sdk(args: ServerArgs) -> Result<SandboxSdk, String> {
             let library = paths.libkrun.ok_or(
                 "libkrun backend requires --libkrun, MORAE_LIBKRUN_PATH, or a supported Homebrew libkrun",
             )?;
-            let root = args
-                .rootfs
-                .ok_or("libkrun backend requires --rootfs or MORAE_ROOTFS")?;
+            let root = if let Some(rootfs) = args.rootfs {
+                rootfs
+            } else {
+                let cache = ImageCache::new(&args.cache_dir);
+                let reference = match args.image {
+                    Some(reference) => reference,
+                    None => cache.default_reference()?,
+                };
+                cache
+                    .resolve_or_pull(
+                        &reference,
+                        &Platform::host_linux(),
+                        args.registry_username
+                            .zip(args.registry_password)
+                            .map(|(username, password)| Credentials { username, password }),
+                    )
+                    .await?
+                    .rootfs
+            };
             let mut config = LibkrunConfig::new(helper, library, root);
             config.library_search_path = paths.library_search_path;
             config.vcpus = args.cpus;
@@ -445,6 +485,7 @@ struct StopArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moraebox_image::Digest;
 
     #[tokio::test]
     async fn initialize_list_and_call_work() {
@@ -490,8 +531,51 @@ mod tests {
         configured.server.rootfs = Some("rootfs".into());
         assert!(!should_show_bare_help(&raw_args, &configured));
 
+        let image = parse_args_from(["morae-mcp", "--image", "python:3.12"]).unwrap();
+        assert_eq!(image.server.image.as_deref(), Some("python:3.12"));
+        assert!(
+            parse_args_from(["morae-mcp", "--rootfs", "rootfs", "--image", "python:3.12"]).is_err()
+        );
+
         let process = parse_args_from(["morae-mcp", "--backend", "process"]).unwrap();
         assert_eq!(process.server.backend, "process");
+    }
+
+    #[tokio::test]
+    async fn cached_image_configures_the_mcp_backend_without_network_access() {
+        let cache_dir =
+            std::env::temp_dir().join(format!("moraebox-mcp-cached-image-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let cache = ImageCache::new(&cache_dir);
+        let digest = Digest::from_bytes(b"cached-manifest");
+        let rootfs = cache_dir.join("rootfs/sha256").join(digest.hex());
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::write(rootfs.join(".moraebox-rootfs-complete"), digest.to_string()).unwrap();
+        let platform = Platform::host_linux();
+        let lock = cache.lock_exclusive().unwrap();
+        cache
+            .record_image(&lock, "python:3.12", &digest, &platform)
+            .unwrap();
+        drop(lock);
+
+        let runtime_stub = cache_dir.join("runtime-stub");
+        std::fs::write(&runtime_stub, b"stub").unwrap();
+        let result = create_sdk(ServerArgs {
+            backend: "libkrun".into(),
+            helper: Some(runtime_stub.clone()),
+            libkrun: Some(runtime_stub),
+            rootfs: None,
+            image: Some("python:3.12".into()),
+            cache_dir: cache_dir.clone(),
+            registry_username: None,
+            registry_password: None,
+            lib_dir: None,
+            cpus: 2,
+            memory_mib: 512,
+        })
+        .await;
+        assert!(result.is_ok(), "unexpected error: {:?}", result.err());
+        std::fs::remove_dir_all(cache_dir).unwrap();
     }
 
     #[cfg(unix)]

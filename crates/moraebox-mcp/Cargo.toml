@@ -14,6 +14,7 @@ path = "src/main.rs"
 base64.workspace = true
 clap = { workspace = true, features = ["env"] }
 moraebox-core = { path = "../moraebox-core" }
+moraebox-image = { path = "../moraebox-image" }
 moraebox-runtime = { path = "../moraebox-runtime" }
 moraebox-sdk = { path = "../moraebox-sdk" }
 serde.workspace = true

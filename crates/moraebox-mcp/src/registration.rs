@@ -1,12 +1,12 @@
 use std::{
     env,
     ffi::{OsStr, OsString},
-    fs,
     path::{Path, PathBuf},
     process::Command,
 };
 
 use clap::{Args, ValueEnum};
+use moraebox_image::ImageCache;
 use serde_json::json;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -50,10 +50,13 @@ pub struct InstallArgs {
     /// Sandbox backend. `process` is deterministic but is not isolated.
     #[arg(long, value_enum, default_value_t = RegistrationBackend::Libkrun)]
     backend: RegistrationBackend,
-    /// Root filesystem registered for the libkrun backend.
+    /// Register an already materialized guest root directory instead of an image.
     #[arg(long, env = "MORAE_ROOTFS")]
     rootfs: Option<PathBuf>,
-    /// Cache searched for a single prepared root filesystem.
+    /// OCI image registered for the libkrun backend; defaults to python:3.12.
+    #[arg(long, conflicts_with = "rootfs")]
+    image: Option<String>,
+    /// Image and rootfs cache used by the registered server.
     #[arg(long, default_value = ".moraebox/cache")]
     cache_dir: PathBuf,
     /// Override the automatically discovered signed VMM helper.
@@ -181,6 +184,9 @@ fn build_command_plan(
 
 fn server_configuration(install: &InstallArgs) -> Result<ServerConfiguration, String> {
     if install.backend == RegistrationBackend::Process {
+        if install.image.is_some() {
+            return Err("--image requires --backend libkrun".into());
+        }
         return Ok((
             Vec::new(),
             vec![
@@ -190,8 +196,28 @@ fn server_configuration(install: &InstallArgs) -> Result<ServerConfiguration, St
         ));
     }
 
-    let rootfs = resolve_rootfs(install)?;
-    let mut environment = vec![("MORAE_ROOTFS", rootfs.as_os_str().to_owned())];
+    let mut environment = Vec::new();
+    let mut server_args = vec![
+        "--backend".into(),
+        RegistrationBackend::Libkrun.as_str().into(),
+    ];
+    if let Some(rootfs) = &install.rootfs {
+        environment.push(("MORAE_ROOTFS", rootfs.as_os_str().to_owned()));
+    } else {
+        let reference = match &install.image {
+            Some(reference) => reference.clone(),
+            None => ImageCache::new(&install.cache_dir)
+                .default_reference()
+                .map_err(|error| error.to_string())?,
+        };
+        let cache_dir = absolute_path(&install.cache_dir)?;
+        server_args.extend([
+            "--image".into(),
+            reference.into(),
+            "--cache-dir".into(),
+            cache_dir.into_os_string(),
+        ]);
+    }
     for (name, path) in [
         ("MORAE_HELPER_PATH", install.helper.as_ref()),
         ("MORAE_LIBKRUN_PATH", install.libkrun.as_ref()),
@@ -201,90 +227,22 @@ fn server_configuration(install: &InstallArgs) -> Result<ServerConfiguration, St
             environment.push((name, path.as_os_str().to_owned()));
         }
     }
-    let server_args = vec![
-        "--backend".into(),
-        RegistrationBackend::Libkrun.as_str().into(),
+    server_args.extend([
         "--cpus".into(),
         install.cpus.to_string().into(),
         "--memory-mib".into(),
         install.memory_mib.to_string().into(),
-    ];
+    ]);
     Ok((environment, server_args))
 }
 
-fn resolve_rootfs(install: &InstallArgs) -> Result<PathBuf, String> {
-    if let Some(rootfs) = &install.rootfs {
-        return Ok(rootfs.clone());
+fn absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path.into());
     }
-
-    discover_cached_rootfs(&install.cache_dir)
-}
-
-fn discover_cached_rootfs(cache_dir: &Path) -> Result<PathBuf, String> {
-    let directory = cache_dir.join("rootfs").join("sha256");
-    let entries = match fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(no_cached_rootfs_message(&directory));
-        }
-        Err(error) => {
-            return Err(format!(
-                "failed to inspect rootfs cache {}: {error}",
-                directory.display()
-            ));
-        }
-    };
-
-    let mut candidates = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            format!(
-                "failed to inspect rootfs cache {}: {error}",
-                directory.display()
-            )
-        })?;
-        let path = entry.path();
-        let is_directory = entry
-            .file_type()
-            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?
-            .is_dir();
-        if is_directory && has_complete_marker(&path) {
-            candidates.push(path);
-        }
-    }
-    candidates.sort();
-
-    match candidates.as_slice() {
-        [] => Err(no_cached_rootfs_message(&directory)),
-        [rootfs] => rootfs.canonicalize().map_err(|error| {
-            format!(
-                "failed to resolve cached rootfs {}: {error}",
-                rootfs.display()
-            )
-        }),
-        _ => Err(format!(
-            "found {} prepared rootfs directories in {}; pass --rootfs to choose one",
-            candidates.len(),
-            directory.display()
-        )),
-    }
-}
-
-fn has_complete_marker(rootfs: &Path) -> bool {
-    [
-        ".moraebox-rootfs-complete",
-        // Compatibility with root filesystems materialized before the project rename.
-        ".fastmvm-rootfs-complete",
-    ]
-    .iter()
-    .any(|marker| rootfs.join(marker).is_file())
-}
-
-fn no_cached_rootfs_message(directory: &Path) -> String {
-    format!(
-        "no prepared rootfs found in {}; run `morae image pull alpine@latest`, or pass --rootfs",
-        directory.display()
-    )
+    env::current_dir()
+        .map(|directory| directory.join(path))
+        .map_err(|error| format!("failed to resolve cache path: {error}"))
 }
 
 fn env_assignment(key: &str, value: &OsStr) -> OsString {
@@ -347,6 +305,7 @@ fn parse_server_name(input: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn install_args(agent: Agent) -> InstallArgs {
         InstallArgs {
@@ -354,6 +313,7 @@ mod tests {
             name: "moraebox".into(),
             backend: RegistrationBackend::Libkrun,
             rootfs: Some("/rootfs".into()),
+            image: None,
             cache_dir: ".moraebox/cache".into(),
             helper: None,
             libkrun: None,
@@ -436,49 +396,65 @@ mod tests {
     }
 
     #[test]
-    fn libkrun_registration_reports_missing_cached_rootfs() {
-        let cache = TestCache::new("missing");
+    fn libkrun_registration_uses_python_default_without_a_rootfs() {
+        let cache = TestCache::new("default");
         let mut install = install_args(Agent::Codex);
         install.rootfs = None;
         install.cache_dir = cache.path.clone();
-        let error = server_configuration(&install).unwrap_err();
-        assert!(error.contains("no prepared rootfs found"));
-        assert!(error.contains("morae image pull alpine@latest"));
+        let (environment, server_args) = server_configuration(&install).unwrap();
+        assert!(environment.is_empty());
+        assert_eq!(
+            string_args_from(&server_args),
+            [
+                "--backend",
+                "libkrun",
+                "--image",
+                "docker.io/library/python:3.12",
+                "--cache-dir",
+                cache.path.to_str().unwrap(),
+                "--cpus",
+                "2",
+                "--memory-mib",
+                "512",
+            ]
+        );
     }
 
     #[test]
-    fn discovers_single_completed_cached_rootfs() {
-        let cache = TestCache::new("single");
-        let rootfs = cache.add_rootfs("digest", ".moraebox-rootfs-complete");
+    fn explicit_image_is_registered_without_credentials() {
+        let cache = TestCache::new("explicit");
         let mut install = install_args(Agent::ClaudeCode);
         install.rootfs = None;
+        install.image = Some("debian:bookworm".into());
         install.cache_dir = cache.path.clone();
-
-        let (environment, _) = server_configuration(&install).unwrap();
-        assert_eq!(environment, [("MORAE_ROOTFS", rootfs.into_os_string())]);
+        let (environment, server_args) = server_configuration(&install).unwrap();
+        assert!(environment.is_empty());
+        assert_eq!(server_args[2], "--image");
+        assert_eq!(server_args[3], "debian:bookworm");
     }
 
     #[test]
-    fn accepts_rootfs_from_legacy_complete_marker() {
-        let cache = TestCache::new("legacy");
-        let rootfs = cache.add_rootfs("digest", ".fastmvm-rootfs-complete");
-        assert_eq!(discover_cached_rootfs(&cache.path).unwrap(), rootfs);
-    }
-
-    #[test]
-    fn refuses_to_choose_between_multiple_cached_rootfs_directories() {
-        let cache = TestCache::new("multiple");
-        cache.add_rootfs("digest-a", ".moraebox-rootfs-complete");
-        cache.add_rootfs("digest-b", ".moraebox-rootfs-complete");
-        let error = discover_cached_rootfs(&cache.path).unwrap_err();
-        assert!(error.contains("found 2 prepared rootfs directories"));
-        assert!(error.contains("pass --rootfs"));
+    fn process_registration_rejects_an_image() {
+        let mut install = install_args(Agent::Codex);
+        install.backend = RegistrationBackend::Process;
+        install.rootfs = None;
+        install.image = Some("python:3.12".into());
+        assert_eq!(
+            server_configuration(&install).unwrap_err(),
+            "--image requires --backend libkrun"
+        );
     }
 
     #[test]
     fn validates_portable_server_names() {
         assert_eq!(parse_server_name("moraebox_2").unwrap(), "moraebox_2");
         assert!(parse_server_name("morae box").is_err());
+    }
+
+    fn string_args_from(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
     }
 
     struct TestCache {
@@ -493,13 +469,6 @@ mod tests {
             ));
             let _ = fs::remove_dir_all(&path);
             Self { path }
-        }
-
-        fn add_rootfs(&self, digest: &str, marker: &str) -> PathBuf {
-            let rootfs = self.path.join("rootfs/sha256").join(digest);
-            fs::create_dir_all(&rootfs).unwrap();
-            fs::write(rootfs.join(marker), digest).unwrap();
-            rootfs.canonicalize().unwrap()
         }
     }
 

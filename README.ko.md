@@ -65,8 +65,10 @@ Homebrew 설치가 검증된 native library와 서명된 sibling helper를 제�
 
 ```sh
 morae doctor --strict
-morae run --image alpine@latest -- /bin/uname -a
+morae run -- python3 --version
 ```
+
+내장 기본 이미지는 `docker.io/library/python:3.12`입니다. `run`은 로컬 캐시를 먼저 확인하고 이미지가 없을 때만 pull하고 구체화합니다.
 
 `--helper`, `--libkrun`, `MORAE_HELPER_PATH`, `MORAE_LIBKRUN_PATH`, `MORAE_LIBKRUNFW_PATH`, `MORAE_LIB_DIR`는 비표준 설치를 위한 명시적 override로 계속 사용할 수 있습니다.
 
@@ -117,15 +119,33 @@ morae doctor --strict
 
 `--strict`는 네이티브 백엔드가 준비되지 않았으면 실패 종료 코드를 반환합니다.
 
-### OCI 이미지 pull
+### OCI 이미지와 캐시 관리
 
 ```sh
-morae image pull alpine@latest --json
+morae image default
+morae image default python:3.12
+morae image pull python:3.12 --json
+morae image list                       # 별칭: image ls
+morae image remove python:3.12         # 별칭: image rm
 morae image pull ghcr.io/example/image:tag \
   --cache-dir .moraebox/cache
 ```
 
 레지스트리 manifest와 blob은 레이어를 구체화하기 전에 digest를 검증합니다. 레지스트리 인증 정보는 옵션 또는 `MORAE_REGISTRY_USERNAME`과 `MORAE_REGISTRY_PASSWORD`를 통해 명시적인 사용자 이름/비밀번호 쌍으로만 받습니다.
+
+`morae image default IMAGE`는 `run`에 `--rootfs`와 `--image`가 없을 때 사용할 이미지를 변경합니다. `morae image default --unset`은 `python:3.12`로 복원합니다. 기본값 설정만으로는 pull하지 않습니다. `run`은 일치하는 로컬 이미지를 재사용하고 캐시 miss일 때 자동 pull합니다. 기본 이미지의 캐시 사본을 삭제해도 설정은 유지되므로 다음 실행에서 다시 pull합니다.
+
+관리 중인 저장공간은 다음 명령으로 조회하고 정리합니다.
+
+```sh
+morae cache info
+morae cache prune --dry-run
+morae cache prune --yes
+morae cache clean --all --dry-run
+morae cache clean --all --yes
+```
+
+`prune`은 참조되지 않는 OCI blob, 완료되지 않은 rootfs, 오래된 이미지 레코드를 제거합니다. `clean --all`은 관리 중인 이미지, OCI, rootfs, workspace 캐시 전체를 지우고 설정한 기본값도 초기화합니다. 파괴적인 캐시 명령에는 `--dry-run` 또는 `--yes`가 반드시 필요합니다. 모든 이미지·캐시 보고서는 `--json`도 지원합니다.
 
 이미지 계층은 `oci-layout:`과 `docker-archive:` 참조를 파싱하지만 공개 CLI는 아직 이를 가져오지 않습니다.
 
@@ -133,12 +153,13 @@ morae image pull ghcr.io/example/image:tag \
 
 ```sh
 morae run \
-  --image alpine@latest \
   --cpus 2 \
   --memory-mib 512 \
   --timeout 30s \
-  -- /bin/echo hello
+  -- python3 -c 'print("hello")'
 ```
+
+한 번의 실행에서 다른 관리형 OCI 이미지를 선택하려면 `--image debian:bookworm`을 사용합니다. `--image`는 레지스트리 참조이며 moraebox가 검증된 캐시를 관리하고, 로컬에 없으면 자동 pull합니다. 반면 `--rootfs`는 이미 구체화된 guest root 디렉터리를 직접 가리키며 이미지 선택, pull, 캐시 인덱싱을 우회합니다. 두 옵션은 함께 사용할 수 없고, `--rootfs`는 호스트 소스 디렉터리를 노출하는 옵션이 아닙니다.
 
 `--` 뒤의 모든 값은 argv 배열로 전달됩니다. 셸을 직접 실행할 때만 셸 문법이 해석됩니다.
 
@@ -194,23 +215,21 @@ JSON 보고서에는 최소, p50, p95, p99, 최대 지연 시간이 포함됩니
 ```sh
 morae-mcp --backend process
 
-MORAE_ROOTFS="/path/to/materialized-rootfs" \
-morae-mcp --backend libkrun
+morae-mcp --backend libkrun --image python:3.12
 ```
 
-MCP 서버는 stdout을 프로토콜 메시지 전용으로 유지하며 진단 메시지는 stderr로 보냅니다.
+libkrun 서버도 `morae run`과 같은 순서를 사용합니다. 명시적 `--rootfs`, 명시적 `--image`, 설정 또는 내장 `python:3.12` 기본값 순으로 선택하며 이미지가 캐시에 없으면 자동 pull합니다. MCP 서버는 stdout을 프로토콜 메시지 전용으로 유지하며 진단 메시지는 stderr로 보냅니다.
 
 ### 코딩 에이전트에 등록
 
 지원하는 에이전트에 `moraebox`를 사용자 전역 stdio MCP 서버로 등록합니다.
 
 ```sh
-morae image pull alpine@latest
 morae-mcp install codex
 morae-mcp install claude-code
 ```
 
-`--rootfs`와 `MORAE_ROOTFS`가 없으면 `.moraebox/cache/rootfs/sha256`에서 완료된 rootfs가 정확히 하나인지 찾아 절대 경로로 등록합니다. 먼저 같은 디렉터리에서 `morae image pull`을 실행합니다. 다른 캐시는 `--cache-dir /path/to/cache`로 지정하고, 캐시에 이미지가 여러 개이면 `--rootfs /absolute/path/to/rootfs`로 하나를 명시합니다.
+미리 pull할 필요가 없습니다. 설치기는 현재 설정한 이미지 또는 기본 `python:3.12`와 절대 캐시 경로를 등록합니다. MCP 서버는 로컬 캐시가 있으면 재사용하고 처음 사용할 때 없으면 pull합니다. 다른 관리형 이미지는 `--image debian:bookworm`, 다른 캐시는 `--cache-dir /path/to/cache`, 고급 unmanaged rootfs는 `--rootfs /absolute/path/to/rootfs`로 선택합니다. `--image`와 `--rootfs`는 함께 사용할 수 없습니다.
 
 등록 명령은 에이전트의 공식 CLI를 argv 배열로 호출하며 설정 파일을 직접 편집하지 않습니다. 설정을 바꾸지 않고 실행할 프로그램과 argv를 미리 확인할 수 있습니다.
 
@@ -244,10 +263,7 @@ Codex에는 `~/.codex/config.toml`에 다음 사용자 전역 항목을 추가�
 ```toml
 [mcp_servers.moraebox]
 command = "morae-mcp"
-args = ["--backend", "libkrun", "--cpus", "2", "--memory-mib", "512"]
-
-[mcp_servers.moraebox.env]
-MORAE_ROOTFS = "/absolute/path/to/materialized-rootfs"
+args = ["--backend", "libkrun", "--image", "docker.io/library/python:3.12", "--cache-dir", "/absolute/path/to/moraebox-cache", "--cpus", "2", "--memory-mib", "512"]
 ```
 
 Claude Code의 프로젝트 scope 또는 공통 `mcpServers` JSON 형식을 받는 다른 클라이언트에서는 다음 설정을 사용합니다.
@@ -257,16 +273,13 @@ Claude Code의 프로젝트 scope 또는 공통 `mcpServers` JSON 형식을 받�
   "mcpServers": {
     "moraebox": {
       "command": "morae-mcp",
-      "args": ["--backend", "libkrun", "--cpus", "2", "--memory-mib", "512"],
-      "env": {
-        "MORAE_ROOTFS": "/absolute/path/to/materialized-rootfs"
-      }
+      "args": ["--backend", "libkrun", "--image", "docker.io/library/python:3.12", "--cache-dir", "/absolute/path/to/moraebox-cache", "--cpus", "2", "--memory-mib", "512"]
     }
   }
 }
 ```
 
-Claude Code는 프로젝트의 `.mcp.json`에서 이 형식을 읽고 프로젝트 승인을 요청합니다. 다른 클라이언트는 설정 파일 위치가 다를 수 있습니다. 비격리 process backend를 수동 설정하려면 `args: ["--backend", "process"]`를 사용하고 native runtime 환경변수를 생략합니다.
+Claude Code는 프로젝트의 `.mcp.json`에서 이 형식을 읽고 프로젝트 승인을 요청합니다. 다른 클라이언트는 설정 파일 위치가 다를 수 있습니다. 고급 대안으로 `--image ... --cache-dir ...` 대신 `--rootfs /absolute/path/to/materialized-rootfs`를 사용할 수 있습니다. 비격리 process backend를 수동 설정하려면 `args: ["--backend", "process"]`를 사용하고 이미지와 native runtime 옵션을 생략합니다.
 
 | 도구 | 용도 |
 | --- | --- |
