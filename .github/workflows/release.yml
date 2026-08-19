@@ -188,6 +188,7 @@ jobs:
           source_root="${verify_root}/moraebox-${RELEASE_VERSION}"
           test -f "${source_root}/Cargo.toml"
           test -f "${source_root}/Cargo.lock"
+          test -f "${source_root}/LICENSE"
           test -f "${source_root}/assets/moraebox-vmm.entitlements"
           test "$(
             cargo metadata \
@@ -365,6 +366,7 @@ jobs:
                 system "cargo", "install", *std_cargo_args(path: "crates/moraebox-cli")
                 system "cargo", "install", *std_cargo_args(path: "crates/moraebox-mcp")
                 system "cargo", "install", *std_cargo_args(path: "crates/moraebox-vmm-helper")
+                doc.install "LICENSE"
 
                 helper = bin/"morae-vmm-helper"
                 helper.chmod 0755

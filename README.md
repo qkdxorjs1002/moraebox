@@ -274,4 +274,4 @@ Bug reports and focused pull requests are welcome. Please include the backend, h
 
 ## License
 
-moraebox is licensed under the Apache License 2.0.
+moraebox is licensed under the [Apache License 2.0](LICENSE).

@@ -274,4 +274,4 @@ cargo test --workspace
 
 ## 라이선스
 
-moraebox는 Apache License 2.0으로 배포됩니다.
+moraebox는 [Apache License 2.0](LICENSE)으로 배포됩니다.
