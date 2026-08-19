@@ -162,11 +162,7 @@ mod tests {
     async fn process_owned_session_supports_incremental_io() {
         let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
         let status = sdk
-            .start(RunSpec::command([
-                "/bin/sh",
-                "-c",
-                "read value; printf '%s' \"$value\"",
-            ]))
+            .start(RunSpec::command(stdin_echo_command()))
             .await
             .unwrap();
         let first = sdk
@@ -191,6 +187,38 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(output.output[0].data, b"sdk");
+        assert!(
+            output
+                .output
+                .iter()
+                .any(|chunk| chunk.data.starts_with(b"sdk"))
+        );
+    }
+
+    #[cfg(unix)]
+    fn stdin_echo_command() -> Vec<String> {
+        ["/bin/sh", "-c", "read value; printf '%s' \"$value\""]
+            .map(String::from)
+            .into()
+    }
+
+    #[cfg(windows)]
+    fn stdin_echo_command() -> Vec<String> {
+        vec![
+            windows_system_executable("findstr.exe"),
+            "/R".into(),
+            ".*".into(),
+        ]
+    }
+
+    #[cfg(windows)]
+    fn windows_system_executable(name: &str) -> String {
+        std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").expect("Windows must define SystemRoot"),
+        )
+        .join("System32")
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
     }
 }

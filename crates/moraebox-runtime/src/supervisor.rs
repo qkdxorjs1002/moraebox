@@ -289,18 +289,22 @@ mod tests {
     #[tokio::test]
     async fn captures_stdout_stderr_and_exit_code() {
         let supervisor = Supervisor::new(ProcessBackend);
-        let spec = RunSpec::command(["/bin/sh", "-c", "printf out; printf err >&2; exit 7"]);
+        let spec = RunSpec::command(output_and_exit_command());
         let report = supervisor.run(spec).await.unwrap();
         assert_eq!(report.exit_code, Some(7));
         assert_eq!(report.state, SessionState::Dead);
-        assert!(report.output.iter().any(|chunk| chunk.data == b"out"));
-        assert!(report.output.iter().any(|chunk| chunk.data == b"err"));
+        assert!(report.output.iter().any(|chunk| {
+            chunk.channel == OutputChannel::Stdout && chunk.data.starts_with(b"out")
+        }));
+        assert!(report.output.iter().any(|chunk| {
+            chunk.channel == OutputChannel::Stderr && chunk.data.starts_with(b"err")
+        }));
     }
 
     #[tokio::test]
     async fn enforces_timeout_and_kills_the_process_group() {
         let supervisor = Supervisor::new(ProcessBackend);
-        let mut spec = RunSpec::command(["/bin/sh", "-c", "sleep 30"]);
+        let mut spec = RunSpec::command(long_running_command());
         spec.timeout = TimeoutPolicy::Limited(30);
         spec.kill_grace = Duration::from_millis(30);
         let report = supervisor.run(spec).await.unwrap();
@@ -311,9 +315,68 @@ mod tests {
     #[tokio::test]
     async fn closes_stdin_after_writing() {
         let supervisor = Supervisor::new(ProcessBackend);
-        let mut spec = RunSpec::command(["/bin/sh", "-c", "cat"]);
+        let mut spec = RunSpec::command(stdin_echo_command());
         spec.stdin = b"input".to_vec();
         let report = supervisor.run(spec).await.unwrap();
-        assert!(report.output.iter().any(|chunk| chunk.data == b"input"));
+        assert!(report.output.iter().any(|chunk| {
+            chunk.channel == OutputChannel::Stdout && chunk.data.starts_with(b"input")
+        }));
+    }
+
+    #[cfg(unix)]
+    fn output_and_exit_command() -> Vec<String> {
+        ["/bin/sh", "-c", "printf out; printf err >&2; exit 7"]
+            .map(String::from)
+            .into()
+    }
+
+    #[cfg(windows)]
+    fn output_and_exit_command() -> Vec<String> {
+        vec![
+            windows_system_executable("cmd.exe"),
+            "/D".into(),
+            "/C".into(),
+            "echo out&echo err>&2&exit /b 7".into(),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn long_running_command() -> Vec<String> {
+        ["/bin/sh", "-c", "sleep 30"].map(String::from).into()
+    }
+
+    #[cfg(windows)]
+    fn long_running_command() -> Vec<String> {
+        vec![
+            windows_system_executable("ping.exe"),
+            "-n".into(),
+            "31".into(),
+            "127.0.0.1".into(),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn stdin_echo_command() -> Vec<String> {
+        ["/bin/sh", "-c", "cat"].map(String::from).into()
+    }
+
+    #[cfg(windows)]
+    fn stdin_echo_command() -> Vec<String> {
+        vec![
+            windows_system_executable("findstr.exe"),
+            "/R".into(),
+            ".*".into(),
+        ]
+    }
+
+    #[cfg(windows)]
+    fn windows_system_executable(name: &str) -> String {
+        std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").expect("Windows must define SystemRoot"),
+        )
+        .join("System32")
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
     }
 }
