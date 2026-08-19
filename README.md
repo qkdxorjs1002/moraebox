@@ -200,6 +200,72 @@ morae-mcp --backend libkrun
 
 The MCP server keeps stdout exclusively for protocol messages; diagnostics go to stderr.
 
+### Register with coding agents
+
+Register `moraebox` as a user-wide stdio MCP server with either supported agent:
+
+```sh
+morae-mcp install codex --rootfs /absolute/path/to/materialized-rootfs
+morae-mcp install claude-code --rootfs /absolute/path/to/materialized-rootfs
+```
+
+`MORAE_ROOTFS` can replace `--rootfs`. The installer invokes the agent's official CLI as an argv array and does not edit its configuration files directly. Preview the exact program and argv without changing configuration:
+
+```sh
+MORAE_ROOTFS="/absolute/path/to/materialized-rootfs" \
+morae-mcp install codex --dry-run
+```
+
+The installed server command is resolved from the current `morae-mcp` invocation. Use `--server-command /absolute/path/to/morae-mcp` when the agent will not inherit the same `PATH`. Explicit `--helper`, `--libkrun`, and `--lib-dir` overrides, or their `MORAE_*` environment equivalents, are copied into the registration. Homebrew installations normally auto-discover those native runtime paths.
+
+For deterministic development without isolation, opt in explicitly:
+
+```sh
+morae-mcp install codex --backend process
+```
+
+This prints a warning because the process backend does **not** provide VM isolation.
+
+Verify or remove the user-wide registration with the agent CLI:
+
+| Agent | Verify | Remove |
+| --- | --- | --- |
+| Codex | `codex mcp list` | `codex mcp remove moraebox` |
+| Claude Code | `claude mcp get moraebox` | `claude mcp remove --scope user moraebox` |
+
+The commands follow the official [Codex MCP](https://developers.openai.com/codex/mcp) and [Claude Code MCP](https://code.claude.com/docs/en/mcp) configuration formats.
+
+### Manual registration
+
+For Codex, add this user-wide entry to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.moraebox]
+command = "morae-mcp"
+args = ["--backend", "libkrun", "--cpus", "2", "--memory-mib", "512"]
+
+[mcp_servers.moraebox.env]
+MORAE_ROOTFS = "/absolute/path/to/materialized-rootfs"
+```
+
+For Claude Code project scope, or another client that accepts the common `mcpServers` JSON shape, use:
+
+```json
+{
+  "mcpServers": {
+    "moraebox": {
+      "command": "morae-mcp",
+      "args": ["--backend", "libkrun", "--cpus", "2", "--memory-mib", "512"],
+      "env": {
+        "MORAE_ROOTFS": "/absolute/path/to/materialized-rootfs"
+      }
+    }
+  }
+}
+```
+
+Claude Code reads this project-scoped shape from `.mcp.json` and asks for project approval. Other clients may use a different settings-file location. To configure the non-isolated process backend manually, use `args: ["--backend", "process"]` and omit the native runtime environment.
+
 | Tool | Purpose |
 | --- | --- |
 | `sandbox_exec` | Start a one-shot command or an asynchronous session |

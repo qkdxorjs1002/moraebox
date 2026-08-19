@@ -200,6 +200,72 @@ morae-mcp --backend libkrun
 
 MCP 서버는 stdout을 프로토콜 메시지 전용으로 유지하며 진단 메시지는 stderr로 보냅니다.
 
+### 코딩 에이전트에 등록
+
+지원하는 에이전트에 `moraebox`를 사용자 전역 stdio MCP 서버로 등록합니다.
+
+```sh
+morae-mcp install codex --rootfs /absolute/path/to/materialized-rootfs
+morae-mcp install claude-code --rootfs /absolute/path/to/materialized-rootfs
+```
+
+`--rootfs` 대신 `MORAE_ROOTFS`를 사용할 수 있습니다. 등록 명령은 에이전트의 공식 CLI를 argv 배열로 호출하며 설정 파일을 직접 편집하지 않습니다. 설정을 바꾸지 않고 실행할 프로그램과 argv를 미리 확인할 수 있습니다.
+
+```sh
+MORAE_ROOTFS="/absolute/path/to/materialized-rootfs" \
+morae-mcp install codex --dry-run
+```
+
+등록되는 서버 명령은 현재 `morae-mcp` 실행 경로에서 해석합니다. 에이전트가 같은 `PATH`를 상속하지 않는 환경이라면 `--server-command /absolute/path/to/morae-mcp`를 지정합니다. 명시적인 `--helper`, `--libkrun`, `--lib-dir` 재정의 또는 대응하는 `MORAE_*` 환경변수도 등록에 복사합니다. Homebrew 설치는 보통 이 native runtime 경로를 자동으로 찾습니다.
+
+격리 없는 결정적 개발 환경이 필요할 때만 명시적으로 선택합니다.
+
+```sh
+morae-mcp install codex --backend process
+```
+
+process backend는 VM 격리를 제공하지 않으므로 경고를 출력합니다.
+
+에이전트 CLI에서 사용자 전역 등록을 확인하거나 제거할 수 있습니다.
+
+| 에이전트 | 확인 | 제거 |
+| --- | --- | --- |
+| Codex | `codex mcp list` | `codex mcp remove moraebox` |
+| Claude Code | `claude mcp get moraebox` | `claude mcp remove --scope user moraebox` |
+
+이 명령은 공식 [Codex MCP](https://developers.openai.com/codex/mcp) 및 [Claude Code MCP](https://code.claude.com/docs/en/mcp) 설정 형식을 따릅니다.
+
+### 수동 등록
+
+Codex에는 `~/.codex/config.toml`에 다음 사용자 전역 항목을 추가합니다.
+
+```toml
+[mcp_servers.moraebox]
+command = "morae-mcp"
+args = ["--backend", "libkrun", "--cpus", "2", "--memory-mib", "512"]
+
+[mcp_servers.moraebox.env]
+MORAE_ROOTFS = "/absolute/path/to/materialized-rootfs"
+```
+
+Claude Code의 프로젝트 scope 또는 공통 `mcpServers` JSON 형식을 받는 다른 클라이언트에서는 다음 설정을 사용합니다.
+
+```json
+{
+  "mcpServers": {
+    "moraebox": {
+      "command": "morae-mcp",
+      "args": ["--backend", "libkrun", "--cpus", "2", "--memory-mib", "512"],
+      "env": {
+        "MORAE_ROOTFS": "/absolute/path/to/materialized-rootfs"
+      }
+    }
+  }
+}
+```
+
+Claude Code는 프로젝트의 `.mcp.json`에서 이 형식을 읽고 프로젝트 승인을 요청합니다. 다른 클라이언트는 설정 파일 위치가 다를 수 있습니다. 비격리 process backend를 수동 설정하려면 `args: ["--backend", "process"]`를 사용하고 native runtime 환경변수를 생략합니다.
+
 | 도구 | 용도 |
 | --- | --- |
 | `sandbox_exec` | 일회성 명령 또는 비동기 세션 시작 |

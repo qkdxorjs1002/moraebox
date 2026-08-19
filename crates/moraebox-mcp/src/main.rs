@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
+mod registration;
+
 use std::{ffi::OsString, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use moraebox_core::{OutputChunk, RunSpec, SessionId, Signal, TimeoutPolicy};
 use moraebox_runtime::{
     Backend, LibkrunBackend, LibkrunConfig, NativeRuntimePaths, ProcessBackend,
@@ -18,6 +20,20 @@ const PROTOCOL_VERSION: &str = "2026-07-28";
 #[derive(Debug, Parser)]
 #[command(name = "morae-mcp", about = "stdio MCP server for moraebox")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<McpCommand>,
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    /// Register this stdio server with a supported coding agent.
+    Install(registration::InstallArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ServerArgs {
     #[arg(long, default_value = "libkrun", value_parser = ["process", "libkrun"])]
     backend: String,
     #[arg(long, env = "MORAE_HELPER_PATH")]
@@ -37,7 +53,17 @@ struct Args {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = parse_args_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
-    match create_sdk(args) {
+    let Args { command, server } = args;
+    if let Some(McpCommand::Install(args)) = command {
+        return match registration::install(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("morae-mcp: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    match create_sdk(server) {
         Ok(sdk) => match serve(sdk).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -70,10 +96,10 @@ where
 }
 
 fn should_show_bare_help(raw_args: &[OsString], parsed: &Args) -> bool {
-    raw_args.len() == 1 && parsed.rootfs.is_none()
+    raw_args.len() == 1 && parsed.command.is_none() && parsed.server.rootfs.is_none()
 }
 
-fn create_sdk(args: Args) -> Result<SandboxSdk, String> {
+fn create_sdk(args: ServerArgs) -> Result<SandboxSdk, String> {
     let backend: Arc<dyn Backend> = match args.backend.as_str() {
         "process" => Arc::new(ProcessBackend),
         "libkrun" => {
@@ -461,11 +487,11 @@ mod tests {
         let raw_args = [OsString::from("morae-mcp")];
         let mut configured = Args::try_parse_from(["morae-mcp"]).unwrap();
         assert!(should_show_bare_help(&raw_args, &configured));
-        configured.rootfs = Some("rootfs".into());
+        configured.server.rootfs = Some("rootfs".into());
         assert!(!should_show_bare_help(&raw_args, &configured));
 
         let process = parse_args_from(["morae-mcp", "--backend", "process"]).unwrap();
-        assert_eq!(process.backend, "process");
+        assert_eq!(process.server.backend, "process");
     }
 
     #[cfg(unix)]
