@@ -23,6 +23,7 @@ type SetExec =
 type SetWorkdir = unsafe extern "C" fn(u32, *const c_char) -> i32;
 type DisableImplicitVsock = unsafe extern "C" fn(u32) -> i32;
 type AddVsock = unsafe extern "C" fn(u32, u32) -> i32;
+type AddNetUnixgram = unsafe extern "C" fn(u32, *const c_char, i32, *mut u8, u32, u32) -> i32;
 type AddDisk = unsafe extern "C" fn(u32, *const c_char, *const c_char, bool) -> i32;
 type DisableImplicitConsole = unsafe extern "C" fn(u32) -> i32;
 type AddVirtioConsoleDefault = unsafe extern "C" fn(u32, i32, i32, i32) -> i32;
@@ -30,6 +31,12 @@ type StartEnter = unsafe extern "C" fn(u32) -> i32;
 
 const ROOT_TAG: &CStr = c"/dev/root";
 const DEFAULT_DAX_WINDOW: u64 = 256 * 1024 * 1024;
+const NETWORK_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
+// Released libkrun 1.19.4 ABI constants from libkrun.h.
+const NETWORK_FEATURES: u32 = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 14);
+const NET_FLAG_VFKIT: u32 = 1 << 0;
+const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
+const NETWORK_FLAGS: u32 = NET_FLAG_VFKIT | NET_FLAG_DHCP_CLIENT;
 
 #[derive(Debug, Parser)]
 #[command(about = "Signed libkrun VMM helper; normally invoked by morae")]
@@ -47,6 +54,9 @@ struct Args {
     /// Read-only ext4 workspace disk; mounted at /workspace before command execution.
     #[arg(long)]
     workspace_disk: Option<PathBuf>,
+    /// gvproxy vfkit Unix datagram endpoint for opt-in guest egress.
+    #[arg(long)]
+    network_socket: Option<PathBuf>,
     /// Supervisor PID. The helper self-terminates if ownership is lost.
     #[arg(long)]
     parent_pid: Option<u32>,
@@ -87,7 +97,7 @@ fn run(args: Args) -> Result<i32, HelperError> {
         (api.set_vm_config)(context.id, args.cpus, args.memory_mib)
     })?;
     api.configure_root(context.id, &args.root)?;
-    api.configure_no_tsi(context.id)?;
+    api.configure_networking(context.id, args.network_socket.as_deref())?;
     api.configure_console(context.id)?;
     if let Some(workspace) = args.workspace_disk.as_deref() {
         api.configure_workspace_disk(context.id, workspace)?;
@@ -153,6 +163,7 @@ struct KrunApi {
     set_workdir: SetWorkdir,
     disable_implicit_vsock: Option<DisableImplicitVsock>,
     add_vsock: AddVsock,
+    add_net_unixgram: Option<AddNetUnixgram>,
     add_disk: Option<AddDisk>,
     disable_implicit_console: Option<DisableImplicitConsole>,
     add_virtio_console_default: Option<AddVirtioConsoleDefault>,
@@ -176,6 +187,7 @@ impl KrunApi {
             set_workdir: required(&library, b"krun_set_workdir\0")?,
             disable_implicit_vsock: optional(&library, b"krun_disable_implicit_vsock\0"),
             add_vsock: required(&library, b"krun_add_vsock\0")?,
+            add_net_unixgram: optional(&library, b"krun_add_net_unixgram\0"),
             add_disk: optional(&library, b"krun_add_disk\0"),
             disable_implicit_console: optional(&library, b"krun_disable_implicit_console\0"),
             add_virtio_console_default: optional(&library, b"krun_add_virtio_console_default\0"),
@@ -224,8 +236,24 @@ impl KrunApi {
         })
     }
 
-    fn configure_no_tsi(&self, context: u32) -> Result<(), HelperError> {
-        if let Some(disable) = self.disable_implicit_vsock {
+    fn configure_networking(&self, context: u32, socket: Option<&Path>) -> Result<(), HelperError> {
+        Self::configure_networking_with(
+            context,
+            socket,
+            self.disable_implicit_vsock,
+            self.add_vsock,
+            self.add_net_unixgram,
+        )
+    }
+
+    fn configure_networking_with(
+        context: u32,
+        socket: Option<&Path>,
+        disable_implicit_vsock: Option<DisableImplicitVsock>,
+        add_vsock: AddVsock,
+        add_network: Option<AddNetUnixgram>,
+    ) -> Result<(), HelperError> {
+        if let Some(disable) = disable_implicit_vsock {
             Self::check("krun_disable_implicit_vsock", unsafe {
                 // SAFETY: function ABI and live context are validated by construction.
                 disable(context)
@@ -233,7 +261,33 @@ impl KrunApi {
         }
         Self::check("krun_add_vsock(tsi=0)", unsafe {
             // SAFETY: zero is the documented no-TSI feature mask.
-            (self.add_vsock)(context, 0)
+            add_vsock(context, 0)
+        })?;
+        if let Some(socket) = socket {
+            Self::configure_network_with(context, socket, add_network)?;
+        }
+        Ok(())
+    }
+
+    fn configure_network_with(
+        context: u32,
+        socket: &Path,
+        add_network: Option<AddNetUnixgram>,
+    ) -> Result<(), HelperError> {
+        let add_network = add_network.ok_or(HelperError::MissingNetworkApi)?;
+        let socket = path_to_cstring(socket)?;
+        let mut mac = NETWORK_MAC;
+        Self::check("krun_add_net_unixgram(gvproxy)", unsafe {
+            // SAFETY: the socket and MAC buffers remain alive for the call. The flags select
+            // gvproxy's vfkit framing and libkrun's guest DHCP client, without enabling TSI.
+            add_network(
+                context,
+                socket.as_ptr(),
+                -1,
+                mac.as_mut_ptr(),
+                NETWORK_FEATURES,
+                NETWORK_FLAGS,
+            )
         })
     }
 
@@ -411,6 +465,8 @@ enum HelperError {
     MissingRootApi,
     #[error("libkrun does not provide krun_add_disk required for workspace isolation")]
     MissingDiskApi,
+    #[error("libkrun does not provide krun_add_net_unixgram required for network access")]
+    MissingNetworkApi,
     #[error("failed to load libkrun symbol: {0}")]
     Load(#[from] libloading::Error),
     #[error("string contains an interior NUL byte: {0}")]
@@ -429,6 +485,8 @@ mod tests {
 
     static CONSOLE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static CONSOLE_CALL_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+    static NETWORK_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static NETWORK_CALL_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
     unsafe extern "C" fn record_disable_implicit_console(context: u32) -> i32 {
         if context == 7 {
@@ -447,6 +505,51 @@ mod tests {
         if (context, input_fd, output_fd, err_fd) == (7, 0, 1, 2) {
             let _ =
                 CONSOLE_CALL_SEQUENCE.compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst);
+        }
+        0
+    }
+
+    unsafe extern "C" fn record_add_network(
+        context: u32,
+        socket: *const c_char,
+        fd: i32,
+        mac: *mut u8,
+        features: u32,
+        flags: u32,
+    ) -> i32 {
+        let socket = unsafe {
+            // SAFETY: configure_network_with passes a live NUL-terminated CString.
+            CStr::from_ptr(socket)
+        };
+        let mac = unsafe {
+            // SAFETY: configure_network_with passes a live six-byte MAC buffer.
+            std::slice::from_raw_parts(mac, NETWORK_MAC.len())
+        };
+        if context == 9
+            && socket == c"/tmp/gvproxy.sock"
+            && fd == -1
+            && mac == NETWORK_MAC
+            && features == NETWORK_FEATURES
+            && flags == NETWORK_FLAGS
+        {
+            let _ =
+                NETWORK_CALL_SEQUENCE.compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst);
+        }
+        0
+    }
+
+    unsafe extern "C" fn record_disable_implicit_vsock(context: u32) -> i32 {
+        if context == 9 {
+            let _ =
+                NETWORK_CALL_SEQUENCE.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
+        }
+        0
+    }
+
+    unsafe extern "C" fn record_add_vsock(context: u32, tsi_features: u32) -> i32 {
+        if context == 9 && tsi_features == 0 {
+            let _ =
+                NETWORK_CALL_SEQUENCE.compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst);
         }
         0
     }
@@ -494,5 +597,48 @@ mod tests {
         KrunApi::configure_console_with(7, None, Some(record_add_console)).unwrap();
 
         assert_eq!(CONSOLE_CALL_SEQUENCE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn configures_gvproxy_without_tsi_features() {
+        let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+        NETWORK_CALL_SEQUENCE.store(0, Ordering::SeqCst);
+
+        KrunApi::configure_networking_with(
+            9,
+            Some(Path::new("/tmp/gvproxy.sock")),
+            Some(record_disable_implicit_vsock),
+            record_add_vsock,
+            Some(record_add_network),
+        )
+        .unwrap();
+
+        assert_eq!(NETWORK_CALL_SEQUENCE.load(Ordering::SeqCst), 3);
+        assert_eq!(NETWORK_FLAGS & !0b11, 0);
+    }
+
+    #[test]
+    fn network_off_still_adds_control_vsock_with_tsi_disabled() {
+        let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+        NETWORK_CALL_SEQUENCE.store(0, Ordering::SeqCst);
+
+        KrunApi::configure_networking_with(
+            9,
+            None,
+            Some(record_disable_implicit_vsock),
+            record_add_vsock,
+            Some(record_add_network),
+        )
+        .unwrap();
+
+        assert_eq!(NETWORK_CALL_SEQUENCE.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn network_requires_the_released_libkrun_api() {
+        assert!(matches!(
+            KrunApi::configure_network_with(9, Path::new("/tmp/gvproxy.sock"), None),
+            Err(HelperError::MissingNetworkApi)
+        ));
     }
 }

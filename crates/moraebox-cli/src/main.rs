@@ -97,6 +97,9 @@ struct RunArgs {
     /// Override the automatically discovered libkrun library.
     #[arg(long, env = "MORAE_LIBKRUN_PATH")]
     libkrun: Option<PathBuf>,
+    /// Override the automatically discovered gvproxy network helper.
+    #[arg(long, env = "MORAE_GVPROXY_PATH")]
+    gvproxy: Option<PathBuf>,
     /// Use an already materialized guest root directory instead of a managed image.
     #[arg(long, env = "MORAE_ROOTFS")]
     rootfs: Option<PathBuf>,
@@ -139,6 +142,9 @@ struct RunArgs {
     /// Preserve the host environment. The secure default is an empty environment.
     #[arg(long)]
     inherit_env: bool,
+    /// Allow outbound network access from the native VM.
+    #[arg(long)]
+    network: bool,
     #[arg(long)]
     cwd: Option<PathBuf>,
     /// Add one guest environment value as KEY=VALUE.
@@ -361,6 +367,15 @@ fn doctor(args: &DoctorArgs) -> Result<i32, Box<dyn std::error::Error>> {
                 .map_or_else(|| "missing".into(), |path| path.display().to_string())
         );
         println!("native backend ready: {}", report.native_backend_ready);
+        println!(
+            "gvproxy: {}",
+            report
+                .gvproxy
+                .path
+                .as_ref()
+                .map_or_else(|| "missing".into(), |path| path.display().to_string())
+        );
+        println!("native network ready: {}", report.native_network_ready);
         for warning in &report.warnings {
             println!("warning: {warning}");
         }
@@ -373,6 +388,7 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     spec.timeout = parse_timeout(&args.timeout)?;
     spec.tty = args.tty;
     spec.inherit_env = args.inherit_env;
+    spec.network = args.network;
     spec.cwd = args.cwd;
     spec.env = args.env.into_iter().collect::<BTreeMap<_, _>>();
     if spec.inherit_env {
@@ -385,6 +401,7 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     if args.rootfs.is_some() && args.image.is_some() {
         return Err("--rootfs and --image are mutually exclusive".into());
     }
+    validate_network_option(&args.backend, spec.network)?;
     let image_reference = select_image_reference(
         &args.backend,
         args.rootfs.is_some(),
@@ -426,6 +443,7 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
                 args.helper,
                 args.libkrun,
                 args.lib_dir,
+                args.gvproxy,
                 args.rootfs.or(image_root),
                 "--rootfs, --image, or MORAE_ROOTFS",
             )?;
@@ -434,6 +452,7 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
             config.workspace_disk = workspace
                 .as_ref()
                 .map(|snapshot| snapshot.image_path.clone());
+            config.network_runtime_dir = args.cache_dir.join("network");
             Supervisor::new(LibkrunBackend::new(config))
                 .run(spec)
                 .await?
@@ -734,6 +753,7 @@ async fn benchmark(args: BenchmarkArgs) -> Result<i32, Box<dyn std::error::Error
                 args.helper,
                 args.libkrun,
                 args.lib_dir,
+                None,
                 args.rootfs,
                 "--rootfs or MORAE_ROOTFS",
             )?;
@@ -807,10 +827,11 @@ fn native_config(
     helper: Option<PathBuf>,
     libkrun: Option<PathBuf>,
     lib_dir: Option<PathBuf>,
+    gvproxy: Option<PathBuf>,
     root: Option<PathBuf>,
     root_description: &'static str,
 ) -> Result<LibkrunConfig, Box<dyn std::error::Error>> {
-    let paths = NativeRuntimePaths::discover(helper, libkrun, lib_dir);
+    let paths = NativeRuntimePaths::discover_with_gvproxy(helper, libkrun, lib_dir, gvproxy);
     let helper = required_path(
         paths.helper,
         "--helper, MORAE_HELPER_PATH, or a sibling morae-vmm-helper",
@@ -821,6 +842,7 @@ fn native_config(
     )?;
     let mut config = LibkrunConfig::new(helper, library, required_path(root, root_description)?);
     config.library_search_path = paths.library_search_path;
+    config.gvproxy_path = paths.gvproxy;
     Ok(config)
 }
 
@@ -858,6 +880,13 @@ fn parse_timeout(input: &str) -> Result<TimeoutPolicy, Box<dyn std::error::Error
     Ok(TimeoutPolicy::Limited(milliseconds))
 }
 
+fn validate_network_option(backend: &str, network: bool) -> Result<(), &'static str> {
+    if network && backend != "libkrun" {
+        return Err("--network requires --backend libkrun");
+    }
+    Ok(())
+}
+
 fn parse_env(input: &str) -> Result<(String, String), String> {
     let Some((key, value)) = input.split_once('=') else {
         return Err("environment values must use KEY=VALUE".into());
@@ -884,6 +913,31 @@ mod tests {
             TimeoutPolicy::Limited(3_600_000)
         );
         assert_eq!(parse_timeout("none").unwrap(), TimeoutPolicy::Unlimited);
+    }
+
+    #[test]
+    fn parses_network_as_an_explicit_opt_in() {
+        let default = Cli::try_parse_from(["morae", "run", "--", "/usr/bin/true"]).unwrap();
+        let Command::Run(default) = default.command else {
+            panic!("expected run command");
+        };
+        assert!(!default.network);
+
+        let enabled = Cli::try_parse_from([
+            "morae",
+            "run",
+            "--network",
+            "--gvproxy",
+            "/opt/tools/gvproxy",
+            "--",
+            "/usr/bin/true",
+        ])
+        .unwrap();
+        let Command::Run(enabled) = enabled.command else {
+            panic!("expected run command");
+        };
+        assert!(enabled.network);
+        assert_eq!(enabled.gvproxy, Some(PathBuf::from("/opt/tools/gvproxy")));
     }
 
     #[test]

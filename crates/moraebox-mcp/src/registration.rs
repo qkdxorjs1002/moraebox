@@ -65,6 +65,9 @@ pub struct InstallArgs {
     /// Override the automatically discovered libkrun library.
     #[arg(long, env = "MORAE_LIBKRUN_PATH")]
     libkrun: Option<PathBuf>,
+    /// Override the automatically discovered gvproxy network helper.
+    #[arg(long, env = "MORAE_GVPROXY_PATH")]
+    gvproxy: Option<PathBuf>,
     /// Override the automatically discovered libkrun dependency directories.
     #[arg(long, env = "MORAE_LIB_DIR")]
     lib_dir: Option<PathBuf>,
@@ -221,6 +224,7 @@ fn server_configuration(install: &InstallArgs) -> Result<ServerConfiguration, St
     for (name, path) in [
         ("MORAE_HELPER_PATH", install.helper.as_ref()),
         ("MORAE_LIBKRUN_PATH", install.libkrun.as_ref()),
+        ("MORAE_GVPROXY_PATH", install.gvproxy.as_ref()),
         ("MORAE_LIB_DIR", install.lib_dir.as_ref()),
     ] {
         if let Some(path) = path {
@@ -317,6 +321,7 @@ mod tests {
             cache_dir: ".moraebox/cache".into(),
             helper: None,
             libkrun: None,
+            gvproxy: None,
             lib_dir: None,
             cpus: 2,
             memory_mib: 512,
@@ -431,6 +436,18 @@ mod tests {
         assert!(environment.is_empty());
         assert_eq!(server_args[2], "--image");
         assert_eq!(server_args[3], "debian:bookworm");
+    }
+
+    #[test]
+    fn explicit_gvproxy_path_is_registered_as_environment() {
+        let mut install = install_args(Agent::Codex);
+        install.gvproxy = Some("/opt/tools/gvproxy".into());
+
+        let (environment, _) = server_configuration(&install).unwrap();
+
+        assert!(
+            environment.contains(&("MORAE_GVPROXY_PATH", OsString::from("/opt/tools/gvproxy")))
+        );
     }
 
     #[test]

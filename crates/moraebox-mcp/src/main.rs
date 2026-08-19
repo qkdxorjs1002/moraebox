@@ -51,6 +51,9 @@ struct ServerArgs {
     helper: Option<PathBuf>,
     #[arg(long, env = "MORAE_LIBKRUN_PATH")]
     libkrun: Option<PathBuf>,
+    /// Override the automatically discovered gvproxy network helper.
+    #[arg(long, env = "MORAE_GVPROXY_PATH")]
+    gvproxy: Option<PathBuf>,
     /// Use an already materialized guest root directory instead of a managed image.
     #[arg(long, env = "MORAE_ROOTFS")]
     rootfs: Option<PathBuf>,
@@ -137,7 +140,12 @@ async fn create_sdk(args: ServerArgs) -> Result<SandboxSdk, Box<dyn std::error::
             Arc::new(ProcessBackend)
         }
         "libkrun" => {
-            let paths = NativeRuntimePaths::discover(args.helper, args.libkrun, args.lib_dir);
+            let paths = NativeRuntimePaths::discover_with_gvproxy(
+                args.helper,
+                args.libkrun,
+                args.lib_dir,
+                args.gvproxy,
+            );
             let helper = paths.helper.ok_or(
                 "libkrun backend requires --helper, MORAE_HELPER_PATH, or a sibling morae-vmm-helper",
             )?;
@@ -165,6 +173,8 @@ async fn create_sdk(args: ServerArgs) -> Result<SandboxSdk, Box<dyn std::error::
             };
             let mut config = LibkrunConfig::new(helper, library, root);
             config.library_search_path = paths.library_search_path;
+            config.gvproxy_path = paths.gvproxy;
+            config.network_runtime_dir = args.cache_dir.join("network");
             config.vcpus = args.cpus;
             config.memory_mib = args.memory_mib;
             Arc::new(LibkrunBackend::new(config))
@@ -261,6 +271,7 @@ async fn sandbox_exec(sdk: &SandboxSdk, arguments: Value) -> Result<Value, Strin
     }
     let mut spec = RunSpec::command(args.argv);
     spec.tty = args.tty;
+    spec.network = args.network;
     spec.timeout = match (args.unlimited, args.timeout_ms) {
         (true, _) => TimeoutPolicy::Unlimited,
         (false, Some(milliseconds)) if milliseconds > 0 => TimeoutPolicy::Limited(milliseconds),
@@ -385,7 +396,7 @@ fn tools_list() -> Value {
             {
                 "name": "sandbox_exec",
                 "title": "Execute in configured runtime",
-                "description": "Start a command in the configured runtime. With the libkrun backend, prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Set wait=false to start a session.",
+                "description": "Start a command in the configured runtime. With the libkrun backend, prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. Set wait=false to start a session.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -393,12 +404,13 @@ fn tools_list() -> Value {
                         "stdin_base64": { "type": "string" },
                         "timeout_ms": { "type": "integer", "minimum": 1 },
                         "unlimited": { "type": "boolean", "default": false },
+                        "network": { "type": "boolean", "default": false },
                         "tty": { "type": "boolean", "default": false },
                         "wait": { "type": "boolean", "default": true }
                     },
                     "required": ["argv"]
                 },
-                "annotations": { "destructiveHint": false, "openWorldHint": false }
+                "annotations": { "destructiveHint": false, "openWorldHint": true }
             },
             {
                 "name": "sandbox_io",
@@ -437,11 +449,13 @@ fn tools_list() -> Value {
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
+#[allow(clippy::struct_excessive_bools)]
 struct ExecArgs {
     argv: Vec<String>,
     stdin_base64: Option<String>,
     timeout_ms: Option<u64>,
     unlimited: bool,
+    network: bool,
     tty: bool,
     wait: bool,
 }
@@ -453,6 +467,7 @@ impl Default for ExecArgs {
             stdin_base64: None,
             timeout_ms: None,
             unlimited: false,
+            network: false,
             tty: false,
             wait: true,
         }
@@ -539,6 +554,15 @@ mod tests {
             .unwrap();
         assert!(exec_description.contains("With the libkrun backend"));
         assert!(exec_description.contains("reproducible Linux checks"));
+        assert!(exec_description.contains("Network access is disabled by default"));
+        assert_eq!(
+            list.pointer("/result/tools/0/inputSchema/properties/network/default"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            list.pointer("/result/tools/0/annotations/openWorldHint"),
+            Some(&json!(true))
+        );
         let call = handle_request(
             &sdk,
             json!({
@@ -551,6 +575,29 @@ mod tests {
         assert_eq!(
             call.pointer("/result/structuredContent/status/exit_code"),
             Some(&json!(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn process_backend_rejects_vm_network_opt_in() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let call = handle_request(
+            &sdk,
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{
+                    "name":"sandbox_exec",
+                    "arguments":{"argv":successful_command(),"network":true}
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(call.pointer("/result/isError"), Some(&json!(true)));
+        assert!(
+            call.pointer("/result/structuredContent/error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("without VM isolation"))
         );
     }
 
@@ -598,6 +645,7 @@ mod tests {
             backend: "libkrun".into(),
             helper: Some(runtime_stub.clone()),
             libkrun: Some(runtime_stub),
+            gvproxy: None,
             rootfs: None,
             image: Some("python:3.12".into()),
             cache_dir: cache_dir.clone(),

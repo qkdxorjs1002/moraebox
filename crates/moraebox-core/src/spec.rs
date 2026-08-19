@@ -77,6 +77,8 @@ pub struct RunSpec {
     pub cwd: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
     pub inherit_env: bool,
+    #[serde(default)]
+    pub network: bool,
     pub stdin: Vec<u8>,
     pub timeout: TimeoutPolicy,
     #[serde(with = "duration_millis")]
@@ -95,6 +97,7 @@ impl RunSpec {
             cwd: None,
             env: BTreeMap::new(),
             inherit_env: false,
+            network: false,
             stdin: Vec::new(),
             timeout: TimeoutPolicy::default(),
             kill_grace: DEFAULT_KILL_GRACE,
@@ -154,5 +157,20 @@ mod tests {
     fn rejects_an_empty_command() {
         let spec = RunSpec::command(Vec::<String>::new());
         assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn network_access_is_opt_in() {
+        assert!(!RunSpec::command(["true"]).network);
+    }
+
+    #[test]
+    fn older_serialized_specs_default_to_no_network() {
+        let mut value = serde_json::to_value(RunSpec::command(["true"])).unwrap();
+        value.as_object_mut().unwrap().remove("network");
+
+        let spec: RunSpec = serde_json::from_value(value).unwrap();
+
+        assert!(!spec.network);
     }
 }

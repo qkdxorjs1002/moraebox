@@ -28,6 +28,11 @@ const LIBKRUNFW_CANDIDATES: &[&str] = &[
     "/opt/homebrew/opt/libkrunfw/lib/libkrunfw.dylib",
     "/usr/local/lib/libkrunfw.dylib",
 ];
+const GVPROXY_CANDIDATES: &[&str] = &[
+    "/opt/homebrew/bin/gvproxy",
+    "/usr/local/bin/gvproxy",
+    "/usr/bin/gvproxy",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -44,7 +49,10 @@ pub struct DoctorReport {
     pub libkrun: LibraryProbe,
     pub libkrunfw: LibraryProbe,
     pub krunvm: ToolProbe,
+    pub gvproxy: ToolProbe,
+    pub libkrun_network_api: Option<bool>,
     pub native_backend_ready: bool,
+    pub native_network_ready: bool,
     pub warnings: Vec<String>,
 }
 
@@ -68,6 +76,7 @@ pub struct NativeRuntimePaths {
     pub helper: Option<PathBuf>,
     pub libkrun: Option<PathBuf>,
     pub libkrunfw: Option<PathBuf>,
+    pub gvproxy: Option<PathBuf>,
     pub library_search_path: Option<PathBuf>,
 }
 
@@ -77,6 +86,16 @@ impl NativeRuntimePaths {
         helper: Option<PathBuf>,
         libkrun: Option<PathBuf>,
         library_search_path: Option<PathBuf>,
+    ) -> Self {
+        Self::discover_with_gvproxy(helper, libkrun, library_search_path, None)
+    }
+
+    /// Resolve native runtime and optional gvproxy paths without overriding caller configuration.
+    pub fn discover_with_gvproxy(
+        helper: Option<PathBuf>,
+        libkrun: Option<PathBuf>,
+        library_search_path: Option<PathBuf>,
+        gvproxy: Option<PathBuf>,
     ) -> Self {
         let helper = helper
             .or_else(|| configured_path("MORAE_HELPER_PATH"))
@@ -90,10 +109,15 @@ impl NativeRuntimePaths {
         let library_search_path = library_search_path
             .or_else(|| configured_path("MORAE_LIB_DIR"))
             .or_else(|| library_parent_path(libkrun.as_deref(), libkrunfw.as_deref()));
+        let gvproxy = gvproxy
+            .or_else(|| configured_path("MORAE_GVPROXY_PATH"))
+            .or_else(|| find_in_path("gvproxy"))
+            .or_else(|| find_candidate(GVPROXY_CANDIDATES));
         Self {
             helper,
             libkrun,
             libkrunfw,
+            gvproxy,
             library_search_path,
         }
     }
@@ -120,12 +144,24 @@ impl DoctorReport {
         );
         let libkrunfw = probe_library("MORAE_LIBKRUNFW_PATH", LIBKRUNFW_CANDIDATES, &[]);
         let krunvm = probe_tool("krunvm");
+        let gvproxy = probe_tool_path(
+            configured_path("MORAE_GVPROXY_PATH")
+                .filter(|path| path.is_file())
+                .or_else(|| find_in_path("gvproxy"))
+                .or_else(|| find_candidate(GVPROXY_CANDIDATES)),
+        );
+        let libkrun_network_api = libkrun
+            .path
+            .as_deref()
+            .and_then(|path| library_has_symbol(path, "krun_add_net_unixgram"));
         let native_backend_ready = host_supported
             && hypervisor_framework
             && hypervisor_entitlement
             && libkrun.found
             && libkrun.required_symbols_present == Some(true)
             && libkrunfw.found;
+        let native_network_ready =
+            native_backend_ready && gvproxy.found && libkrun_network_api == Some(true);
         let mut warnings = Vec::new();
         if !libkrun.found {
             warnings.push("libkrun was not found; the process backend remains available".into());
@@ -136,6 +172,18 @@ impl DoctorReport {
         if !hypervisor_entitlement {
             warnings.push(
                 "the current executable lacks com.apple.security.hypervisor; sign the vmm helper before native execution"
+                    .into(),
+            );
+        }
+        if !gvproxy.found {
+            warnings.push(
+                "gvproxy was not found; native runs remain network-isolated unless it is installed and configured"
+                    .into(),
+            );
+        }
+        if libkrun_network_api == Some(false) {
+            warnings.push(
+                "libkrun does not export krun_add_net_unixgram; native network opt-in is unavailable"
                     .into(),
             );
         }
@@ -152,7 +200,10 @@ impl DoctorReport {
             libkrun,
             libkrunfw,
             krunvm,
+            gvproxy,
+            libkrun_network_api,
             native_backend_ready,
+            native_network_ready,
             warnings,
         }
     }
@@ -209,7 +260,10 @@ fn probe_library(
 }
 
 fn probe_tool(name: &str) -> ToolProbe {
-    let path = find_in_path(name);
+    probe_tool_path(find_in_path(name))
+}
+
+fn probe_tool_path(path: Option<PathBuf>) -> ToolProbe {
     let version = path
         .as_ref()
         .and_then(|path| command_output(path.to_string_lossy().as_ref(), &["--version"]));
@@ -218,6 +272,11 @@ fn probe_tool(name: &str) -> ToolProbe {
         path,
         version,
     }
+}
+
+fn library_has_symbol(path: &Path, symbol: &str) -> Option<bool> {
+    command_output("nm", &["-gU", path.to_string_lossy().as_ref()])
+        .map(|symbols| symbols.contains(symbol))
 }
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
@@ -325,10 +384,11 @@ mod tests {
 
     #[test]
     fn explicit_native_paths_take_precedence() {
-        let paths = NativeRuntimePaths::discover(
+        let paths = NativeRuntimePaths::discover_with_gvproxy(
             Some(PathBuf::from("/configured/helper")),
             Some(PathBuf::from("/configured/lib/libkrun.dylib")),
             Some(PathBuf::from("/configured/search")),
+            Some(PathBuf::from("/configured/gvproxy")),
         );
         assert_eq!(paths.helper, Some(PathBuf::from("/configured/helper")));
         assert_eq!(
@@ -339,6 +399,7 @@ mod tests {
             paths.library_search_path,
             Some(PathBuf::from("/configured/search"))
         );
+        assert_eq!(paths.gvproxy, Some(PathBuf::from("/configured/gvproxy")));
     }
 
     #[test]

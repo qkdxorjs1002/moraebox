@@ -87,6 +87,20 @@ morae run --image alpine:latest --env MESSAGE=hello \
 
 개별 환경값은 `--env KEY=VALUE`로 추가합니다. `--inherit-env`는 호스트 환경을 전달하므로 해당 노출이 의도된 경우에만 사용해야 합니다.
 
+### 외부 네트워크 접속 허용
+
+게스트 네트워크는 기본적으로 꺼져 있습니다. 네이티브 VM 실행 하나에만 허용하려면 `--network`를 지정합니다.
+
+```sh
+morae run --network -- curl -I https://example.com
+```
+
+네트워크 실행에는 `gvproxy`가 필요합니다. moraebox는 `PATH`에서 `gvproxy`를 찾으며, 다른 위치에 설치했다면 `--gvproxy /path/to/gvproxy` 또는 `MORAE_GVPROXY_PATH`를 사용합니다. 네이티브 런타임은 실행마다 새 gvproxy 프로세스와 virtio-net endpoint를 시작하고 VM과 함께 정리합니다. control vsock은 별도로 유지하며 모든 TSI feature flag를 끕니다.
+
+Rust SDK에서는 `RunSpec.network = true`, MCP `sandbox_exec`에서는 `"network": true`가 같은 실행별 opt-in입니다. `process` 백엔드는 호스트 네트워크 문맥에서 직접 실행되고 VM 격리를 제공하지 않으므로 이 VM 전용 옵션을 거부합니다.
+
+네트워크를 켜면 게스트 코드는 호스트 사용자 네트워크 문맥에서 가능한 외부 접속을 사용할 수 있습니다. 목적지 allowlist나 별도 네트워크 보안 경계는 아닙니다.
+
 ### OCI 이미지 선택
 
 ```sh
@@ -164,13 +178,13 @@ morae-mcp install claude-code
 morae-mcp install codex --dry-run
 ```
 
-설치기는 에이전트의 공식 CLI를 사용하며 설정 파일을 직접 편집하지 않습니다. `--image`, `--cache-dir`, `--cpus`, `--memory-mib`로 등록 내용을 조정할 수 있습니다. 격리 없는 수명주기 테스트가 필요하면 `--backend process`를 명시합니다.
+설치기는 에이전트의 공식 CLI를 사용하며 설정 파일을 직접 편집하지 않습니다. `--image`, `--cache-dir`, `--cpus`, `--memory-mib`, `--gvproxy`로 등록 내용을 조정할 수 있습니다. 격리 없는 수명주기 테스트가 필요하면 `--backend process`를 명시합니다.
 
 서버는 세 가지 도구를 제공합니다.
 
 | 도구 | 용도 |
 | --- | --- |
-| `sandbox_exec` | 명령 하나를 실행하거나 비동기 세션 시작 |
+| `sandbox_exec` | 명령 하나를 실행하거나 비동기 세션 시작, 네트워크 기본값은 꺼짐 |
 | `sandbox_io` | 제한된 출력 읽기, stdin 쓰기·닫기, 크기 조절, 시그널 전송 |
 | `sandbox_stop` | 세션을 중지하고 정리가 끝날 때까지 대기 |
 
@@ -188,6 +202,7 @@ CLI / Rust SDK / MCP 서버
        정식 libkrun ABI
              │
    console + vsock (TSI off)
+ 선택형 virtio-net ↔ gvproxy
              │
       일회용 Linux microVM
 ```
@@ -222,8 +237,9 @@ prepare → start → ready → running → stop → dead
 
 보안과 관련된 기본값은 다음과 같습니다.
 
-- 게스트 네트워크 인터페이스 없음
+- 실행에서 명시적으로 허용하지 않는 한 게스트 네트워크 인터페이스 없음
 - Transparent Socket Impersonation 플래그를 0으로 설정한 control vsock
+- 실행별 gvproxy virtio-net으로 egress를 허용하고 VM과 함께 정리
 - 호스트 환경 전달 없음
 - 암묵적인 셸 파싱 없음
 - 불변 읽기 전용 워크스페이스 스냅샷
@@ -262,7 +278,7 @@ codesign --force --sign - \
   target/release/morae-vmm-helper
 ```
 
-네이티브 실행에는 호환되는 정식 libkrun/libkrunfw 빌드, Hypervisor.framework, 워크스페이스 연결 시 `e2fsprogs`의 `mke2fs`도 필요합니다. `morae doctor --json`은 현재 호스트에 부족한 항목을 보고합니다.
+네이티브 실행에는 호환되는 정식 libkrun/libkrunfw 빌드, Hypervisor.framework, 선택형 네트워크 사용 시 `gvproxy`, 워크스페이스 연결 시 `e2fsprogs`의 `mke2fs`도 필요합니다. `morae doctor --json`은 기본 네이티브 준비 상태와 네트워크 준비 상태를 구분해 보고합니다.
 
 ## 개발
 

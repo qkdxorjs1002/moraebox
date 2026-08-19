@@ -87,6 +87,20 @@ morae run --image alpine:latest --env MESSAGE=hello \
 
 Use `--env KEY=VALUE` to add individual values. `--inherit-env` forwards the host environment and should be used only when that exposure is intentional.
 
+### Opt into outbound network access
+
+Guest networking is disabled by default. Enable it for one native VM run with `--network`:
+
+```sh
+morae run --network -- curl -I https://example.com
+```
+
+Network-enabled runs require `gvproxy`. moraebox discovers `gvproxy` on `PATH`; use `--gvproxy /path/to/gvproxy` or `MORAE_GVPROXY_PATH` when it is installed elsewhere. The native runtime starts a fresh gvproxy process and virtio-net endpoint for the run, then tears both down with the VM. The control vsock remains separate with all TSI feature flags disabled.
+
+The same opt-in is `RunSpec.network = true` in the Rust SDK and `"network": true` in an MCP `sandbox_exec` call. The `process` backend rejects this VM-specific option because it already runs directly in the host network context and does not provide VM isolation.
+
+Enabling network access gives guest code outbound access available through the host user's network context. It is not a destination allowlist or a separate network security boundary.
+
 ### Select an OCI image
 
 ```sh
@@ -164,13 +178,13 @@ Preview the exact command and argv without changing agent configuration:
 morae-mcp install codex --dry-run
 ```
 
-The installer uses the agent's official CLI and does not edit configuration files directly. Use `--image`, `--cache-dir`, `--cpus`, or `--memory-mib` to customize the registration. For lifecycle testing without isolation, opt in with `--backend process`.
+The installer uses the agent's official CLI and does not edit configuration files directly. Use `--image`, `--cache-dir`, `--cpus`, `--memory-mib`, or `--gvproxy` to customize the registration. For lifecycle testing without isolation, opt in with `--backend process`.
 
 The server exposes three tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `sandbox_exec` | Run one command or start an asynchronous session |
+| `sandbox_exec` | Run one command or start an asynchronous session; network access defaults to off |
 | `sandbox_io` | Read bounded output, write or close stdin, resize, or send a signal |
 | `sandbox_stop` | Stop a session and wait for cleanup |
 
@@ -188,6 +202,7 @@ CLI / Rust SDK / MCP server
        released libkrun ABI
              │
    console + vsock (TSI off)
+ optional virtio-net ↔ gvproxy
              │
       one Linux microVM
 ```
@@ -222,8 +237,9 @@ The current threat model is untrusted Linux guest code launched by a local user 
 
 Security-relevant defaults include:
 
-- no guest network interface;
+- no guest network interface unless one run explicitly opts in;
 - a control vsock with Transparent Socket Impersonation flags set to zero;
+- opt-in egress uses a per-run gvproxy virtio-net process that is cleaned up with the VM;
 - no host environment forwarding;
 - no implicit shell parsing;
 - immutable, read-only workspace snapshots;
@@ -262,7 +278,7 @@ codesign --force --sign - \
   target/release/morae-vmm-helper
 ```
 
-Native execution additionally needs compatible released libkrun/libkrunfw builds, Hypervisor.framework, and `mke2fs` from `e2fsprogs` when a workspace is attached. `morae doctor --json` reports what the current host is missing.
+Native execution additionally needs compatible released libkrun/libkrunfw builds, Hypervisor.framework, `gvproxy` for opt-in networking, and `mke2fs` from `e2fsprogs` when a workspace is attached. `morae doctor --json` reports base native readiness and network readiness separately.
 
 ## Development
 

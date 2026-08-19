@@ -22,6 +22,26 @@ fn timeout_uses_the_conventional_exit_code() {
     assert_eq!(output.status.code(), Some(124));
 }
 
+#[test]
+fn process_backend_rejects_the_vm_network_option() {
+    let output = Command::new(env!("CARGO_BIN_EXE_morae"))
+        .args([
+            "run",
+            "--backend",
+            "process",
+            "--network",
+            "--",
+            "not-executed",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--network requires --backend libkrun")
+    );
+}
+
 #[cfg(unix)]
 fn output_and_exit_command() -> Vec<String> {
     ["/bin/sh", "-c", "printf stdout; printf stderr >&2; exit 7"]

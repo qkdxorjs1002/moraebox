@@ -26,6 +26,11 @@ impl Backend for ProcessBackend {
                 "PTY on the deterministic process backend",
             ));
         }
+        if spec.network {
+            return Err(BackendError::Unsupported(
+                "network opt-in on the process backend; it already uses the host network without VM isolation",
+            ));
+        }
 
         let mut command = Command::new(&spec.argv[0]);
         command.args(&spec.argv[1..]);
@@ -181,5 +186,21 @@ impl BackendController for ProcessController {
                 )),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejects_vm_network_opt_in() {
+        let mut spec = RunSpec::command(["true"]);
+        spec.network = true;
+
+        assert!(matches!(
+            ProcessBackend.spawn(&spec).await,
+            Err(BackendError::Unsupported(_))
+        ));
     }
 }
