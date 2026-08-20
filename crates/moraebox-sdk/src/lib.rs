@@ -5,7 +5,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use moraebox_box::{BoxMetadata, BoxStore, BoxStoreError, CreateBox};
-use moraebox_core::{BoxId, OutputChunk, RunSpec, SessionId, Signal};
+use moraebox_core::{BoxId, OutputChunk, OutputReadError, RunSpec, SessionId, Signal};
 use moraebox_runtime::{Backend, SessionError, SessionHandle, SessionManager, SessionStatus};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -48,7 +48,13 @@ impl SandboxSdk {
             return Err(error.into());
         }
         let status = handle.wait().await?;
-        let output = handle.read_output(0, usize::MAX).await?;
+        let output = match handle.read_output(0, usize::MAX).await {
+            Ok(output) => output,
+            Err(SessionError::Output(OutputReadError::CursorExpired { earliest, .. })) => {
+                handle.read_output(earliest, usize::MAX).await?
+            }
+            Err(error) => return Err(error.into()),
+        };
         Ok(ExecutionResult {
             status,
             output: output.chunks,
@@ -311,6 +317,44 @@ mod tests {
         assert_eq!(second.state, moraebox_core::SessionState::Dead);
     }
 
+    #[tokio::test]
+    async fn exec_returns_retained_mixed_output_after_truncation() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let mut spec = RunSpec::command(mixed_output_command());
+        spec.output_limit = 8;
+
+        let result = sdk.exec(spec).await.unwrap();
+
+        assert!(result.truncated);
+        assert_eq!(result.next_cursor, 12);
+        assert_eq!(
+            result
+                .output
+                .iter()
+                .map(|chunk| chunk.data.len())
+                .sum::<usize>(),
+            8
+        );
+        let mut cursor = 4;
+        for chunk in &result.output {
+            assert_eq!(chunk.cursor, cursor);
+            cursor += chunk.data.len() as u64;
+        }
+        assert_eq!(cursor, result.next_cursor);
+        assert!(
+            result
+                .output
+                .iter()
+                .any(|chunk| chunk.channel == moraebox_core::OutputChannel::Stdout)
+        );
+        assert!(
+            result
+                .output
+                .iter()
+                .any(|chunk| chunk.channel == moraebox_core::OutputChannel::Stderr)
+        );
+    }
+
     #[cfg(unix)]
     fn stdin_echo_command() -> Vec<String> {
         ["/bin/sh", "-c", "read value; printf '%s' \"$value\""]
@@ -321,6 +365,33 @@ mod tests {
     #[cfg(unix)]
     fn long_running_command() -> Vec<String> {
         ["/bin/sh", "-c", "sleep 30"].map(String::from).into()
+    }
+
+    #[cfg(unix)]
+    fn mixed_output_command() -> Vec<String> {
+        ["/bin/sh", "-c", "printf abcdef; printf UVWXYZ >&2"]
+            .map(String::from)
+            .into()
+    }
+
+    #[cfg(windows)]
+    fn mixed_output_command() -> Vec<String> {
+        vec![
+            std::path::PathBuf::from(
+                std::env::var_os("SystemRoot").expect("Windows must define SystemRoot"),
+            )
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe")
+            .to_string_lossy()
+            .into_owned(),
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            "[Console]::Out.Write('abcdef'); [Console]::Error.Write('UVWXYZ')".into(),
+        ]
     }
 
     #[cfg(windows)]

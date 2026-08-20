@@ -71,7 +71,7 @@
   - 반복 stop이 최초 kill deadline을 연장하지 않아야 한다.
   - 이미 stopping/dead인 session에는 안정적인 최종 상태를 반환한다.
 
-- [ ] SDK one-shot 실행에서 output buffer가 잘린 경우 `CursorExpired` 대신 보존된 output과 `truncated=true`, 정확한 cursor를 반환한다.
+- [x] SDK one-shot 실행에서 output buffer가 잘린 경우 `CursorExpired` 대신 보존된 output과 `truncated=true`, 정확한 cursor를 반환한다.
   - output limit보다 큰 stdout/stderr와 혼합 channel 회귀 테스트를 추가한다.
 
 ### MCP responsiveness와 resource ownership
