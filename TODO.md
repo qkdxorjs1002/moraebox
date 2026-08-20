@@ -67,7 +67,7 @@
   - `force_stop`, exit wait, stdout/stderr pump 오류를 무시하지 않는다.
   - `dead`는 모든 host resource가 회수된 뒤에만 publish한다.
 
-- [ ] stop을 상태 기반으로 idempotent하게 만든다.
+- [x] stop을 상태 기반으로 idempotent하게 만든다.
   - 반복 stop이 최초 kill deadline을 연장하지 않아야 한다.
   - 이미 stopping/dead인 session에는 안정적인 최종 상태를 반환한다.
 

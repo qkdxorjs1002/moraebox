@@ -192,6 +192,15 @@ impl SessionHandle {
     }
 
     pub async fn stop(&self) -> Result<(), SessionError> {
+        if matches!(
+            self.status().state,
+            SessionState::Stopping
+                | SessionState::Failed
+                | SessionState::TimedOut
+                | SessionState::Dead
+        ) {
+            return Ok(());
+        }
         self.request(SessionCommand::Stop).await
     }
 
@@ -394,6 +403,10 @@ async fn drive_session(
                         let _ = reply.send(result);
                     }
                     SessionCommand::Stop(reply) => {
+                        if shutdown_started {
+                            let _ = reply.send(Ok(()));
+                            continue;
+                        }
                         shutdown_started = true;
                         reason = TerminationReason::Cancelled;
                         publish_running_state(&status_sender, &spec, started, SessionState::Stopping, reason, false);
@@ -1004,10 +1017,68 @@ mod tests {
         assert_eq!(session.wait().await.unwrap().state, SessionState::Dead);
     }
 
+    #[tokio::test]
+    async fn repeated_stop_preserves_the_first_kill_deadline() {
+        let state = Arc::new(SessionBackendState::default());
+        let manager = SessionManager::new(Arc::new(SessionTestBackend {
+            mode: SessionBackendMode::GracefulThenForce,
+            state: Arc::clone(&state),
+        }));
+        let mut spec = RunSpec::command(["fake"]);
+        spec.kill_grace = Duration::from_millis(80);
+        let session = manager.start(spec).await.unwrap();
+
+        session.stop().await.unwrap();
+        sleep(Duration::from_millis(50)).await;
+        session.stop().await.unwrap();
+        let status = timeout(Duration::from_millis(55), session.wait())
+            .await
+            .expect("a repeated stop must not extend the first kill deadline")
+            .unwrap();
+
+        assert_eq!(state.term_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.force_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(status.state, SessionState::Dead);
+        session.stop().await.unwrap();
+        assert_eq!(session.status(), status);
+    }
+
+    #[tokio::test]
+    async fn queued_stop_race_sends_term_only_once() {
+        let state = Arc::new(SessionBackendState::default());
+        let manager = SessionManager::new(Arc::new(SessionTestBackend {
+            mode: SessionBackendMode::GracefulThenForce,
+            state: Arc::clone(&state),
+        }));
+        let mut spec = RunSpec::command(["fake"]);
+        spec.kill_grace = Duration::from_millis(20);
+        let session = manager.start(spec).await.unwrap();
+        let (first_reply, first_result) = oneshot::channel();
+        let (second_reply, second_result) = oneshot::channel();
+
+        session
+            .commands
+            .send(SessionCommand::Stop(first_reply))
+            .await
+            .unwrap();
+        session
+            .commands
+            .send(SessionCommand::Stop(second_reply))
+            .await
+            .unwrap();
+        assert!(first_result.await.unwrap().is_ok());
+        assert!(second_result.await.unwrap().is_ok());
+        session.wait().await.unwrap();
+
+        assert_eq!(state.term_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.force_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[derive(Clone, Copy)]
     enum SessionBackendMode {
         ControlFailure,
         ExitHangs,
+        GracefulThenForce,
         OutputFailure,
         OutputGate,
     }
@@ -1035,11 +1106,13 @@ mod tests {
         async fn spawn(&self, _spec: &RunSpec) -> Result<crate::SpawnedSandbox, BackendError> {
             let exit_state = Arc::clone(&self.state);
             let exit: crate::backend::ExitFuture = match self.mode {
-                SessionBackendMode::ControlFailure => Box::pin(async move {
-                    exit_state.forced.notified().await;
-                    exit_state.exit_cleanups.fetch_add(1, Ordering::SeqCst);
-                    Ok(success_status())
-                }),
+                SessionBackendMode::ControlFailure | SessionBackendMode::GracefulThenForce => {
+                    Box::pin(async move {
+                        exit_state.forced.notified().await;
+                        exit_state.exit_cleanups.fetch_add(1, Ordering::SeqCst);
+                        Ok(success_status())
+                    })
+                }
                 SessionBackendMode::ExitHangs => Box::pin(std::future::pending()),
                 SessionBackendMode::OutputFailure | SessionBackendMode::OutputGate => {
                     Box::pin(async { Ok(success_status()) })
@@ -1052,9 +1125,9 @@ mod tests {
                     *self.state.output_writer.lock().unwrap() = Some(writer);
                     Box::pin(reader)
                 }
-                SessionBackendMode::ControlFailure | SessionBackendMode::ExitHangs => {
-                    Box::pin(tokio::io::empty())
-                }
+                SessionBackendMode::ControlFailure
+                | SessionBackendMode::ExitHangs
+                | SessionBackendMode::GracefulThenForce => Box::pin(tokio::io::empty()),
             };
             Ok(crate::SpawnedSandbox {
                 stdin: None,
@@ -1090,8 +1163,13 @@ mod tests {
 
         async fn force_stop(&self) -> Result<(), BackendError> {
             self.state.force_calls.fetch_add(1, Ordering::SeqCst);
-            if matches!(self.mode, SessionBackendMode::ControlFailure) {
+            if matches!(
+                self.mode,
+                SessionBackendMode::ControlFailure | SessionBackendMode::GracefulThenForce
+            ) {
                 self.state.forced.notify_one();
+            }
+            if matches!(self.mode, SessionBackendMode::ControlFailure) {
                 return Err(BackendError::Control("injected force-stop failure".into()));
             }
             Ok(())

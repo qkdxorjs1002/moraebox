@@ -231,6 +231,8 @@ pub enum SdkError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use moraebox_runtime::ProcessBackend;
 
     use super::*;
@@ -295,11 +297,40 @@ mod tests {
         assert!(sdk.list_boxes().await.unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn repeated_stop_returns_the_same_final_status() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let mut spec = RunSpec::command(long_running_command());
+        spec.kill_grace = Duration::from_millis(20);
+        let started = sdk.start(spec).await.unwrap();
+
+        let first = sdk.stop(started.session_id).await.unwrap();
+        let second = sdk.stop(started.session_id).await.unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(second.state, moraebox_core::SessionState::Dead);
+    }
+
     #[cfg(unix)]
     fn stdin_echo_command() -> Vec<String> {
         ["/bin/sh", "-c", "read value; printf '%s' \"$value\""]
             .map(String::from)
             .into()
+    }
+
+    #[cfg(unix)]
+    fn long_running_command() -> Vec<String> {
+        ["/bin/sh", "-c", "sleep 30"].map(String::from).into()
+    }
+
+    #[cfg(windows)]
+    fn long_running_command() -> Vec<String> {
+        vec![
+            windows_system_executable("ping.exe"),
+            "-n".into(),
+            "31".into(),
+            "127.0.0.1".into(),
+        ]
     }
 
     #[cfg(windows)]
