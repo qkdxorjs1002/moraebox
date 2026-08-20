@@ -41,7 +41,7 @@
     ls -la
     ```
 
-- [ ] `--workspace` 실행이 `mke2fs` 단계에서 멈추는 현상을 재현하고 수정한다.
+- [x] `--workspace` 실행이 `mke2fs` 단계에서 멈추는 현상을 재현하고 수정한다.
   - 단계별 timeout과 stderr diagnostics를 제공해 snapshot 순회, image 생성, `mke2fs`, attach 중 어디서 멈췄는지 구분한다.
   - source를 직접 공유하지 않고 immutable read-only ext4 snapshot 계약을 유지한다.
   - 실패·취소 시 `mke2fs`, helper, 임시 image를 모두 정리한다.

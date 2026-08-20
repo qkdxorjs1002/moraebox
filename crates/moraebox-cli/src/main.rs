@@ -20,7 +20,7 @@ use moraebox_core::{
 };
 use moraebox_image::{
     CacheUsage, CachedImage, CleanReport, Credentials, ImageCache, Platform, PreparedImage,
-    PruneReport, RemoveReport, WorkspaceSnapshot, digest_tree,
+    PruneReport, RemoveReport, WorkspaceSnapshot, WorkspaceStage, digest_tree,
 };
 use moraebox_runtime::{
     Backend, BoxRootSource, BoxRuntimeConfig, DoctorReport, LibkrunBackend, LibkrunConfig,
@@ -646,7 +646,16 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
         let cache_dir = cache_dir
             .as_deref()
             .ok_or("--workspace requires a cache directory")?;
-        Some(WorkspaceSnapshot::create(source, cache_dir, &mke2fs)?)
+        Some(
+            WorkspaceSnapshot::create_async(
+                source,
+                cache_dir,
+                &mke2fs,
+                spec.timeout.duration(),
+                report_workspace_stage,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -713,6 +722,9 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
                 e2fsck_path: args.e2fsck.unwrap_or_else(default_e2fsck),
             };
             let backend = LibkrunBackend::new(config).with_box_runtime(runtime);
+            if workspace.is_some() {
+                eprintln!("morae: workspace: attaching read-only image");
+            }
             if args.interactive {
                 return run_interactive(backend, spec).await;
             }
@@ -746,6 +758,10 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     } else {
         Ok(125)
     }
+}
+
+fn report_workspace_stage(stage: WorkspaceStage) {
+    eprintln!("morae: workspace: {stage}");
 }
 
 const INTERACTIVE_READ_BYTES: usize = 64 * 1024;

@@ -19,4 +19,4 @@ pub use reference::{ImageReference, RegistryReference};
 pub use registry::{
     Credentials, ImageManifest, Platform, PulledImage, RegistryClient, RegistryError,
 };
-pub use workspace::{WorkspaceError, WorkspaceSnapshot, digest_tree};
+pub use workspace::{WorkspaceError, WorkspaceSnapshot, WorkspaceStage, digest_tree};
