@@ -76,7 +76,7 @@
 
 ### MCP responsiveness와 resource ownership
 
-- [ ] MCP stdio server가 여러 request ID를 동시에 처리하도록 dispatcher와 단일 stdout writer를 분리한다.
+- [x] MCP stdio server가 여러 request ID를 동시에 처리하도록 dispatcher와 단일 stdout writer를 분리한다.
   - 긴 `sandbox_exec(wait=true)` 중에도 `sandbox_io`, `sandbox_stop`, `ping`을 처리해야 한다.
   - response 순서는 달라도 ID 대응과 stdout protocol 무오염을 보장한다.
 

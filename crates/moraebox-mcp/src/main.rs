@@ -2,7 +2,7 @@
 
 mod registration;
 
-use std::{ffi::OsString, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
+use std::{ffi::OsString, io, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand};
@@ -19,9 +19,15 @@ use moraebox_runtime::{
 use moraebox_sdk::{ExecutionResult, IoRequest, IoResult, SandboxSdk};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
+    sync::{Semaphore, mpsc},
+    task::JoinSet,
+};
 
 const PROTOCOL_VERSION: &str = "2026-07-28";
+const MAX_CONCURRENT_REQUESTS: usize = 32;
+const RESPONSE_QUEUE_CAPACITY: usize = 128;
 const SERVER_INSTRUCTIONS: &str = concat!(
     "Use sandbox_exec when a command benefits from a disposable execution environment, ",
     "including untrusted code, dependency installation, isolated experiments, reproducible ",
@@ -260,36 +266,88 @@ async fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error
 
 async fn serve(server: McpServer) -> Result<(), Box<dyn std::error::Error>> {
     let mut input = BufReader::new(tokio::io::stdin()).lines();
-    let mut output = BufWriter::new(tokio::io::stdout());
-    while let Some(line) = input.next_line().await? {
+    let (responses, response_receiver) = mpsc::channel(RESPONSE_QUEUE_CAPACITY);
+    let writer = tokio::spawn(write_responses(response_receiver));
+    let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
+    let mut requests = JoinSet::new();
+    let input_error = loop {
+        let line = match input.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        };
         if line.trim().is_empty() {
             continue;
         }
         let request: Value = match serde_json::from_str(&line) {
             Ok(request) => request,
             Err(error) => {
-                write_response(
-                    &mut output,
-                    &protocol_error(Value::Null, -32700, &error.to_string()),
-                )
-                .await?;
+                if responses
+                    .send(protocol_error(Value::Null, -32700, &error.to_string()))
+                    .await
+                    .is_err()
+                {
+                    break Some(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "MCP response writer stopped",
+                    ));
+                }
                 continue;
             }
         };
         if request.get("id").is_none() {
             continue;
         }
-        let response = handle_request(&server, request).await;
+        let permit = Arc::clone(&permits)
+            .acquire_owned()
+            .await
+            .expect("request semaphore remains open");
+        let server = server.clone();
+        let responses = responses.clone();
+        requests.spawn(async move {
+            let _permit = permit;
+            let response = handle_request(&server, request).await;
+            let _ = responses.send(response).await;
+        });
+    };
+    drop(responses);
+
+    let mut request_error = None;
+    while let Some(result) = requests.join_next().await {
+        if let Err(error) = result
+            && request_error.is_none()
+        {
+            request_error = Some(io::Error::other(format!(
+                "MCP request task failed: {error}"
+            )));
+        }
+    }
+    let writer_result = writer
+        .await
+        .map_err(|error| io::Error::other(format!("MCP writer task failed: {error}")))?;
+    if let Some(error) = input_error {
+        return Err(error.into());
+    }
+    if let Some(error) = request_error {
+        return Err(error.into());
+    }
+    writer_result?;
+    Ok(())
+}
+
+async fn write_responses(mut responses: mpsc::Receiver<Value>) -> io::Result<()> {
+    let mut output = BufWriter::new(tokio::io::stdout());
+    while let Some(response) = responses.recv().await {
         write_response(&mut output, &response).await?;
     }
     Ok(())
 }
 
-async fn write_response(
-    output: &mut BufWriter<tokio::io::Stdout>,
-    response: &Value,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut encoded = serde_json::to_vec(response)?;
+async fn write_response<W>(output: &mut W, response: &Value) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut encoded = serde_json::to_vec(response).map_err(io::Error::other)?;
     encoded.push(b'\n');
     output.write_all(&encoded).await?;
     output.flush().await?;
