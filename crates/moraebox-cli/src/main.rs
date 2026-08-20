@@ -375,7 +375,8 @@ struct CacheCleanArgs {
 
 #[derive(Debug, Args)]
 struct BenchmarkArgs {
-    #[arg(long, default_value = "process", value_parser = ["process", "libkrun"])]
+    /// Execution backend. Defaults to the isolated native microVM backend.
+    #[arg(long, default_value = "libkrun", value_parser = ["process", "libkrun"])]
     backend: String,
     #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=10_000))]
     iterations: u32,
@@ -702,6 +703,9 @@ fn select_image_reference(
     cache_dir: &std::path::Path,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     if backend != "libkrun" {
+        if has_rootfs {
+            return Err("--rootfs requires --backend libkrun".into());
+        }
         if explicit_image.is_some() {
             return Err("--image requires --backend libkrun".into());
         }
@@ -1226,9 +1230,10 @@ async fn run_benchmark<B: Backend>(
         );
     }
     samples.sort_unstable();
+    let backend = supervisor.backend_name();
     Ok(BenchmarkReport {
-        backend: supervisor.backend_name().into(),
-        mode: "cached-one-shot".into(),
+        backend: backend.into(),
+        mode: benchmark_mode(backend).into(),
         iterations,
         failures,
         min_micros: samples[0],
@@ -1244,6 +1249,14 @@ async fn run_benchmark<B: Backend>(
         disk_clone_p95_micros: optional_percentile(&mut disk_clone_samples, 95),
         helper_spawn_p95_micros: optional_percentile(&mut helper_spawn_samples, 95),
     })
+}
+
+fn benchmark_mode(backend: &str) -> &'static str {
+    if backend == "libkrun" {
+        "cached-one-shot"
+    } else {
+        "host-process"
+    }
 }
 
 fn extend_if_some(samples: &mut Vec<u64>, value: Option<u64>) {
@@ -1471,6 +1484,35 @@ mod tests {
     }
 
     #[test]
+    fn user_execution_commands_default_to_libkrun() {
+        let run = Cli::try_parse_from(["morae", "run", "--", "/bin/true"]).unwrap();
+        let Command::Run(run) = run.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(run.backend, "libkrun");
+
+        let benchmark = Cli::try_parse_from(["morae", "benchmark", "--", "/bin/true"]).unwrap();
+        let Command::Benchmark(benchmark) = benchmark.command else {
+            panic!("expected benchmark command");
+        };
+        assert_eq!(benchmark.backend, "libkrun");
+
+        let process = Cli::try_parse_from([
+            "morae",
+            "benchmark",
+            "--backend",
+            "process",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let Command::Benchmark(process) = process.command else {
+            panic!("expected benchmark command");
+        };
+        assert_eq!(process.backend, "process");
+    }
+
+    #[test]
     fn parses_environment_without_shell_expansion() {
         assert_eq!(
             parse_env("A=hello world").unwrap(),
@@ -1643,6 +1685,12 @@ mod tests {
             None
         );
         assert_eq!(
+            select_image_reference("process", true, None, &cache_dir)
+                .unwrap_err()
+                .to_string(),
+            "--rootfs requires --backend libkrun"
+        );
+        assert_eq!(
             select_image_reference("libkrun", true, None, &cache_dir).unwrap(),
             None
         );
@@ -1669,5 +1717,11 @@ mod tests {
             Some("docker.io/library/debian:bookworm")
         );
         std::fs::remove_dir_all(cache_dir).unwrap();
+    }
+
+    #[test]
+    fn benchmark_modes_distinguish_microvms_from_host_processes() {
+        assert_eq!(benchmark_mode("libkrun"), "cached-one-shot");
+        assert_eq!(benchmark_mode("process"), "host-process");
     }
 }

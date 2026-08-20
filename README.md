@@ -183,16 +183,16 @@ morae run --backend process -- /usr/bin/printf 'portable path\n'
 morae benchmark --backend process --iterations 100 -- /usr/bin/true
 ```
 
-The `process` backend is useful for deterministic tests, CI, and integration development. It is not a sandbox and must not be presented as one.
+`morae run`, `morae benchmark`, and `morae-mcp` default to the `libkrun` microVM backend. The `process` backend is available only through the explicit `--backend process` development opt-in shown above. It is useful for deterministic tests, CI, and integration development, but it is not a sandbox and must not be presented as one. Guest root options such as `--image`, `--rootfs`, and `--box` are rejected with the process backend instead of being ignored.
 
 For native cached-start qualification, use a command that writes immediately so the report can measure the first guest output as a conservative command-start signal:
 
 ```sh
-morae benchmark --backend libkrun --image alpine:latest \
+morae benchmark --image alpine:latest \
   --iterations 100 -- /bin/echo ready
 ```
 
-The JSON report separates immutable-base lookup, Box lock, CoW clone, root preparation, helper spawn, first guest output, and full completion percentiles.
+The JSON report separates immutable-base lookup, Box lock, CoW clone, root preparation, helper spawn, first guest output, and full completion percentiles. Native runs report `mode: "cached-one-shot"`; an explicit process benchmark reports `mode: "host-process"` so host execution cannot be mistaken for microVM performance.
 
 ## Connect a coding agent
 

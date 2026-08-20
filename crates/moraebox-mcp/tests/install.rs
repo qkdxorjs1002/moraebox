@@ -113,9 +113,7 @@ fn process_dry_run_warns_and_never_claims_isolation() {
                 "--", "morae-mcp", "--backend", "process",
                 "--cache-dir", cache.to_str().unwrap(),
                 "--state-dir", state.to_str().unwrap(),
-                "--disk-size", "8589934592",
-                "--cpus", "2",
-                "--memory-mib", "512"
+                "--disk-size", "8589934592"
             ]
         })
     );

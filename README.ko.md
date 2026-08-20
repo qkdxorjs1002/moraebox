@@ -183,16 +183,16 @@ morae run --backend process -- /usr/bin/printf 'portable path\n'
 morae benchmark --backend process --iterations 100 -- /usr/bin/true
 ```
 
-`process` 백엔드는 결정론적 테스트, CI, 통합 개발에 유용합니다. 샌드박스가 아니며 샌드박스로 설명해서도 안 됩니다.
+`morae run`, `morae benchmark`, `morae-mcp`는 기본적으로 `libkrun` microVM 백엔드를 사용합니다. `process` 백엔드는 위 예시처럼 `--backend process`를 명시한 개발용 opt-in으로만 사용할 수 있습니다. 결정론적 테스트, CI, 통합 개발에는 유용하지만 샌드박스가 아니며 샌드박스로 설명해서도 안 됩니다. `--image`, `--rootfs`, `--box` 같은 guest root 옵션은 process 백엔드에서 무시되지 않고 오류로 거부됩니다.
 
 네이티브 cached-start를 검증할 때는 첫 guest 출력을 보수적인 command-start 신호로 측정할 수 있도록 즉시 출력하는 명령을 사용합니다.
 
 ```sh
-morae benchmark --backend libkrun --image alpine:latest \
+morae benchmark --image alpine:latest \
   --iterations 100 -- /bin/echo ready
 ```
 
-JSON report는 immutable-base 조회, Box lock, CoW clone, root 준비, helper spawn, 첫 guest 출력, 전체 완료 percentile을 분리합니다.
+JSON report는 immutable-base 조회, Box lock, CoW clone, root 준비, helper spawn, 첫 guest 출력, 전체 완료 percentile을 분리합니다. Native 실행은 `mode: "cached-one-shot"`, 명시적 process benchmark는 `mode: "host-process"`로 표시하므로 호스트 실행을 microVM 성능으로 오인하지 않습니다.
 
 ## 코딩 에이전트 연결
 

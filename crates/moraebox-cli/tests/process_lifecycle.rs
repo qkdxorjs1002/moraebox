@@ -42,6 +42,27 @@ fn process_backend_rejects_the_vm_network_option() {
     );
 }
 
+#[test]
+fn process_backend_rejects_a_guest_rootfs() {
+    let output = Command::new(env!("CARGO_BIN_EXE_morae"))
+        .args([
+            "run",
+            "--backend",
+            "process",
+            "--rootfs",
+            "ignored-rootfs",
+            "--",
+            "not-executed",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--rootfs requires --backend libkrun")
+    );
+}
+
 #[cfg(unix)]
 fn output_and_exit_command() -> Vec<String> {
     ["/bin/sh", "-c", "printf stdout; printf stderr >&2; exit 7"]

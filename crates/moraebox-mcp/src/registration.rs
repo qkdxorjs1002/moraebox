@@ -201,8 +201,8 @@ fn server_configuration(install: &InstallArgs) -> Result<ServerConfiguration, St
     let cache_dir = absolute_path(&install.cache_dir)?;
     let state_dir = absolute_path(&install.state_dir)?;
     if install.backend == RegistrationBackend::Process {
-        if install.image.is_some() {
-            return Err("--image requires --backend libkrun".into());
+        if install.rootfs.is_some() || install.image.is_some() {
+            return Err("--rootfs and --image require --backend libkrun".into());
         }
         return Ok((
             Vec::new(),
@@ -243,7 +243,7 @@ fn common_server_args(
     cache_dir: PathBuf,
     state_dir: PathBuf,
 ) -> Vec<OsString> {
-    vec![
+    let mut args = vec![
         "--backend".into(),
         install.backend.as_str().into(),
         "--cache-dir".into(),
@@ -252,11 +252,16 @@ fn common_server_args(
         state_dir.into_os_string(),
         "--disk-size".into(),
         install.disk_size.to_string().into(),
-        "--cpus".into(),
-        install.cpus.to_string().into(),
-        "--memory-mib".into(),
-        install.memory_mib.to_string().into(),
-    ]
+    ];
+    if install.backend == RegistrationBackend::Libkrun {
+        args.extend([
+            "--cpus".into(),
+            install.cpus.to_string().into(),
+            "--memory-mib".into(),
+            install.memory_mib.to_string().into(),
+        ]);
+    }
+    args
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, String> {
@@ -434,12 +439,15 @@ mod tests {
     fn process_registration_is_explicit_and_has_no_native_environment() {
         let mut install = install_args(Agent::Codex);
         install.backend = RegistrationBackend::Process;
+        install.rootfs = None;
         let (environment, server_args) = server_configuration(&install).unwrap();
         assert!(environment.is_empty());
         let rendered = string_args_from(&server_args);
         assert_eq!(rendered[0..2], ["--backend", "process"]);
         assert!(rendered.contains(&"--cache-dir".into()));
         assert!(rendered.contains(&"--state-dir".into()));
+        assert!(!rendered.contains(&"--cpus".into()));
+        assert!(!rendered.contains(&"--memory-mib".into()));
     }
 
     #[test]
@@ -502,14 +510,21 @@ mod tests {
     }
 
     #[test]
-    fn process_registration_rejects_an_image() {
+    fn process_registration_rejects_guest_root_sources() {
         let mut install = install_args(Agent::Codex);
         install.backend = RegistrationBackend::Process;
         install.rootfs = None;
         install.image = Some("python:3.12".into());
         assert_eq!(
             server_configuration(&install).unwrap_err(),
-            "--image requires --backend libkrun"
+            "--rootfs and --image require --backend libkrun"
+        );
+
+        install.image = None;
+        install.rootfs = Some("/rootfs".into());
+        assert_eq!(
+            server_configuration(&install).unwrap_err(),
+            "--rootfs and --image require --backend libkrun"
         );
     }
 

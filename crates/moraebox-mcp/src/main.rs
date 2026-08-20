@@ -49,6 +49,7 @@ enum McpCommand {
 
 #[derive(Debug, clap::Args)]
 struct ServerArgs {
+    /// Execution backend. Defaults to the isolated native microVM backend.
     #[arg(long, default_value = "libkrun", value_parser = ["process", "libkrun"])]
     backend: String,
     #[arg(long, env = "MORAE_HELPER_PATH")]
@@ -176,8 +177,8 @@ async fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error
     let mke2fs_path = args.mke2fs.unwrap_or_else(default_mke2fs);
     let backend: Arc<dyn Backend> = match args.backend.as_str() {
         "process" => {
-            if args.image.is_some() {
-                return Err("--image requires --backend libkrun".into());
+            if args.rootfs.is_some() || args.image.is_some() {
+                return Err("--rootfs and --image require --backend libkrun".into());
             }
             Arc::new(ProcessBackend)
         }
@@ -1092,6 +1093,7 @@ mod tests {
 
         let raw_args = [OsString::from("morae-mcp")];
         let mut configured = Args::try_parse_from(["morae-mcp"]).unwrap();
+        assert_eq!(configured.server.backend, "libkrun");
         assert!(should_show_bare_help(&raw_args, &configured));
         configured.server.rootfs = Some("rootfs".into());
         assert!(!should_show_bare_help(&raw_args, &configured));
@@ -1104,6 +1106,37 @@ mod tests {
 
         let process = parse_args_from(["morae-mcp", "--backend", "process"]).unwrap();
         assert_eq!(process.server.backend, "process");
+    }
+
+    #[tokio::test]
+    async fn process_server_rejects_a_guest_rootfs() {
+        let result = create_server(ServerArgs {
+            backend: "process".into(),
+            helper: None,
+            libkrun: None,
+            gvproxy: None,
+            rootfs: Some("ignored-rootfs".into()),
+            image: None,
+            cache_dir: ".moraebox/cache".into(),
+            state_dir: ".moraebox/state".into(),
+            registry_username: None,
+            registry_password: None,
+            lib_dir: None,
+            cpus: 2,
+            memory_mib: 512,
+            mke2fs: None,
+            e2fsck: None,
+            disk_size: 8 * 1024 * 1024 * 1024,
+        })
+        .await;
+
+        let Err(error) = result else {
+            panic!("process server unexpectedly accepted a guest rootfs");
+        };
+        assert_eq!(
+            error.to_string(),
+            "--rootfs and --image require --backend libkrun"
+        );
     }
 
     #[tokio::test]
