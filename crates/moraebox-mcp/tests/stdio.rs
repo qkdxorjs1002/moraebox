@@ -30,6 +30,17 @@ fn stdio_has_one_json_response_per_request() {
         stdout.read_line(&mut line).unwrap();
         let response: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(response.get("id"), request.get("id"));
+        if request.get("id") == Some(&json!(3)) {
+            assert_eq!(
+                response.pointer("/result/structuredContent/output/0/text"),
+                Some(&json!("stdio"))
+            );
+            assert!(
+                response
+                    .pointer("/result/structuredContent/output/0/data_base64")
+                    .is_none()
+            );
+        }
     }
     drop(stdin);
     assert!(child.wait().unwrap().success());

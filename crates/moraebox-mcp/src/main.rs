@@ -351,7 +351,7 @@ fn chunks_json(chunks: &[OutputChunk]) -> Vec<Value> {
             json!({
                 "cursor": chunk.cursor,
                 "channel": chunk.channel,
-                "data_base64": STANDARD.encode(&chunk.data)
+                "text": String::from_utf8_lossy(&chunk.data)
             })
         })
         .collect()
@@ -396,7 +396,7 @@ fn tools_list() -> Value {
             {
                 "name": "sandbox_exec",
                 "title": "Execute in configured runtime",
-                "description": "Start a command in the configured runtime. With the libkrun backend, prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. Set wait=false to start a session.",
+                "description": "Start a command in the configured runtime. With the libkrun backend, prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. Set wait=false to start a session. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -415,7 +415,7 @@ fn tools_list() -> Value {
             {
                 "name": "sandbox_io",
                 "title": "Sandbox session I/O",
-                "description": "Write stdin, close it, signal or resize, and read bounded output from a cursor.",
+                "description": "Write stdin, close it, signal or resize, and read bounded UTF-8 text output from a cursor. Invalid byte sequences are replaced with U+FFFD.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -576,6 +576,28 @@ mod tests {
             call.pointer("/result/structuredContent/status/exit_code"),
             Some(&json!(0))
         );
+        assert_eq!(
+            call.pointer("/result/structuredContent/output/0/text"),
+            Some(&json!("mcp"))
+        );
+        assert!(
+            call.pointer("/result/structuredContent/output/0/data_base64")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn output_chunks_are_rendered_as_lossy_utf8_text() {
+        let output = chunks_json(&[OutputChunk {
+            cursor: 7,
+            channel: moraebox_core::OutputChannel::Stdout,
+            data: vec![b'o', b'k', 0xff],
+        }]);
+
+        assert_eq!(output[0].get("cursor"), Some(&json!(7)));
+        assert_eq!(output[0].get("channel"), Some(&json!("stdout")));
+        assert_eq!(output[0].get("text"), Some(&json!("ok\u{fffd}")));
+        assert!(output[0].get("data_base64").is_none());
     }
 
     #[tokio::test]

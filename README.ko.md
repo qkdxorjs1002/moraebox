@@ -188,7 +188,7 @@ morae-mcp install codex --dry-run
 | `sandbox_io` | 제한된 출력 읽기, stdin 쓰기·닫기, 크기 조절, 시그널 전송 |
 | `sandbox_stop` | 세션을 중지하고 정리가 끝날 때까지 대기 |
 
-MCP 스키마에서도 명령은 argv 배열입니다. 출력과 stdin 바이트는 base64로 인코딩합니다.
+MCP 스키마에서도 명령은 argv 배열입니다. 출력 청크는 에이전트가 바로 읽을 수 있는 UTF-8 평문으로 제공하며, 잘못된 UTF-8 바이트는 `U+FFFD`로 치환합니다. stdin 바이트는 계속 base64로 인코딩합니다.
 
 ## 동작 방식
 

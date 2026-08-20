@@ -188,7 +188,7 @@ The server exposes three tools:
 | `sandbox_io` | Read bounded output, write or close stdin, resize, or send a signal |
 | `sandbox_stop` | Stop a session and wait for cleanup |
 
-Commands remain argv arrays in the MCP schema. Output and stdin bytes are base64-encoded.
+Commands remain argv arrays in the MCP schema. Output chunks are exposed as UTF-8 text so agents can read them directly; invalid UTF-8 bytes are replaced with `U+FFFD`. Stdin bytes remain base64-encoded.
 
 ## How it works
 
