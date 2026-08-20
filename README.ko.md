@@ -118,6 +118,23 @@ morae image default --unset
 
 `--rootfs /path/to/rootfs`는 이미 구체화한 guest root 디렉터리를 사용하는 고급 대안입니다. 이미지 해석을 우회하며 `--image`와 함께 사용할 수 없습니다.
 
+### Persistent Box로 작업 이어가기
+
+일반 실행은 새 `SessionId`, 새 microVM, 정리 후 삭제되는 ephemeral copy-on-write root disk를 받습니다. 이후 실행에서도 파일 변경을 유지해야 할 때만 Box를 만듭니다.
+
+```sh
+BOX_ID=$(morae box create --image alpine:latest --json | jq -r .box_id)
+
+morae run --box "$BOX_ID" -- /bin/sh -c 'echo retained > /root/result'
+morae run --box "$BOX_ID" -- cat /root/result
+
+morae box clone "$BOX_ID" --yes
+morae box reset "$BOX_ID" --yes
+morae box delete "$BOX_ID" --yes
+```
+
+`BoxId`는 persistent root filesystem 계보를 식별하며 VM identity나 인증 수단이 아닙니다. `morae run --box`도 매번 새 microVM과 `SessionId`를 만들고 Box disk의 파일만 이어받습니다. 서로 다른 Box는 독립된 disk를 사용하며 같은 Box의 두 번째 writer는 즉시 실패합니다. `--box`는 `--image`, `--rootfs`, `--workspace`와 함께 사용할 수 없고, 격리 없는 `process` 백엔드는 이를 거부합니다.
+
 ### 읽기 전용 워크스페이스 연결
 
 ```sh
@@ -143,6 +160,13 @@ morae image pull python:3.12
 morae image list
 morae image remove python:3.12
 
+morae box create --image python:3.12
+morae box list
+morae box show BOX_ID
+morae box clone BOX_ID --yes
+morae box reset BOX_ID --yes
+morae box delete BOX_ID --yes
+
 morae cache info
 morae cache prune --dry-run
 morae cache prune --yes
@@ -150,7 +174,7 @@ morae cache clean --all --dry-run
 morae cache clean --all --yes
 ```
 
-파괴적인 캐시 작업에는 `--dry-run` 또는 `--yes`가 필요합니다. 구조화된 출력이 필요한 image·cache 명령은 `--json`을 지원합니다.
+파괴적인 캐시 작업에는 `--dry-run` 또는 `--yes`가 필요하며 durable Box 변경에는 `--yes`가 필요합니다. `morae cache clean`은 다시 만들 수 있는 image, immutable base disk, ephemeral 데이터만 지우고 `.moraebox/state`의 persistent Box disk는 지우지 않습니다. 구조화된 출력이 필요한 image·Box·cache 명령은 `--json`을 지원합니다.
 
 ### 격리 없이 수명주기만 확인
 
@@ -160,6 +184,15 @@ morae benchmark --backend process --iterations 100 -- /usr/bin/true
 ```
 
 `process` 백엔드는 결정론적 테스트, CI, 통합 개발에 유용합니다. 샌드박스가 아니며 샌드박스로 설명해서도 안 됩니다.
+
+네이티브 cached-start를 검증할 때는 첫 guest 출력을 보수적인 command-start 신호로 측정할 수 있도록 즉시 출력하는 명령을 사용합니다.
+
+```sh
+morae benchmark --backend libkrun --image alpine:latest \
+  --iterations 100 -- /bin/echo ready
+```
+
+JSON report는 immutable-base 조회, Box lock, CoW clone, root 준비, helper spawn, 첫 guest 출력, 전체 완료 percentile을 분리합니다.
 
 ## 코딩 에이전트 연결
 
@@ -178,15 +211,19 @@ morae-mcp install claude-code
 morae-mcp install codex --dry-run
 ```
 
-설치기는 에이전트의 공식 CLI를 사용하며 설정 파일을 직접 편집하지 않습니다. `--image`, `--cache-dir`, `--cpus`, `--memory-mib`, `--gvproxy`로 등록 내용을 조정할 수 있습니다. 격리 없는 수명주기 테스트가 필요하면 `--backend process`를 명시합니다.
+설치기는 에이전트의 공식 CLI를 사용하며 설정 파일을 직접 편집하지 않습니다. `--image`, `--cache-dir`, `--state-dir`, `--disk-size`, `--cpus`, `--memory-mib`, `--gvproxy`로 등록 내용을 조정할 수 있습니다. 격리 없는 수명주기 테스트가 필요하면 `--backend process`를 명시합니다.
 
-서버는 세 가지 도구를 제공합니다.
+서버는 실행 도구와 persistent Box 관리 도구를 제공합니다.
 
 | 도구 | 용도 |
 | --- | --- |
-| `sandbox_exec` | 명령 하나를 실행하거나 비동기 세션 시작, 네트워크 기본값은 꺼짐 |
+| `sandbox_exec` | 명령 하나를 실행하거나 비동기 세션 시작, 선택형 `box_id`로 파일 상태 재사용 |
 | `sandbox_io` | 제한된 출력 읽기, stdin 쓰기·닫기, 크기 조절, 시그널 전송 |
 | `sandbox_stop` | 세션을 중지하고 정리가 끝날 때까지 대기 |
+| `sandbox_box_create` | OCI 이미지에서 persistent Box 생성 |
+| `sandbox_box_list` / `sandbox_box_get` | persistent Box metadata 조회 |
+| `sandbox_box_delete` / `sandbox_box_reset` | 명시적 확인 후 idle Box를 영구 변경 |
+| `sandbox_box_clone` | 명시적 확인 후 독립된 durable Box 생성 |
 
 MCP 스키마에서도 명령은 argv 배열입니다. 출력 청크는 에이전트가 바로 읽을 수 있는 UTF-8 평문으로 제공하며, 잘못된 UTF-8 바이트는 `U+FFFD`로 치환합니다. stdin 바이트는 계속 base64로 인코딩합니다.
 
@@ -197,6 +234,10 @@ CLI / Rust SDK / MCP 서버
              │
       runtime supervisor
    lifecycle · deadline · I/O
+             │
+ image rootfs → immutable base ext4
+       ├─ BoxId 없음: 실행별 CoW disk → 삭제
+       └─ BoxId 있음: persistent disk → 유지
              │
     실행별 VMM helper 프로세스
        정식 libkrun ABI
@@ -223,6 +264,7 @@ prepare → start → ready → running → stop → dead
 | Crate | 책임 |
 | --- | --- |
 | `moraebox-core` | 실행 명세, 수명주기 상태, 시그널, 제한된 출력 |
+| `moraebox-box` | persistent Box metadata, lease, immutable base disk, ephemeral CoW disk |
 | `moraebox-image` | OCI 레지스트리, digest 검증, 캐시, 워크스페이스 스냅샷 |
 | `moraebox-runtime` | 백엔드, supervision, 세션, 진단, trace |
 | `moraebox-sdk` | 비동기 임베딩 API |
@@ -247,6 +289,8 @@ prepare → start → ready → running → stop → dead
 - 기본 1시간 deadline과 TERM 이후 KILL 승격
 - 일회용 준비 unit과 부모 프로세스 종료 후 정리
 
+Persistent Box는 filesystem 폐기의 명시적 예외일 뿐 VM 폐기의 예외가 아닙니다. 신뢰할 수 없는 guest 변경을 실행 사이에 보존할 수 있으므로 관련 작업에만 같은 Box를 사용하고 trust boundary를 넘기 전 delete 또는 reset해야 합니다. exclusive lease가 한 Box의 동시 writer를 막습니다.
+
 moraebox는 적대적인 호스트 사용자, 손상된 hypervisor·VMM, 적대적인 멀티테넌트 환경으로부터 보호한다고 주장하지 않습니다. process 백엔드는 격리를 제공하지 않습니다.
 
 ## 플랫폼 지원과 현재 제약
@@ -258,6 +302,7 @@ moraebox는 적대적인 호스트 사용자, 손상된 hypervisor·VMM, 적대�
 | libkrun 스택 | 정식 libkrun 1.19.4 및 libkrunfw 5.5.0으로 검증 |
 | 이미지 소스 | 원격 OCI 레지스트리, 로컬 OCI layout과 Docker archive는 아직 가져오지 않음 |
 | VM 재사용 | 구체화한 artifact는 캐시할 수 있지만 부팅한 신뢰 불가 VM은 재사용하지 않음 |
+| Box 지속성 | opt-in 전체 root filesystem 지속성, 각 실행은 여전히 새 microVM 사용 |
 | 워크스페이스 | 읽기 전용 스냅샷, 쓰기 overlay와 copy-out/diff는 후속 작업 |
 | 대화형 I/O | PTY 지원, 실시간 크기 조절은 후속 작업 |
 
@@ -278,7 +323,7 @@ codesign --force --sign - \
   target/release/morae-vmm-helper
 ```
 
-네이티브 실행에는 호환되는 정식 libkrun/libkrunfw 빌드, Hypervisor.framework, 선택형 네트워크 사용 시 `gvproxy`, 워크스페이스 연결 시 `e2fsprogs`의 `mke2fs`도 필요합니다. `morae doctor --json`은 기본 네이티브 준비 상태와 네트워크 준비 상태를 구분해 보고합니다.
+네이티브 실행에는 호환되는 정식 libkrun/libkrunfw 빌드, Hypervisor.framework, `e2fsprogs`의 `mke2fs`와 `e2fsck`, 선택형 네트워크 사용 시 `gvproxy`가 필요합니다. `morae doctor --json`은 기본 네이티브 준비 상태와 네트워크 준비 상태를 구분해 보고합니다.
 
 ## 개발
 

@@ -7,6 +7,7 @@ pub enum TraceKind {
     BackendSpawnStarted,
     BackendSpawned,
     CommandStarted,
+    FirstOutput,
     Timeout,
     GracefulStop,
     ForcedStop,

@@ -10,14 +10,17 @@ use std::{
 };
 
 use clap::{Args, Parser, Subcommand};
-use moraebox_core::{OutputChannel, RunSpec, TimeoutPolicy};
+use moraebox_box::{
+    BaseDiskSpec, BaseDiskStore, BoxMetadata, BoxStore, CreateBox, EphemeralDiskStore,
+};
+use moraebox_core::{BoxId, OutputChannel, RunSpec, TimeoutPolicy};
 use moraebox_image::{
     CacheUsage, CachedImage, CleanReport, Credentials, ImageCache, Platform, PreparedImage,
-    PruneReport, RemoveReport, WorkspaceSnapshot,
+    PruneReport, RemoveReport, WorkspaceSnapshot, digest_tree,
 };
 use moraebox_runtime::{
-    Backend, DoctorReport, LibkrunBackend, LibkrunConfig, NativeRuntimePaths, ProcessBackend,
-    Supervisor,
+    Backend, BoxRootSource, BoxRuntimeConfig, DoctorReport, LibkrunBackend, LibkrunConfig,
+    NativeRuntimePaths, ProcessBackend, Supervisor,
 };
 use serde::Serialize;
 
@@ -48,6 +51,11 @@ enum Command {
         #[command(subcommand)]
         command: CacheCommand,
     },
+    /// Create and manage persistent Box root filesystems.
+    Box {
+        #[command(subcommand)]
+        command: BoxCommand,
+    },
     /// Measure cached one-shot sandbox latency.
     Benchmark(Box<BenchmarkArgs>),
 }
@@ -74,6 +82,24 @@ enum CacheCommand {
     Prune(CachePruneArgs),
     /// Remove all managed image, rootfs, OCI, and workspace cache entries.
     Clean(CacheCleanArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum BoxCommand {
+    /// Create a persistent Box from an OCI image.
+    Create(BoxCreateArgs),
+    /// List persistent Boxes.
+    #[command(visible_alias = "ls")]
+    List(BoxListArgs),
+    /// Show one Box.
+    Show(BoxShowArgs),
+    /// Delete one idle Box.
+    #[command(visible_alias = "rm")]
+    Delete(BoxDeleteArgs),
+    /// Reset one idle Box to its cached immutable base disk.
+    Reset(BoxResetArgs),
+    /// Clone one idle Box into a new independent Box.
+    Clone(BoxCloneArgs),
 }
 
 #[derive(Debug, Args)]
@@ -106,6 +132,9 @@ struct RunArgs {
     /// OCI registry reference; uses the configured python:3.12 default when omitted.
     #[arg(long)]
     image: Option<String>,
+    /// Reuse the persistent root filesystem identified by this `BoxId`.
+    #[arg(long = "box", conflicts_with_all = ["rootfs", "image", "workspace"])]
+    box_id: Option<BoxId>,
     /// Override the automatically discovered libkrun dependency directories.
     #[arg(long, env = "MORAE_LIB_DIR")]
     lib_dir: Option<PathBuf>,
@@ -118,6 +147,9 @@ struct RunArgs {
     workspace: Option<PathBuf>,
     #[arg(long, default_value = ".moraebox/cache")]
     cache_dir: PathBuf,
+    /// Persistent Box metadata root; intentionally separate from the disposable cache.
+    #[arg(long, default_value = ".moraebox/state")]
+    state_dir: PathBuf,
     #[arg(long, env = "MORAE_REGISTRY_USERNAME", requires = "registry_password")]
     registry_username: Option<String>,
     #[arg(
@@ -130,6 +162,12 @@ struct RunArgs {
     /// Path to mke2fs; auto-detected when omitted.
     #[arg(long, env = "MORAE_MKE2FS")]
     mke2fs: Option<PathBuf>,
+    /// Path to e2fsck; auto-detected when omitted.
+    #[arg(long, env = "MORAE_E2FSCK")]
+    e2fsck: Option<PathBuf>,
+    /// Virtual root disk size for an ephemeral image-backed run.
+    #[arg(long, default_value = "8GiB", value_parser = parse_disk_size)]
+    disk_size: u64,
     /// Sandbox wall timeout, for example 30s, 1h, or none.
     #[arg(long, default_value = "1h")]
     timeout: String,
@@ -155,6 +193,87 @@ struct RunArgs {
     json: bool,
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct BoxCreateArgs {
+    /// OCI registry reference; uses the configured default when omitted.
+    #[arg(long)]
+    image: Option<String>,
+    #[arg(long, default_value = ".moraebox/cache")]
+    cache_dir: PathBuf,
+    #[arg(long, default_value = ".moraebox/state")]
+    state_dir: PathBuf,
+    #[arg(long, default_value = "8GiB", value_parser = parse_disk_size)]
+    disk_size: u64,
+    #[arg(long, env = "MORAE_MKE2FS")]
+    mke2fs: Option<PathBuf>,
+    #[arg(long, env = "MORAE_REGISTRY_USERNAME", requires = "registry_password")]
+    registry_username: Option<String>,
+    #[arg(
+        long,
+        env = "MORAE_REGISTRY_PASSWORD",
+        requires = "registry_username",
+        hide_env_values = true
+    )]
+    registry_password: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct BoxListArgs {
+    #[arg(long, default_value = ".moraebox/state")]
+    state_dir: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct BoxShowArgs {
+    box_id: BoxId,
+    #[arg(long, default_value = ".moraebox/state")]
+    state_dir: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct BoxDeleteArgs {
+    box_id: BoxId,
+    #[arg(long, default_value = ".moraebox/state")]
+    state_dir: PathBuf,
+    /// Confirm permanent deletion of the Box disk.
+    #[arg(long, required = true)]
+    yes: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct BoxResetArgs {
+    box_id: BoxId,
+    #[arg(long, default_value = ".moraebox/cache")]
+    cache_dir: PathBuf,
+    #[arg(long, default_value = ".moraebox/state")]
+    state_dir: PathBuf,
+    /// Confirm replacement of every change in the Box disk.
+    #[arg(long, required = true)]
+    yes: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct BoxCloneArgs {
+    box_id: BoxId,
+    #[arg(long, default_value = ".moraebox/state")]
+    state_dir: PathBuf,
+    /// Confirm creation of a new durable Box disk.
+    #[arg(long, required = true)]
+    yes: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -266,12 +385,36 @@ struct BenchmarkArgs {
     libkrun: Option<PathBuf>,
     #[arg(long, env = "MORAE_ROOTFS")]
     rootfs: Option<PathBuf>,
+    #[arg(long, conflicts_with = "rootfs")]
+    image: Option<String>,
+    #[arg(long = "box", conflicts_with_all = ["rootfs", "image"])]
+    box_id: Option<BoxId>,
+    #[arg(long, default_value = ".moraebox/cache")]
+    cache_dir: PathBuf,
+    #[arg(long, default_value = ".moraebox/state")]
+    state_dir: PathBuf,
+    #[arg(long, env = "MORAE_MKE2FS")]
+    mke2fs: Option<PathBuf>,
+    #[arg(long, env = "MORAE_E2FSCK")]
+    e2fsck: Option<PathBuf>,
+    #[arg(long, default_value = "8GiB", value_parser = parse_disk_size)]
+    disk_size: u64,
+    #[arg(long, env = "MORAE_REGISTRY_USERNAME", requires = "registry_password")]
+    registry_username: Option<String>,
+    #[arg(
+        long,
+        env = "MORAE_REGISTRY_PASSWORD",
+        requires = "registry_username",
+        hide_env_values = true
+    )]
+    registry_password: Option<String>,
     #[arg(long, env = "MORAE_LIB_DIR")]
     lib_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 2)]
     cpus: u8,
     #[arg(long, default_value_t = 512)]
     memory_mib: u32,
+    /// Command to measure; emit output immediately to populate `command_start_p95_micros`.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
@@ -325,6 +468,24 @@ async fn execute(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         Command::Cache {
             command: CacheCommand::Clean(args),
         } => cache_clean(&args),
+        Command::Box {
+            command: BoxCommand::Create(args),
+        } => box_create(args).await,
+        Command::Box {
+            command: BoxCommand::List(args),
+        } => box_list(&args),
+        Command::Box {
+            command: BoxCommand::Show(args),
+        } => box_show(&args),
+        Command::Box {
+            command: BoxCommand::Delete(args),
+        } => box_delete(&args),
+        Command::Box {
+            command: BoxCommand::Reset(args),
+        } => box_reset(&args),
+        Command::Box {
+            command: BoxCommand::Clone(args),
+        } => box_clone(&args),
         Command::Benchmark(args) => benchmark(*args).await,
     }
 }
@@ -383,8 +544,10 @@ fn doctor(args: &DoctorArgs) -> Result<i32, Box<dyn std::error::Error>> {
     Ok(i32::from(args.strict && !report.native_backend_ready))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let mut spec = RunSpec::command(args.command);
+    spec.box_id = args.box_id;
     spec.timeout = parse_timeout(&args.timeout)?;
     spec.tty = args.tty;
     spec.inherit_env = args.inherit_env;
@@ -401,27 +564,40 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     if args.rootfs.is_some() && args.image.is_some() {
         return Err("--rootfs and --image are mutually exclusive".into());
     }
+    if spec.box_id.is_some() && args.backend != "libkrun" {
+        return Err("--box requires --backend libkrun".into());
+    }
+    if spec.box_id.is_some()
+        && (args.rootfs.is_some() || args.image.is_some() || args.workspace.is_some())
+    {
+        return Err("--box cannot be combined with --rootfs, --image, or --workspace".into());
+    }
     validate_network_option(&args.backend, spec.network)?;
-    let image_reference = select_image_reference(
-        &args.backend,
-        args.rootfs.is_some(),
-        args.image,
-        &args.cache_dir,
-    )?;
-    let image_root = if let Some(reference) = image_reference.as_deref() {
+    let image_reference = if spec.box_id.is_some() {
+        None
+    } else {
+        select_image_reference(
+            &args.backend,
+            args.rootfs.is_some(),
+            args.image,
+            &args.cache_dir,
+        )?
+    };
+    let platform = Platform::host_linux();
+    let prepared_image = if let Some(reference) = image_reference.as_deref() {
         Some(
             resolve_or_pull(
                 reference,
                 &args.cache_dir,
-                &Platform::host_linux(),
+                &platform,
                 credentials(args.registry_username, args.registry_password),
             )
-            .await?
-            .rootfs,
+            .await?,
         )
     } else {
         None
     };
+    let mke2fs = args.mke2fs.unwrap_or_else(default_mke2fs);
 
     let workspace = if let Some(source) = args.workspace.as_deref() {
         if args.backend != "libkrun" {
@@ -430,7 +606,6 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
         if spec.cwd.is_some() {
             return Err("--cwd and --workspace cannot be combined in this version".into());
         }
-        let mke2fs = args.mke2fs.unwrap_or_else(default_mke2fs);
         Some(WorkspaceSnapshot::create(source, &args.cache_dir, &mke2fs)?)
     } else {
         None
@@ -439,13 +614,37 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let report = match args.backend.as_str() {
         "process" => Supervisor::new(ProcessBackend).run(spec).await?,
         "libkrun" => {
+            let root_source = if spec.box_id.is_some() {
+                None
+            } else if let Some(prepared) = prepared_image.as_ref() {
+                Some(BoxRootSource {
+                    rootfs_path: prepared.rootfs.clone(),
+                    manifest_digest: prepared.manifest_digest.clone(),
+                    platform: platform_name(&platform),
+                    virtual_size_bytes: args.disk_size,
+                    mke2fs_path: mke2fs,
+                })
+            } else if let Some(rootfs) = args.rootfs.as_ref() {
+                Some(BoxRootSource {
+                    rootfs_path: rootfs.clone(),
+                    manifest_digest: digest_tree(rootfs)?.to_string(),
+                    platform: platform_name(&platform),
+                    virtual_size_bytes: args.disk_size,
+                    mke2fs_path: mke2fs,
+                })
+            } else {
+                return Err("libkrun run requires an image, rootfs, or BoxId".into());
+            };
             let mut config = native_config(
                 args.helper,
                 args.libkrun,
                 args.lib_dir,
                 args.gvproxy,
-                args.rootfs.or(image_root),
+                root_source
+                    .as_ref()
+                    .map(|source| source.rootfs_path.clone()),
                 "--rootfs, --image, or MORAE_ROOTFS",
+                true,
             )?;
             config.vcpus = args.cpus;
             config.memory_mib = args.memory_mib;
@@ -453,7 +652,16 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
                 .as_ref()
                 .map(|snapshot| snapshot.image_path.clone());
             config.network_runtime_dir = args.cache_dir.join("network");
-            Supervisor::new(LibkrunBackend::new(config))
+            let ephemeral_disks = EphemeralDiskStore::new(args.cache_dir.join("runtime"));
+            let _ = ephemeral_disks.garbage_collect()?;
+            let runtime = BoxRuntimeConfig {
+                boxes: BoxStore::new(args.state_dir),
+                base_disks: BaseDiskStore::new(&args.cache_dir),
+                ephemeral_disks,
+                source: root_source,
+                e2fsck_path: args.e2fsck.unwrap_or_else(default_e2fsck),
+            };
+            Supervisor::new(LibkrunBackend::new(config).with_box_runtime(runtime))
                 .run(spec)
                 .await?
         }
@@ -520,6 +728,130 @@ async fn resolve_or_pull(
         .resolve_or_pull(reference, platform, credentials)
         .await
         .map_err(Into::into)
+}
+
+async fn box_create(args: BoxCreateArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    let cache = ImageCache::new(&args.cache_dir);
+    let reference = match args.image {
+        Some(reference) => reference,
+        None => cache.default_reference()?,
+    };
+    let platform = Platform::host_linux();
+    let prepared = cache
+        .resolve_or_pull(
+            &reference,
+            &platform,
+            credentials(args.registry_username, args.registry_password),
+        )
+        .await?;
+    let spec = BaseDiskSpec::new(
+        prepared.manifest_digest.clone(),
+        platform_name(&platform),
+        args.disk_size,
+    );
+    let base = BaseDiskStore::new(&args.cache_dir).prepare(
+        &spec,
+        &prepared.rootfs,
+        &args.mke2fs.unwrap_or_else(default_mke2fs),
+    )?;
+    let metadata = BoxStore::new(args.state_dir).create(
+        &CreateBox::new(
+            prepared.manifest_digest,
+            platform_name(&platform),
+            args.disk_size,
+        ),
+        base.disk_path(),
+    )?;
+    print_box_result(&metadata, args.json)?;
+    Ok(0)
+}
+
+fn box_list(args: &BoxListArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    let boxes = BoxStore::new(&args.state_dir).list()?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&boxes)?);
+    } else {
+        println!("BOX ID\tSTATE\tIMAGE DIGEST\tPLATFORM\tSIZE\tGENERATION");
+        for metadata in boxes {
+            println!(
+                "{}\t{:?}\t{}\t{}\t{}\t{}",
+                metadata.box_id,
+                metadata.state,
+                metadata.manifest_digest,
+                metadata.platform,
+                format_bytes(metadata.virtual_size_bytes),
+                metadata.generation
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn box_show(args: &BoxShowArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    let metadata = BoxStore::new(&args.state_dir).get(args.box_id)?;
+    print_box_result(&metadata, args.json)?;
+    Ok(0)
+}
+
+fn box_delete(args: &BoxDeleteArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    debug_assert!(args.yes, "clap requires --yes");
+    let metadata = BoxStore::new(&args.state_dir).delete(args.box_id)?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&BoxMutationReport {
+                operation: "delete",
+                box_id: metadata.box_id,
+                generation: metadata.generation,
+            })?
+        );
+    } else {
+        println!("deleted Box {}", metadata.box_id);
+    }
+    Ok(0)
+}
+
+fn box_reset(args: &BoxResetArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    debug_assert!(args.yes, "clap requires --yes");
+    let store = BoxStore::new(&args.state_dir);
+    let current = store.get(args.box_id)?;
+    let spec = BaseDiskSpec::new(
+        current.manifest_digest.clone(),
+        current.platform.clone(),
+        current.virtual_size_bytes,
+    );
+    let base = BaseDiskStore::new(&args.cache_dir)
+        .get(&spec)?
+        .ok_or_else(|| {
+            format!(
+                "the immutable base disk for Box {} is not cached; recreate the image-backed Box instead",
+                args.box_id
+            )
+        })?;
+    let metadata = store.reset(args.box_id, base.disk_path())?;
+    print_box_result(&metadata, args.json)?;
+    Ok(0)
+}
+
+fn box_clone(args: &BoxCloneArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    debug_assert!(args.yes, "clap requires --yes");
+    let metadata = BoxStore::new(&args.state_dir).clone_box(args.box_id)?;
+    print_box_result(&metadata, args.json)?;
+    Ok(0)
+}
+
+fn print_box_result(metadata: &BoxMetadata, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(metadata)?);
+    } else {
+        println!("Box ID: {}", metadata.box_id);
+        println!("state: {:?}", metadata.state);
+        println!("manifest: {}", metadata.manifest_digest);
+        println!("platform: {}", metadata.platform);
+        println!("disk size: {}", format_bytes(metadata.virtual_size_bytes));
+        println!("generation: {}", metadata.generation);
+    }
+    Ok(())
 }
 
 async fn image_pull(args: ImagePullArgs) -> Result<i32, Box<dyn std::error::Error>> {
@@ -701,6 +1033,11 @@ fn print_cache_usage(usage: &CacheUsage) {
     println!("image references: {}", usage.references);
     println!("ready rootfs images: {}", usage.images);
     println!("rootfs size: {}", format_bytes(usage.rootfs_bytes));
+    println!("immutable Box base disks: {}", usage.base_disks);
+    println!(
+        "Box base disk size: {}",
+        format_bytes(usage.base_disk_bytes)
+    );
     println!("OCI blobs: {}", usage.oci_blobs);
     println!("OCI size: {}", format_bytes(usage.oci_bytes));
     println!("workspace snapshots: {}", usage.workspaces);
@@ -746,23 +1083,87 @@ async fn benchmark(args: BenchmarkArgs) -> Result<i32, Box<dyn std::error::Error
     let command = args.command;
     let report = match args.backend.as_str() {
         "process" => {
-            run_benchmark(&Supervisor::new(ProcessBackend), command, args.iterations).await?
+            if args.box_id.is_some() || args.image.is_some() || args.rootfs.is_some() {
+                return Err("--box, --image, and --rootfs require --backend libkrun".into());
+            }
+            run_benchmark(
+                &Supervisor::new(ProcessBackend),
+                command,
+                args.iterations,
+                None,
+            )
+            .await?
         }
         "libkrun" => {
+            let platform = Platform::host_linux();
+            let prepared_image = if args.box_id.is_none() && args.rootfs.is_none() {
+                let cache = ImageCache::new(&args.cache_dir);
+                let reference = match args.image {
+                    Some(reference) => reference,
+                    None => cache.default_reference()?,
+                };
+                Some(
+                    cache
+                        .resolve_or_pull(
+                            &reference,
+                            &platform,
+                            credentials(args.registry_username, args.registry_password),
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            };
+            let mke2fs = args.mke2fs.unwrap_or_else(default_mke2fs);
+            let root_source = if args.box_id.is_some() {
+                None
+            } else if let Some(prepared) = prepared_image {
+                Some(BoxRootSource {
+                    rootfs_path: prepared.rootfs,
+                    manifest_digest: prepared.manifest_digest,
+                    platform: platform_name(&platform),
+                    virtual_size_bytes: args.disk_size,
+                    mke2fs_path: mke2fs,
+                })
+            } else if let Some(rootfs) = args.rootfs {
+                Some(BoxRootSource {
+                    manifest_digest: digest_tree(&rootfs)?.to_string(),
+                    rootfs_path: rootfs,
+                    platform: platform_name(&platform),
+                    virtual_size_bytes: args.disk_size,
+                    mke2fs_path: mke2fs,
+                })
+            } else {
+                return Err("libkrun benchmark requires an image, rootfs, or BoxId".into());
+            };
             let mut config = native_config(
                 args.helper,
                 args.libkrun,
                 args.lib_dir,
                 None,
-                args.rootfs,
-                "--rootfs or MORAE_ROOTFS",
+                root_source
+                    .as_ref()
+                    .map(|source| source.rootfs_path.clone()),
+                "--rootfs, --image, or --box",
+                true,
             )?;
             config.vcpus = args.cpus;
             config.memory_mib = args.memory_mib;
+            config.network_runtime_dir = args.cache_dir.join("network");
+            let ephemeral_disks = EphemeralDiskStore::new(args.cache_dir.join("runtime"));
+            let _ = ephemeral_disks.garbage_collect()?;
+            let runtime = BoxRuntimeConfig {
+                boxes: BoxStore::new(args.state_dir),
+                base_disks: BaseDiskStore::new(&args.cache_dir),
+                ephemeral_disks,
+                source: root_source,
+                e2fsck_path: args.e2fsck.unwrap_or_else(default_e2fsck),
+            };
             run_benchmark(
-                &Supervisor::new(LibkrunBackend::new(config)),
+                &Supervisor::new(LibkrunBackend::new(config).with_box_runtime(runtime)),
                 command,
                 args.iterations,
+                args.box_id,
             )
             .await?
         }
@@ -776,20 +1177,58 @@ async fn run_benchmark<B: Backend>(
     supervisor: &Supervisor<B>,
     command: Vec<String>,
     iterations: u32,
+    box_id: Option<BoxId>,
 ) -> Result<BenchmarkReport, Box<dyn std::error::Error>> {
     let mut samples = Vec::with_capacity(iterations as usize);
+    let mut backend_ready_samples = Vec::with_capacity(iterations as usize);
+    let mut command_start_samples = Vec::with_capacity(iterations as usize);
+    let mut root_prepare_samples = Vec::new();
+    let mut cache_lookup_samples = Vec::new();
+    let mut box_lock_samples = Vec::new();
+    let mut disk_clone_samples = Vec::new();
+    let mut helper_spawn_samples = Vec::new();
     let mut failures = 0_u32;
     for _ in 0..iterations {
-        let report = supervisor.run(RunSpec::command(command.clone())).await?;
+        let mut spec = RunSpec::command(command.clone());
+        spec.box_id = box_id;
+        let report = supervisor.run(spec).await?;
         if report.exit_code != Some(0) || report.timed_out {
             failures += 1;
         }
         samples.push(report.elapsed_micros);
+        if let Some(command_started) = report
+            .trace
+            .iter()
+            .find(|event| event.kind == moraebox_runtime::TraceKind::CommandStarted)
+        {
+            backend_ready_samples.push(command_started.elapsed_micros);
+        }
+        if let Some(first_output) = report
+            .trace
+            .iter()
+            .find(|event| event.kind == moraebox_runtime::TraceKind::FirstOutput)
+        {
+            command_start_samples.push(first_output.elapsed_micros);
+        }
+        extend_if_some(
+            &mut root_prepare_samples,
+            report.startup.root_prepare_micros,
+        );
+        extend_if_some(
+            &mut cache_lookup_samples,
+            report.startup.cache_lookup_micros,
+        );
+        extend_if_some(&mut box_lock_samples, report.startup.box_lock_micros);
+        extend_if_some(&mut disk_clone_samples, report.startup.disk_clone_micros);
+        extend_if_some(
+            &mut helper_spawn_samples,
+            report.startup.helper_spawn_micros,
+        );
     }
     samples.sort_unstable();
     Ok(BenchmarkReport {
         backend: supervisor.backend_name().into(),
-        mode: "cached-cold".into(),
+        mode: "cached-one-shot".into(),
         iterations,
         failures,
         min_micros: samples[0],
@@ -797,7 +1236,29 @@ async fn run_benchmark<B: Backend>(
         p95_micros: percentile(&samples, 95),
         p99_micros: percentile(&samples, 99),
         max_micros: *samples.last().expect("iterations is non-zero"),
+        command_start_p95_micros: optional_percentile(&mut command_start_samples, 95),
+        backend_ready_p95_micros: optional_percentile(&mut backend_ready_samples, 95),
+        root_prepare_p95_micros: optional_percentile(&mut root_prepare_samples, 95),
+        cache_lookup_p95_micros: optional_percentile(&mut cache_lookup_samples, 95),
+        box_lock_p95_micros: optional_percentile(&mut box_lock_samples, 95),
+        disk_clone_p95_micros: optional_percentile(&mut disk_clone_samples, 95),
+        helper_spawn_p95_micros: optional_percentile(&mut helper_spawn_samples, 95),
     })
+}
+
+fn extend_if_some(samples: &mut Vec<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        samples.push(value);
+    }
+}
+
+fn optional_percentile(samples: &mut [u64], percentile_value: usize) -> Option<u64> {
+    if samples.is_empty() {
+        None
+    } else {
+        samples.sort_unstable();
+        Some(percentile(samples, percentile_value))
+    }
 }
 
 fn percentile(sorted: &[u64], percentile: usize) -> u64 {
@@ -811,6 +1272,13 @@ struct DefaultImageReport {
 }
 
 #[derive(Debug, Serialize)]
+struct BoxMutationReport {
+    operation: &'static str,
+    box_id: BoxId,
+    generation: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct BenchmarkReport {
     backend: String,
     mode: String,
@@ -821,6 +1289,13 @@ struct BenchmarkReport {
     p95_micros: u64,
     p99_micros: u64,
     max_micros: u64,
+    command_start_p95_micros: Option<u64>,
+    backend_ready_p95_micros: Option<u64>,
+    root_prepare_p95_micros: Option<u64>,
+    cache_lookup_p95_micros: Option<u64>,
+    box_lock_p95_micros: Option<u64>,
+    disk_clone_p95_micros: Option<u64>,
+    helper_spawn_p95_micros: Option<u64>,
 }
 
 fn native_config(
@@ -830,6 +1305,7 @@ fn native_config(
     gvproxy: Option<PathBuf>,
     root: Option<PathBuf>,
     root_description: &'static str,
+    managed_root: bool,
 ) -> Result<LibkrunConfig, Box<dyn std::error::Error>> {
     let paths = NativeRuntimePaths::discover_with_gvproxy(helper, libkrun, lib_dir, gvproxy);
     let helper = required_path(
@@ -840,7 +1316,12 @@ fn native_config(
         paths.libkrun,
         "--libkrun, MORAE_LIBKRUN_PATH, or a supported Homebrew libkrun",
     )?;
-    let mut config = LibkrunConfig::new(helper, library, required_path(root, root_description)?);
+    let root = if managed_root {
+        root.unwrap_or_default()
+    } else {
+        required_path(root, root_description)?
+    };
+    let mut config = LibkrunConfig::new(helper, library, root);
     config.library_search_path = paths.library_search_path;
     config.gvproxy_path = paths.gvproxy;
     Ok(config)
@@ -866,6 +1347,55 @@ fn default_mke2fs() -> PathBuf {
         }
     }
     PathBuf::from("mke2fs")
+}
+
+fn default_e2fsck() -> PathBuf {
+    for path in [
+        "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck",
+        "/usr/local/opt/e2fsprogs/sbin/e2fsck",
+        "/usr/sbin/e2fsck",
+        "/sbin/e2fsck",
+    ] {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return path;
+        }
+    }
+    PathBuf::from("e2fsck")
+}
+
+fn platform_name(platform: &Platform) -> String {
+    match &platform.variant {
+        Some(variant) => format!("{}/{}/{}", platform.os, platform.architecture, variant),
+        None => format!("{}/{}", platform.os, platform.architecture),
+    }
+}
+
+fn parse_disk_size(input: &str) -> Result<u64, String> {
+    let input = input.trim();
+    let split = input
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(input.len());
+    let (number, suffix) = input.split_at(split);
+    let value = number
+        .parse::<u64>()
+        .map_err(|_| "disk size must start with a positive integer".to_owned())?;
+    if value == 0 {
+        return Err("disk size must be greater than zero".into());
+    }
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kib" => 1024,
+        "mib" => 1024 * 1024,
+        "gib" => 1024 * 1024 * 1024,
+        "kb" => 1000,
+        "mb" => 1000 * 1000,
+        "gb" => 1000 * 1000 * 1000,
+        _ => return Err("disk size suffix must be B, KiB, MiB, GiB, KB, MB, or GB".into()),
+    };
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| "disk size is too large".into())
 }
 
 fn parse_timeout(input: &str) -> Result<TimeoutPolicy, Box<dyn std::error::Error>> {
@@ -1037,6 +1567,69 @@ mod tests {
         assert!(!destructive_mode(true, false, "cache prune").unwrap());
         assert!(destructive_mode(false, true, "cache prune").unwrap());
         assert!(destructive_mode(false, false, "cache prune").is_err());
+    }
+
+    #[test]
+    fn parses_box_management_and_run_selection() {
+        let create = Cli::try_parse_from([
+            "morae",
+            "box",
+            "create",
+            "--image",
+            "alpine:latest",
+            "--disk-size",
+            "512MiB",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Box {
+            command: BoxCommand::Create(create),
+        } = create.command
+        else {
+            panic!("expected box create command");
+        };
+        assert_eq!(create.disk_size, 512 * 1024 * 1024);
+        assert!(create.json);
+
+        let box_id = BoxId::new();
+        let run = Cli::try_parse_from([
+            "morae",
+            "run",
+            "--box",
+            &box_id.to_string(),
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let Command::Run(run) = run.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(run.box_id, Some(box_id));
+
+        assert!(
+            Cli::try_parse_from([
+                "morae",
+                "run",
+                "--box",
+                &box_id.to_string(),
+                "--image",
+                "alpine:latest",
+                "--",
+                "/bin/true",
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["morae", "box", "delete", &box_id.to_string()]).is_err());
+        assert!(Cli::try_parse_from(["morae", "box", "reset", &box_id.to_string()]).is_err());
+        assert!(Cli::try_parse_from(["morae", "box", "clone", &box_id.to_string()]).is_err());
+    }
+
+    #[test]
+    fn parses_disk_size_units_and_rejects_zero() {
+        assert_eq!(parse_disk_size("8GiB").unwrap(), 8 * 1024 * 1024 * 1024);
+        assert_eq!(parse_disk_size("500MB").unwrap(), 500_000_000);
+        assert!(parse_disk_size("0").is_err());
+        assert!(parse_disk_size("1TB").is_err());
     }
 
     #[test]

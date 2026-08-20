@@ -16,7 +16,7 @@ use tokio::{
     time::{Sleep, sleep},
 };
 
-use crate::{Backend, BackendError, TraceEvent, TraceKind};
+use crate::{Backend, BackendError, StartupMetrics, TraceEvent, TraceKind};
 
 pub struct Supervisor<B> {
     backend: B,
@@ -57,6 +57,7 @@ where
         trace.push(TraceKind::BackendSpawned);
         lifecycle.apply(LifecycleEvent::CommandStarted)?;
         trace.push(TraceKind::CommandStarted);
+        let startup = spawned.startup;
 
         let mut exit = spawned.exit;
         let controller = spawned.controller;
@@ -88,6 +89,7 @@ where
         let timeout = spec.timeout.duration();
         let mut timer = timeout.map(|duration| Box::pin(sleep(duration)));
         let mut output_open = true;
+        let mut first_output_seen = false;
         let mut timed_out = false;
 
         let status = loop {
@@ -95,7 +97,13 @@ where
                 status = &mut exit => break status?,
                 chunk = output_receiver.recv(), if output_open => {
                     match chunk {
-                        Some((channel, bytes)) => { output.push(channel, bytes); }
+                        Some((channel, bytes)) => {
+                            if !first_output_seen {
+                                first_output_seen = true;
+                                trace.push(TraceKind::FirstOutput);
+                            }
+                            output.push(channel, bytes);
+                        }
                         None => { output_open = false; }
                     }
                 }
@@ -112,6 +120,7 @@ where
                         &mut output_receiver,
                         &mut output,
                         &mut trace,
+                        &mut first_output_seen,
                     ).await?;
                 }
             }
@@ -128,6 +137,10 @@ where
             let _ = task.await;
         }
         while let Ok((channel, bytes)) = output_receiver.try_recv() {
+            if !first_output_seen {
+                first_output_seen = true;
+                trace.push(TraceKind::FirstOutput);
+            }
             output.push(channel, bytes);
         }
 
@@ -151,6 +164,7 @@ where
             output_next_cursor: output.next_cursor(),
             output_truncated: all_output.truncated,
             elapsed_micros: duration_micros(started.elapsed()),
+            startup,
             trace: trace.events,
         })
     }
@@ -169,6 +183,7 @@ async fn wait_with_grace(
     output_receiver: &mut mpsc::Receiver<(OutputChannel, Vec<u8>)>,
     output: &mut OutputBuffer,
     trace: &mut TraceRecorder,
+    first_output_seen: &mut bool,
 ) -> Result<ExitStatus, SupervisorError> {
     let grace_timer = sleep(grace);
     tokio::pin!(grace_timer);
@@ -177,6 +192,10 @@ async fn wait_with_grace(
             status = &mut *exit => return Ok(status?),
             chunk = output_receiver.recv() => {
                 if let Some((channel, bytes)) = chunk {
+                    if !*first_output_seen {
+                        *first_output_seen = true;
+                        trace.push(TraceKind::FirstOutput);
+                    }
                     output.push(channel, bytes);
                 }
             }
@@ -238,6 +257,7 @@ pub struct RunReport {
     pub output_next_cursor: u64,
     pub output_truncated: bool,
     pub elapsed_micros: u64,
+    pub startup: StartupMetrics,
     pub trace: Vec<TraceEvent>,
 }
 
@@ -299,6 +319,20 @@ mod tests {
         assert!(report.output.iter().any(|chunk| {
             chunk.channel == OutputChannel::Stderr && chunk.data.starts_with(b"err")
         }));
+        let trace_kinds = report
+            .trace
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+        let command_started = trace_kinds
+            .iter()
+            .position(|kind| *kind == TraceKind::CommandStarted)
+            .unwrap();
+        let first_output = trace_kinds
+            .iter()
+            .position(|kind| *kind == TraceKind::FirstOutput)
+            .unwrap();
+        assert!(command_started < first_output);
     }
 
     #[tokio::test]

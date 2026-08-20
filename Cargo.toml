@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/moraebox-box",
     "crates/moraebox-core",
     "crates/moraebox-protocol",
     "crates/moraebox-image",

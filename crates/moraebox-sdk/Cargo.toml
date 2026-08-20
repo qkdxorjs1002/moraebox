@@ -7,11 +7,15 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+moraebox-box = { path = "../moraebox-box" }
 moraebox-core = { path = "../moraebox-core" }
 moraebox-runtime = { path = "../moraebox-runtime" }
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

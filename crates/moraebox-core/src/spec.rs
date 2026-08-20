@@ -39,6 +39,40 @@ impl std::str::FromStr for SessionId {
     }
 }
 
+/// Identifies a persistent root filesystem lineage across otherwise independent runs.
+///
+/// A `BoxId` is not a VM identity or an authentication token. Every run still receives a new
+/// [`SessionId`] and a fresh backend instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BoxId(Uuid);
+
+impl BoxId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for BoxId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for BoxId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::str::FromStr for BoxId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "milliseconds", rename_all = "snake_case")]
 pub enum TimeoutPolicy {
@@ -73,6 +107,8 @@ pub enum Signal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSpec {
     pub session_id: SessionId,
+    #[serde(default)]
+    pub box_id: Option<BoxId>,
     pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
@@ -93,6 +129,7 @@ impl RunSpec {
     pub fn command(argv: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             session_id: SessionId::new(),
+            box_id: None,
             argv: argv.into_iter().map(Into::into).collect(),
             cwd: None,
             env: BTreeMap::new(),
@@ -172,5 +209,21 @@ mod tests {
         let spec: RunSpec = serde_json::from_value(value).unwrap();
 
         assert!(!spec.network);
+    }
+
+    #[test]
+    fn older_serialized_specs_default_to_no_box() {
+        let mut value = serde_json::to_value(RunSpec::command(["true"])).unwrap();
+        value.as_object_mut().unwrap().remove("box_id");
+
+        let spec: RunSpec = serde_json::from_value(value).unwrap();
+
+        assert_eq!(spec.box_id, None);
+    }
+
+    #[test]
+    fn box_id_round_trips_as_a_uuid() {
+        let id = BoxId::new();
+        assert_eq!(id.to_string().parse::<BoxId>().unwrap(), id);
     }
 }

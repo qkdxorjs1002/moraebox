@@ -6,10 +6,12 @@ use std::{ffi::OsString, path::PathBuf, process::ExitCode, str::FromStr, sync::A
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand};
-use moraebox_core::{OutputChunk, RunSpec, SessionId, Signal, TimeoutPolicy};
-use moraebox_image::{Credentials, ImageCache, Platform};
+use moraebox_box::{BaseDiskSpec, BaseDiskStore, BoxStore, CreateBox, EphemeralDiskStore};
+use moraebox_core::{BoxId, OutputChunk, RunSpec, SessionId, Signal, TimeoutPolicy};
+use moraebox_image::{Credentials, ImageCache, Platform, digest_tree};
 use moraebox_runtime::{
-    Backend, LibkrunBackend, LibkrunConfig, NativeRuntimePaths, ProcessBackend,
+    Backend, BoxRootSource, BoxRuntimeConfig, LibkrunBackend, LibkrunConfig, NativeRuntimePaths,
+    ProcessBackend,
 };
 use moraebox_sdk::{ExecutionResult, IoRequest, IoResult, SandboxSdk};
 use serde::Deserialize;
@@ -22,7 +24,9 @@ const SERVER_INSTRUCTIONS: &str = concat!(
     "including untrusted code, dependency installation, isolated experiments, reproducible ",
     "Linux checks, or long-running sessions. Use wait=true for one-shot commands and ",
     "wait=false to start sessions; use sandbox_io for cursor-based I/O and sandbox_stop to ",
-    "terminate and clean up sessions. Only the libkrun backend provides VM isolation; the ",
+    "terminate and clean up sessions. Pass box_id to continue from a persistent Box while ",
+    "still receiving a new microVM and SessionId for every run. Use the sandbox_box_* tools ",
+    "to create and manage persistent root filesystems. Only the libkrun backend provides VM isolation; the ",
     "process backend is for deterministic development and is not isolated. Host workspace ",
     "files are not attached automatically, so use this server only when required inputs ",
     "already exist in the guest."
@@ -62,6 +66,9 @@ struct ServerArgs {
     image: Option<String>,
     #[arg(long, default_value = ".moraebox/cache")]
     cache_dir: PathBuf,
+    /// Persistent Box metadata root; intentionally separate from the disposable cache.
+    #[arg(long, default_value = ".moraebox/state")]
+    state_dir: PathBuf,
     #[arg(long, env = "MORAE_REGISTRY_USERNAME", requires = "registry_password")]
     registry_username: Option<String>,
     #[arg(
@@ -77,6 +84,31 @@ struct ServerArgs {
     cpus: u8,
     #[arg(long, default_value_t = 512)]
     memory_mib: u32,
+    /// Path to mke2fs; auto-detected when omitted.
+    #[arg(long, env = "MORAE_MKE2FS")]
+    mke2fs: Option<PathBuf>,
+    /// Path to e2fsck; auto-detected when omitted.
+    #[arg(long, env = "MORAE_E2FSCK")]
+    e2fsck: Option<PathBuf>,
+    /// Virtual root disk size for ephemeral image-backed runs and new Boxes.
+    #[arg(long, default_value = "8GiB", value_parser = parse_disk_size)]
+    disk_size: u64,
+}
+
+#[derive(Clone)]
+struct McpServer {
+    sdk: SandboxSdk,
+    boxes: BoxServices,
+}
+
+#[derive(Clone)]
+struct BoxServices {
+    images: ImageCache,
+    base_disks: BaseDiskStore,
+    platform: Platform,
+    credentials: Option<Credentials>,
+    mke2fs_path: PathBuf,
+    default_disk_size: u64,
 }
 
 #[tokio::main]
@@ -92,8 +124,8 @@ async fn main() -> ExitCode {
             }
         };
     }
-    match create_sdk(server).await {
-        Ok(sdk) => match serve(sdk).await {
+    match create_server(server).await {
+        Ok(server) => match serve(server).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("morae-mcp: {error}");
@@ -131,7 +163,17 @@ fn should_show_bare_help(raw_args: &[OsString], parsed: &Args) -> bool {
         && parsed.server.image.is_none()
 }
 
-async fn create_sdk(args: ServerArgs) -> Result<SandboxSdk, Box<dyn std::error::Error>> {
+#[allow(clippy::too_many_lines)]
+async fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error::Error>> {
+    let platform = Platform::host_linux();
+    let images = ImageCache::new(&args.cache_dir);
+    let credentials = args
+        .registry_username
+        .zip(args.registry_password)
+        .map(|(username, password)| Credentials { username, password });
+    let box_store = BoxStore::new(&args.state_dir);
+    let base_disks = BaseDiskStore::new(&args.cache_dir);
+    let mke2fs_path = args.mke2fs.unwrap_or_else(default_mke2fs);
     let backend: Arc<dyn Backend> = match args.backend.as_str() {
         "process" => {
             if args.image.is_some() {
@@ -152,39 +194,64 @@ async fn create_sdk(args: ServerArgs) -> Result<SandboxSdk, Box<dyn std::error::
             let library = paths.libkrun.ok_or(
                 "libkrun backend requires --libkrun, MORAE_LIBKRUN_PATH, or a supported Homebrew libkrun",
             )?;
-            let root = if let Some(rootfs) = args.rootfs {
-                rootfs
+            let root_source = if let Some(rootfs) = args.rootfs {
+                BoxRootSource {
+                    manifest_digest: digest_tree(&rootfs)?.to_string(),
+                    rootfs_path: rootfs,
+                    platform: platform_name(&platform),
+                    virtual_size_bytes: args.disk_size,
+                    mke2fs_path: mke2fs_path.clone(),
+                }
             } else {
-                let cache = ImageCache::new(&args.cache_dir);
                 let reference = match args.image {
                     Some(reference) => reference,
-                    None => cache.default_reference()?,
+                    None => images.default_reference()?,
                 };
-                cache
-                    .resolve_or_pull(
-                        &reference,
-                        &Platform::host_linux(),
-                        args.registry_username
-                            .zip(args.registry_password)
-                            .map(|(username, password)| Credentials { username, password }),
-                    )
-                    .await?
-                    .rootfs
+                let prepared = images
+                    .resolve_or_pull(&reference, &platform, credentials.clone())
+                    .await?;
+                BoxRootSource {
+                    rootfs_path: prepared.rootfs,
+                    manifest_digest: prepared.manifest_digest,
+                    platform: platform_name(&platform),
+                    virtual_size_bytes: args.disk_size,
+                    mke2fs_path: mke2fs_path.clone(),
+                }
             };
-            let mut config = LibkrunConfig::new(helper, library, root);
+            let mut config = LibkrunConfig::new(helper, library, &root_source.rootfs_path);
             config.library_search_path = paths.library_search_path;
             config.gvproxy_path = paths.gvproxy;
             config.network_runtime_dir = args.cache_dir.join("network");
             config.vcpus = args.cpus;
             config.memory_mib = args.memory_mib;
-            Arc::new(LibkrunBackend::new(config))
+            let ephemeral_disks = EphemeralDiskStore::new(args.cache_dir.join("runtime"));
+            let _ = ephemeral_disks.garbage_collect()?;
+            Arc::new(
+                LibkrunBackend::new(config).with_box_runtime(BoxRuntimeConfig {
+                    boxes: box_store.clone(),
+                    base_disks: base_disks.clone(),
+                    ephemeral_disks,
+                    source: Some(root_source),
+                    e2fsck_path: args.e2fsck.unwrap_or_else(default_e2fsck),
+                }),
+            )
         }
         _ => return Err("unsupported backend".into()),
     };
-    Ok(SandboxSdk::new(backend))
+    Ok(McpServer {
+        sdk: SandboxSdk::new(backend).with_box_store(box_store),
+        boxes: BoxServices {
+            images,
+            base_disks,
+            platform,
+            credentials,
+            mke2fs_path,
+            default_disk_size: args.disk_size,
+        },
+    })
 }
 
-async fn serve(sdk: SandboxSdk) -> Result<(), Box<dyn std::error::Error>> {
+async fn serve(server: McpServer) -> Result<(), Box<dyn std::error::Error>> {
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut output = BufWriter::new(tokio::io::stdout());
     while let Some(line) = input.next_line().await? {
@@ -205,7 +272,7 @@ async fn serve(sdk: SandboxSdk) -> Result<(), Box<dyn std::error::Error>> {
         if request.get("id").is_none() {
             continue;
         }
-        let response = handle_request(&sdk, request).await;
+        let response = handle_request(&server, request).await;
         write_response(&mut output, &response).await?;
     }
     Ok(())
@@ -222,7 +289,7 @@ async fn write_response(
     Ok(())
 }
 
-async fn handle_request(sdk: &SandboxSdk, request: Value) -> Value {
+async fn handle_request(server: &McpServer, request: Value) -> Value {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     match method {
@@ -238,13 +305,18 @@ async fn handle_request(sdk: &SandboxSdk, request: Value) -> Value {
         "ping" => success(id, json!({})),
         "tools/list" => success(id, tools_list()),
         "tools/call" => {
-            call_tool(sdk, id, request.get("params").cloned().unwrap_or_default()).await
+            call_tool(
+                server,
+                id,
+                request.get("params").cloned().unwrap_or_default(),
+            )
+            .await
         }
         _ => protocol_error(id, -32601, "method not found"),
     }
 }
 
-async fn call_tool(sdk: &SandboxSdk, id: Value, params: Value) -> Value {
+async fn call_tool(server: &McpServer, id: Value, params: Value) -> Value {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return protocol_error(id, -32602, "tool name is required");
     };
@@ -253,9 +325,15 @@ async fn call_tool(sdk: &SandboxSdk, id: Value, params: Value) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
     let result = match name {
-        "sandbox_exec" => sandbox_exec(sdk, arguments).await,
-        "sandbox_io" => sandbox_io(sdk, arguments).await,
-        "sandbox_stop" => sandbox_stop(sdk, arguments).await,
+        "sandbox_exec" => sandbox_exec(&server.sdk, arguments).await,
+        "sandbox_io" => sandbox_io(&server.sdk, arguments).await,
+        "sandbox_stop" => sandbox_stop(&server.sdk, arguments).await,
+        "sandbox_box_create" => sandbox_box_create(server, arguments).await,
+        "sandbox_box_list" => sandbox_box_list(server, arguments).await,
+        "sandbox_box_get" => sandbox_box_get(server, arguments).await,
+        "sandbox_box_delete" => sandbox_box_delete(server, arguments).await,
+        "sandbox_box_reset" => sandbox_box_reset(server, arguments).await,
+        "sandbox_box_clone" => sandbox_box_clone(server, arguments).await,
         _ => return protocol_error(id, -32602, "unknown tool"),
     };
     match result {
@@ -270,6 +348,7 @@ async fn sandbox_exec(sdk: &SandboxSdk, arguments: Value) -> Result<Value, Strin
         return Err("argv must contain an executable".into());
     }
     let mut spec = RunSpec::command(args.argv);
+    spec.box_id = args.box_id;
     spec.tty = args.tty;
     spec.network = args.network;
     spec.timeout = match (args.unlimited, args.timeout_ms) {
@@ -324,6 +403,142 @@ async fn sandbox_stop(sdk: &SandboxSdk, arguments: Value) -> Result<Value, Strin
         .await
         .map_err(|error| error.to_string())?;
     Ok(json!({ "status": status }))
+}
+
+async fn sandbox_box_create(server: &McpServer, arguments: Value) -> Result<Value, String> {
+    let args: BoxCreateArgs =
+        serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+    let reference = args
+        .image
+        .map_or_else(|| server.boxes.images.default_reference(), Ok)
+        .map_err(|error| error.to_string())?;
+    let prepared = server
+        .boxes
+        .images
+        .resolve_or_pull(
+            &reference,
+            &server.boxes.platform,
+            server.boxes.credentials.clone(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let disk_size = args
+        .disk_size_bytes
+        .unwrap_or(server.boxes.default_disk_size);
+    if disk_size == 0 {
+        return Err("disk_size_bytes must be greater than zero".into());
+    }
+    let base_spec = BaseDiskSpec::new(
+        prepared.manifest_digest.clone(),
+        platform_name(&server.boxes.platform),
+        disk_size,
+    );
+    let base_disks = server.boxes.base_disks.clone();
+    let rootfs = prepared.rootfs;
+    let mke2fs = server.boxes.mke2fs_path.clone();
+    let base =
+        tokio::task::spawn_blocking(move || base_disks.prepare(&base_spec, &rootfs, &mke2fs))
+            .await
+            .map_err(|error| format!("base disk task failed: {error}"))?
+            .map_err(|error| error.to_string())?;
+    let metadata = server
+        .sdk
+        .create_box(
+            CreateBox::new(
+                prepared.manifest_digest,
+                platform_name(&server.boxes.platform),
+                disk_size,
+            ),
+            base.disk_path().to_path_buf(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(metadata).map_err(|error| error.to_string())
+}
+
+async fn sandbox_box_list(server: &McpServer, arguments: Value) -> Result<Value, String> {
+    let _: EmptyArgs = serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+    let boxes = server
+        .sdk
+        .list_boxes()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(json!({ "boxes": boxes }))
+}
+
+async fn sandbox_box_get(server: &McpServer, arguments: Value) -> Result<Value, String> {
+    let args: BoxIdArgs = serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+    let metadata = server
+        .sdk
+        .get_box(args.box_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(metadata).map_err(|error| error.to_string())
+}
+
+async fn sandbox_box_delete(server: &McpServer, arguments: Value) -> Result<Value, String> {
+    let args: ConfirmedBoxArgs =
+        serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+    require_confirmation(args.confirm)?;
+    let metadata = server
+        .sdk
+        .delete_box(args.box_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(json!({ "deleted": metadata.box_id }))
+}
+
+async fn sandbox_box_reset(server: &McpServer, arguments: Value) -> Result<Value, String> {
+    let args: ConfirmedBoxArgs =
+        serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+    require_confirmation(args.confirm)?;
+    let current = server
+        .sdk
+        .get_box(args.box_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let spec = BaseDiskSpec::new(
+        current.manifest_digest,
+        current.platform,
+        current.virtual_size_bytes,
+    );
+    let base_disks = server.boxes.base_disks.clone();
+    let base = tokio::task::spawn_blocking(move || base_disks.get(&spec))
+        .await
+        .map_err(|error| format!("base disk task failed: {error}"))?
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "the immutable base disk for Box {} is not cached; recreate the image-backed Box instead",
+                args.box_id
+            )
+        })?;
+    let metadata = server
+        .sdk
+        .reset_box(args.box_id, base.disk_path().to_path_buf())
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(metadata).map_err(|error| error.to_string())
+}
+
+async fn sandbox_box_clone(server: &McpServer, arguments: Value) -> Result<Value, String> {
+    let args: ConfirmedBoxArgs =
+        serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+    require_confirmation(args.confirm)?;
+    let metadata = server
+        .sdk
+        .clone_box(args.box_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(metadata).map_err(|error| error.to_string())
+}
+
+fn require_confirmation(confirmed: bool) -> Result<(), String> {
+    if confirmed {
+        Ok(())
+    } else {
+        Err("confirm must be true for this Box operation".into())
+    }
 }
 
 fn execution_json(result: &ExecutionResult) -> Value {
@@ -390,18 +605,20 @@ fn protocol_error(id: Value, code: i32, message: &str) -> Value {
     response
 }
 
+#[allow(clippy::too_many_lines)]
 fn tools_list() -> Value {
     json!({
         "tools": [
             {
                 "name": "sandbox_exec",
                 "title": "Execute in configured runtime",
-                "description": "Start a command in the configured runtime. With the libkrun backend, prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. Set wait=false to start a session. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
+                "description": "Start a command in the configured runtime. Every call receives a new SessionId and, with libkrun, a new microVM. Pass box_id only when the command should reuse that Box's persistent root filesystem. Prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. Set wait=false to start a session. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "argv": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
                         "stdin_base64": { "type": "string" },
+                        "box_id": { "type": "string", "format": "uuid", "description": "Persistent Box root filesystem to reuse; the microVM and SessionId remain new." },
                         "timeout_ms": { "type": "integer", "minimum": 1 },
                         "unlimited": { "type": "boolean", "default": false },
                         "network": { "type": "boolean", "default": false },
@@ -442,6 +659,84 @@ fn tools_list() -> Value {
                     "required": ["session_id"]
                 },
                 "annotations": { "destructiveHint": true, "idempotentHint": true, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_box_create",
+                "title": "Create persistent Box",
+                "description": "Create an independent persistent root filesystem from an OCI image. Image resolution may access the registry when the immutable base is not cached.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "image": { "type": "string", "description": "OCI image reference; uses the configured default when omitted." },
+                        "disk_size_bytes": { "type": "integer", "minimum": 1, "description": "Virtual root disk size; uses the server default when omitted." }
+                    },
+                    "additionalProperties": false
+                },
+                "annotations": { "destructiveHint": false, "idempotentHint": false, "openWorldHint": true }
+            },
+            {
+                "name": "sandbox_box_list",
+                "title": "List persistent Boxes",
+                "description": "List persistent Box metadata without starting a microVM.",
+                "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_box_get",
+                "title": "Get persistent Box",
+                "description": "Read metadata for one persistent Box.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "box_id": { "type": "string", "format": "uuid" } },
+                    "required": ["box_id"],
+                    "additionalProperties": false
+                },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_box_delete",
+                "title": "Delete persistent Box",
+                "description": "Permanently delete one idle Box and its full root filesystem. confirm must be true.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "box_id": { "type": "string", "format": "uuid" },
+                        "confirm": { "type": "boolean", "description": "Explicitly authorize permanent deletion." }
+                    },
+                    "required": ["box_id", "confirm"],
+                    "additionalProperties": false
+                },
+                "annotations": { "destructiveHint": true, "idempotentHint": false, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_box_reset",
+                "title": "Reset persistent Box",
+                "description": "Replace every change in one idle Box with its cached immutable base disk. confirm must be true.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "box_id": { "type": "string", "format": "uuid" },
+                        "confirm": { "type": "boolean", "description": "Explicitly authorize discarding all Box changes." }
+                    },
+                    "required": ["box_id", "confirm"],
+                    "additionalProperties": false
+                },
+                "annotations": { "destructiveHint": true, "idempotentHint": false, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_box_clone",
+                "title": "Clone persistent Box",
+                "description": "Create a new independent Box from the current disk of an idle Box. confirm must be true because this allocates durable state.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "box_id": { "type": "string", "format": "uuid" },
+                        "confirm": { "type": "boolean", "description": "Explicitly authorize creation of durable cloned state." }
+                    },
+                    "required": ["box_id", "confirm"],
+                    "additionalProperties": false
+                },
+                "annotations": { "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
             }
         ]
     })
@@ -453,6 +748,7 @@ fn tools_list() -> Value {
 struct ExecArgs {
     argv: Vec<String>,
     stdin_base64: Option<String>,
+    box_id: Option<BoxId>,
     timeout_ms: Option<u64>,
     unlimited: bool,
     network: bool,
@@ -465,6 +761,7 @@ impl Default for ExecArgs {
         Self {
             argv: Vec::new(),
             stdin_base64: None,
+            box_id: None,
             timeout_ms: None,
             unlimited: false,
             network: false,
@@ -507,6 +804,94 @@ struct StopArgs {
     session_id: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct EmptyArgs {}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct BoxCreateArgs {
+    image: Option<String>,
+    disk_size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoxIdArgs {
+    box_id: BoxId,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmedBoxArgs {
+    box_id: BoxId,
+    confirm: bool,
+}
+
+fn default_mke2fs() -> PathBuf {
+    for path in [
+        "/opt/homebrew/opt/e2fsprogs/sbin/mke2fs",
+        "/usr/local/opt/e2fsprogs/sbin/mke2fs",
+        "/usr/sbin/mke2fs",
+        "/sbin/mke2fs",
+    ] {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return path;
+        }
+    }
+    PathBuf::from("mke2fs")
+}
+
+fn default_e2fsck() -> PathBuf {
+    for path in [
+        "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck",
+        "/usr/local/opt/e2fsprogs/sbin/e2fsck",
+        "/usr/sbin/e2fsck",
+        "/sbin/e2fsck",
+    ] {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return path;
+        }
+    }
+    PathBuf::from("e2fsck")
+}
+
+fn platform_name(platform: &Platform) -> String {
+    match &platform.variant {
+        Some(variant) => format!("{}/{}/{}", platform.os, platform.architecture, variant),
+        None => format!("{}/{}", platform.os, platform.architecture),
+    }
+}
+
+fn parse_disk_size(input: &str) -> Result<u64, String> {
+    let input = input.trim();
+    let split = input
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(input.len());
+    let (number, suffix) = input.split_at(split);
+    let value = number
+        .parse::<u64>()
+        .map_err(|_| "disk size must start with a positive integer".to_owned())?;
+    if value == 0 {
+        return Err("disk size must be greater than zero".into());
+    }
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kib" => 1024,
+        "mib" => 1024 * 1024,
+        "gib" => 1024 * 1024 * 1024,
+        "kb" => 1000,
+        "mb" => 1000 * 1000,
+        "gb" => 1000 * 1000 * 1000,
+        _ => return Err("disk size suffix must be B, KiB, MiB, GiB, KB, MB, or GB".into()),
+    };
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| "disk size is too large".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,9 +899,9 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_list_and_call_work() {
-        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let server = test_server(SandboxSdk::new(Arc::new(ProcessBackend)));
         let initialized = handle_request(
-            &sdk,
+            &server,
             json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}),
         )
         .await;
@@ -535,11 +920,15 @@ mod tests {
             "Only the libkrun backend provides VM isolation",
             "process backend is for deterministic development and is not isolated",
             "Host workspace files are not attached automatically",
+            "new microVM and SessionId for every run",
         ] {
             assert!(instructions.contains(expected), "missing {expected:?}");
         }
-        let list =
-            handle_request(&sdk, json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).await;
+        let list = handle_request(
+            &server,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        )
+        .await;
         assert_eq!(
             list.pointer("/result/tools/0/name"),
             Some(&json!("sandbox_exec"))
@@ -552,7 +941,7 @@ mod tests {
             .pointer("/result/tools/0/description")
             .and_then(Value::as_str)
             .unwrap();
-        assert!(exec_description.contains("With the libkrun backend"));
+        assert!(exec_description.contains("with libkrun"));
         assert!(exec_description.contains("reproducible Linux checks"));
         assert!(exec_description.contains("Network access is disabled by default"));
         assert_eq!(
@@ -560,11 +949,15 @@ mod tests {
             Some(&json!(false))
         );
         assert_eq!(
+            list.pointer("/result/tools/0/inputSchema/properties/box_id/format"),
+            Some(&json!("uuid"))
+        );
+        assert_eq!(
             list.pointer("/result/tools/0/annotations/openWorldHint"),
             Some(&json!(true))
         );
         let call = handle_request(
-            &sdk,
+            &server,
             json!({
                 "jsonrpc":"2.0","id":3,"method":"tools/call",
                 "params":{"name":"sandbox_exec","arguments":{"argv":successful_command()}}
@@ -602,9 +995,9 @@ mod tests {
 
     #[tokio::test]
     async fn process_backend_rejects_vm_network_opt_in() {
-        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let server = test_server(SandboxSdk::new(Arc::new(ProcessBackend)));
         let call = handle_request(
-            &sdk,
+            &server,
             json!({
                 "jsonrpc":"2.0","id":1,"method":"tools/call",
                 "params":{
@@ -621,6 +1014,75 @@ mod tests {
                 .and_then(Value::as_str)
                 .is_some_and(|error| error.contains("without VM isolation"))
         );
+    }
+
+    #[tokio::test]
+    async fn process_backend_rejects_box_execution() {
+        let server = test_server(SandboxSdk::new(Arc::new(ProcessBackend)));
+        let call = handle_request(
+            &server,
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{
+                    "name":"sandbox_exec",
+                    "arguments":{"argv":successful_command(),"box_id":BoxId::new()}
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(call.pointer("/result/isError"), Some(&json!(true)));
+        assert!(
+            call.pointer("/result/structuredContent/error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("Box persistence"))
+        );
+    }
+
+    #[tokio::test]
+    async fn box_list_get_and_confirmed_delete_work() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source.ext4");
+        let file = std::fs::File::create(&source).unwrap();
+        file.set_len(1024 * 1024).unwrap();
+        let store = BoxStore::new(temporary.path().join("state"));
+        let metadata = store
+            .create(
+                &CreateBox::new("sha256:test", "linux/arm64", 1024 * 1024),
+                &source,
+            )
+            .unwrap();
+        let server = test_server(SandboxSdk::new(Arc::new(ProcessBackend)).with_box_store(store));
+
+        let list = call(&server, "sandbox_box_list", json!({})).await;
+        assert_eq!(
+            list.pointer("/result/structuredContent/boxes/0/box_id"),
+            Some(&json!(metadata.box_id))
+        );
+        let get = call(
+            &server,
+            "sandbox_box_get",
+            json!({"box_id": metadata.box_id}),
+        )
+        .await;
+        assert_eq!(
+            get.pointer("/result/structuredContent/box_id"),
+            Some(&json!(metadata.box_id))
+        );
+        let unconfirmed = call(
+            &server,
+            "sandbox_box_delete",
+            json!({"box_id": metadata.box_id, "confirm": false}),
+        )
+        .await;
+        assert_eq!(unconfirmed.pointer("/result/isError"), Some(&json!(true)));
+        let deleted = call(
+            &server,
+            "sandbox_box_delete",
+            json!({"box_id": metadata.box_id, "confirm": true}),
+        )
+        .await;
+        assert_eq!(deleted.pointer("/result/isError"), Some(&json!(false)));
     }
 
     #[test]
@@ -663,7 +1125,7 @@ mod tests {
 
         let runtime_stub = cache_dir.join("runtime-stub");
         std::fs::write(&runtime_stub, b"stub").unwrap();
-        let result = create_sdk(ServerArgs {
+        let result = create_server(ServerArgs {
             backend: "libkrun".into(),
             helper: Some(runtime_stub.clone()),
             libkrun: Some(runtime_stub),
@@ -671,15 +1133,46 @@ mod tests {
             rootfs: None,
             image: Some("python:3.12".into()),
             cache_dir: cache_dir.clone(),
+            state_dir: cache_dir.join("state"),
             registry_username: None,
             registry_password: None,
             lib_dir: None,
             cpus: 2,
             memory_mib: 512,
+            mke2fs: None,
+            e2fsck: None,
+            disk_size: 8 * 1024 * 1024 * 1024,
         })
         .await;
         assert!(result.is_ok(), "unexpected error: {:?}", result.err());
         std::fs::remove_dir_all(cache_dir).unwrap();
+    }
+
+    fn test_server(sdk: SandboxSdk) -> McpServer {
+        let root =
+            std::env::temp_dir().join(format!("moraebox-mcp-test-services-{}", std::process::id()));
+        McpServer {
+            sdk,
+            boxes: BoxServices {
+                images: ImageCache::new(&root),
+                base_disks: BaseDiskStore::new(&root),
+                platform: Platform::host_linux(),
+                credentials: None,
+                mke2fs_path: default_mke2fs(),
+                default_disk_size: 8 * 1024 * 1024 * 1024,
+            },
+        }
+    }
+
+    async fn call(server: &McpServer, name: &str, arguments: Value) -> Value {
+        handle_request(
+            server,
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":name,"arguments":arguments}
+            }),
+        )
+        .await
     }
 
     #[cfg(unix)]

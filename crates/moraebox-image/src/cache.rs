@@ -63,6 +63,8 @@ pub struct CacheUsage {
     pub references: usize,
     pub images: usize,
     pub rootfs_bytes: u64,
+    pub base_disks: usize,
+    pub base_disk_bytes: u64,
     pub oci_blobs: usize,
     pub oci_bytes: u64,
     pub workspaces: usize,
@@ -215,10 +217,33 @@ impl ImageCache {
         canonical_reference: &str,
         platform: &Platform,
     ) -> Result<Option<CachedImage>, ImageCacheError> {
-        Ok(self.list_unlocked()?.into_iter().find(|image| {
-            image.ready
-                && image.reference.as_deref() == Some(canonical_reference)
-                && image.platform.as_ref() == Some(platform)
+        let path = self.record_path_for(canonical_reference, platform);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let record: ImageRecord = serde_json::from_slice(&bytes)?;
+        validate_record(&record, &path)?;
+        if record.reference != canonical_reference || &record.platform != platform {
+            return Err(ImageCacheError::InvalidRecord(path));
+        }
+        let digest = parse_digest(&record.manifest_digest)?;
+        let rootfs = self.rootfs_path(&digest);
+        if !is_complete_rootfs(&rootfs) {
+            return Ok(None);
+        }
+        let default = self.default_reference_unlocked()?;
+        Ok(Some(CachedImage {
+            reference: Some(record.reference.clone()),
+            manifest_digest: record.manifest_digest,
+            platform: Some(record.platform),
+            rootfs,
+            ready: true,
+            default: record.reference == default,
+            // Size calculation recursively walks the rootfs and intentionally belongs only to
+            // management operations such as `list` and `usage`, never the run hot path.
+            size_bytes: 0,
         }))
     }
 
@@ -438,6 +463,7 @@ impl ImageCache {
             self.root.join("images"),
             self.root.join("oci"),
             self.root.join("rootfs"),
+            self.root.join("box-bases"),
             self.root.join("workspaces"),
             self.default_path(),
         ];
@@ -536,6 +562,7 @@ impl ImageCache {
         let roots = self.read_rootfs_entries()?;
         let images = roots.iter().filter(|entry| entry.ready).count();
         let rootfs_bytes = roots.iter().map(|entry| entry.size_bytes).sum();
+        let (base_disks, base_disk_bytes) = count_base_disks(&self.root.join("box-bases"))?;
         let (oci_blobs, oci_bytes) = count_regular_files(&self.blob_directory())?;
         let (workspaces, workspace_bytes) =
             count_regular_files(&self.root.join("workspaces/sha256"))?;
@@ -543,11 +570,13 @@ impl ImageCache {
             references,
             images,
             rootfs_bytes,
+            base_disks,
+            base_disk_bytes,
             oci_blobs,
             oci_bytes,
             workspaces,
             workspace_bytes,
-            total_bytes: rootfs_bytes + oci_bytes + workspace_bytes,
+            total_bytes: rootfs_bytes + base_disk_bytes + oci_bytes + workspace_bytes,
         })
     }
 
@@ -662,12 +691,16 @@ impl ImageCache {
     }
 
     fn record_path(&self, record: &ImageRecord) -> PathBuf {
+        self.record_path_for(&record.reference, &record.platform)
+    }
+
+    fn record_path_for(&self, reference: &str, platform: &Platform) -> PathBuf {
         let key = format!(
             "{}\0{}\0{}\0{}",
-            record.reference,
-            record.platform.os,
-            record.platform.architecture,
-            record.platform.variant.as_deref().unwrap_or_default()
+            reference,
+            platform.os,
+            platform.architecture,
+            platform.variant.as_deref().unwrap_or_default()
         );
         self.record_directory()
             .join(format!("{}.json", Digest::from_bytes(key.as_bytes()).hex()))
@@ -846,6 +879,23 @@ fn count_regular_files(path: &Path) -> Result<(usize, u64), ImageCacheError> {
         if entry.file_type()?.is_file() {
             count += 1;
             bytes += entry.metadata()?.len();
+        }
+    }
+    Ok((count, bytes))
+}
+
+fn count_base_disks(path: &Path) -> Result<(usize, u64), ImageCacheError> {
+    let mut count = 0;
+    let mut bytes = 0_u64;
+    for entry in read_entries(path)? {
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            let (child_count, child_bytes) = count_base_disks(&entry.path())?;
+            count += child_count;
+            bytes = bytes.saturating_add(child_bytes);
+        } else if metadata.is_file() && entry.file_name() == "root.ext4" {
+            count += 1;
+            bytes = bytes.saturating_add(metadata.len());
         }
     }
     Ok((count, bytes))
@@ -1035,6 +1085,24 @@ mod tests {
     }
 
     #[test]
+    fn resolving_a_reference_does_not_enumerate_unrelated_records() {
+        let fixture = Fixture::new();
+        fixture.add_image(Some("python:3.12"));
+        let unrelated = fixture.cache.record_directory().join("unrelated.json");
+        fs::write(&unrelated, b"not json").unwrap();
+
+        let resolved = fixture
+            .cache
+            .resolve_reference("python:3.12", &Fixture::platform())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.reference.as_deref(), Some(BUILTIN_DEFAULT_IMAGE));
+        assert_eq!(resolved.size_bytes, 0);
+        assert!(fixture.cache.list().is_err());
+    }
+
+    #[test]
     fn removing_one_alias_preserves_a_shared_rootfs() {
         let fixture = Fixture::new();
         let digest = fixture.add_image(Some("python:3.12"));
@@ -1110,13 +1178,25 @@ mod tests {
         let workspace = fixture.cache.root.join("workspaces/sha256/workspace.ext4");
         fs::create_dir_all(workspace.parent().unwrap()).unwrap();
         fs::write(&workspace, b"workspace").unwrap();
+        let base_disk = fixture
+            .cache
+            .root
+            .join("box-bases/v1/sha256/base/root.ext4");
+        fs::create_dir_all(base_disk.parent().unwrap()).unwrap();
+        fs::write(&base_disk, b"base").unwrap();
+
+        let usage = fixture.cache.usage().unwrap();
+        assert_eq!(usage.base_disks, 1);
+        assert_eq!(usage.base_disk_bytes, 4);
 
         let preview = fixture.cache.clean(false).unwrap();
         assert!(!preview.applied);
         assert!(workspace.is_file());
+        assert!(base_disk.is_file());
         let applied = fixture.cache.clean(true).unwrap();
         assert!(applied.applied);
         assert!(!workspace.exists());
+        assert!(!base_disk.exists());
         assert_eq!(
             fixture.cache.default_reference().unwrap(),
             BUILTIN_DEFAULT_IMAGE

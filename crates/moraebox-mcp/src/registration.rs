@@ -59,6 +59,9 @@ pub struct InstallArgs {
     /// Image and rootfs cache used by the registered server.
     #[arg(long, default_value = ".moraebox/cache")]
     cache_dir: PathBuf,
+    /// Persistent Box metadata root.
+    #[arg(long, default_value = ".moraebox/state")]
+    state_dir: PathBuf,
     /// Override the automatically discovered signed VMM helper.
     #[arg(long, env = "MORAE_HELPER_PATH")]
     helper: Option<PathBuf>,
@@ -71,6 +74,15 @@ pub struct InstallArgs {
     /// Override the automatically discovered libkrun dependency directories.
     #[arg(long, env = "MORAE_LIB_DIR")]
     lib_dir: Option<PathBuf>,
+    /// Override the mke2fs utility used to prepare Box root disks.
+    #[arg(long, env = "MORAE_MKE2FS")]
+    mke2fs: Option<PathBuf>,
+    /// Override the e2fsck utility used to recover dirty Boxes.
+    #[arg(long, env = "MORAE_E2FSCK")]
+    e2fsck: Option<PathBuf>,
+    /// Virtual root disk size for ephemeral runs and new Boxes.
+    #[arg(long, default_value = "8GiB", value_parser = super::parse_disk_size)]
+    disk_size: u64,
     #[arg(long, default_value_t = 2)]
     cpus: u8,
     #[arg(long, default_value_t = 512)]
@@ -186,24 +198,20 @@ fn build_command_plan(
 }
 
 fn server_configuration(install: &InstallArgs) -> Result<ServerConfiguration, String> {
+    let cache_dir = absolute_path(&install.cache_dir)?;
+    let state_dir = absolute_path(&install.state_dir)?;
     if install.backend == RegistrationBackend::Process {
         if install.image.is_some() {
             return Err("--image requires --backend libkrun".into());
         }
         return Ok((
             Vec::new(),
-            vec![
-                "--backend".into(),
-                RegistrationBackend::Process.as_str().into(),
-            ],
+            common_server_args(install, cache_dir, state_dir),
         ));
     }
 
     let mut environment = Vec::new();
-    let mut server_args = vec![
-        "--backend".into(),
-        RegistrationBackend::Libkrun.as_str().into(),
-    ];
+    let mut server_args = common_server_args(install, cache_dir, state_dir);
     if let Some(rootfs) = &install.rootfs {
         environment.push(("MORAE_ROOTFS", rootfs.as_os_str().to_owned()));
     } else {
@@ -213,31 +221,42 @@ fn server_configuration(install: &InstallArgs) -> Result<ServerConfiguration, St
                 .default_reference()
                 .map_err(|error| error.to_string())?,
         };
-        let cache_dir = absolute_path(&install.cache_dir)?;
-        server_args.extend([
-            "--image".into(),
-            reference.into(),
-            "--cache-dir".into(),
-            cache_dir.into_os_string(),
-        ]);
+        server_args.extend(["--image".into(), reference.into()]);
     }
     for (name, path) in [
         ("MORAE_HELPER_PATH", install.helper.as_ref()),
         ("MORAE_LIBKRUN_PATH", install.libkrun.as_ref()),
         ("MORAE_GVPROXY_PATH", install.gvproxy.as_ref()),
         ("MORAE_LIB_DIR", install.lib_dir.as_ref()),
+        ("MORAE_MKE2FS", install.mke2fs.as_ref()),
+        ("MORAE_E2FSCK", install.e2fsck.as_ref()),
     ] {
         if let Some(path) = path {
             environment.push((name, path.as_os_str().to_owned()));
         }
     }
-    server_args.extend([
+    Ok((environment, server_args))
+}
+
+fn common_server_args(
+    install: &InstallArgs,
+    cache_dir: PathBuf,
+    state_dir: PathBuf,
+) -> Vec<OsString> {
+    vec![
+        "--backend".into(),
+        install.backend.as_str().into(),
+        "--cache-dir".into(),
+        cache_dir.into_os_string(),
+        "--state-dir".into(),
+        state_dir.into_os_string(),
+        "--disk-size".into(),
+        install.disk_size.to_string().into(),
         "--cpus".into(),
         install.cpus.to_string().into(),
         "--memory-mib".into(),
         install.memory_mib.to_string().into(),
-    ]);
-    Ok((environment, server_args))
+    ]
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, String> {
@@ -319,10 +338,14 @@ mod tests {
             rootfs: Some("/rootfs".into()),
             image: None,
             cache_dir: ".moraebox/cache".into(),
+            state_dir: ".moraebox/state".into(),
             helper: None,
             libkrun: None,
             gvproxy: None,
             lib_dir: None,
+            mke2fs: None,
+            e2fsck: None,
+            disk_size: 8 * 1024 * 1024 * 1024,
             cpus: 2,
             memory_mib: 512,
             server_command: None,
@@ -339,6 +362,8 @@ mod tests {
 
     #[test]
     fn builds_codex_user_registration() {
+        let cache = env::current_dir().unwrap().join(".moraebox/cache");
+        let state = env::current_dir().unwrap().join(".moraebox/state");
         let plan =
             build_command_plan(&install_args(Agent::Codex), "/bin/morae-mcp".into()).unwrap();
         assert_eq!(plan.program, "codex");
@@ -354,6 +379,12 @@ mod tests {
                 "/bin/morae-mcp",
                 "--backend",
                 "libkrun",
+                "--cache-dir",
+                cache.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+                "--disk-size",
+                "8589934592",
                 "--cpus",
                 "2",
                 "--memory-mib",
@@ -364,6 +395,8 @@ mod tests {
 
     #[test]
     fn builds_claude_user_registration() {
+        let cache = env::current_dir().unwrap().join(".moraebox/cache");
+        let state = env::current_dir().unwrap().join(".moraebox/state");
         let plan =
             build_command_plan(&install_args(Agent::ClaudeCode), "/bin/morae-mcp".into()).unwrap();
         assert_eq!(plan.program, "claude");
@@ -383,6 +416,12 @@ mod tests {
                 "/bin/morae-mcp",
                 "--backend",
                 "libkrun",
+                "--cache-dir",
+                cache.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+                "--disk-size",
+                "8589934592",
                 "--cpus",
                 "2",
                 "--memory-mib",
@@ -397,12 +436,16 @@ mod tests {
         install.backend = RegistrationBackend::Process;
         let (environment, server_args) = server_configuration(&install).unwrap();
         assert!(environment.is_empty());
-        assert_eq!(server_args, ["--backend", "process"]);
+        let rendered = string_args_from(&server_args);
+        assert_eq!(rendered[0..2], ["--backend", "process"]);
+        assert!(rendered.contains(&"--cache-dir".into()));
+        assert!(rendered.contains(&"--state-dir".into()));
     }
 
     #[test]
     fn libkrun_registration_uses_python_default_without_a_rootfs() {
         let cache = TestCache::new("default");
+        let state = env::current_dir().unwrap().join(".moraebox/state");
         let mut install = install_args(Agent::Codex);
         install.rootfs = None;
         install.cache_dir = cache.path.clone();
@@ -413,14 +456,18 @@ mod tests {
             [
                 "--backend",
                 "libkrun",
-                "--image",
-                "docker.io/library/python:3.12",
                 "--cache-dir",
                 cache.path.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+                "--disk-size",
+                "8589934592",
                 "--cpus",
                 "2",
                 "--memory-mib",
                 "512",
+                "--image",
+                "docker.io/library/python:3.12",
             ]
         );
     }
@@ -434,8 +481,12 @@ mod tests {
         install.cache_dir = cache.path.clone();
         let (environment, server_args) = server_configuration(&install).unwrap();
         assert!(environment.is_empty());
-        assert_eq!(server_args[2], "--image");
-        assert_eq!(server_args[3], "debian:bookworm");
+        let rendered = string_args_from(&server_args);
+        let image = rendered
+            .iter()
+            .position(|value| value == "--image")
+            .unwrap();
+        assert_eq!(rendered[image + 1], "debian:bookworm");
     }
 
     #[test]

@@ -14,12 +14,16 @@ path = "src/main.rs"
 base64.workspace = true
 clap = { workspace = true, features = ["env"] }
 moraebox-core = { path = "../moraebox-core" }
+moraebox-box = { path = "../moraebox-box" }
 moraebox-image = { path = "../moraebox-image" }
 moraebox-runtime = { path = "../moraebox-runtime" }
 moraebox-sdk = { path = "../moraebox-sdk" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

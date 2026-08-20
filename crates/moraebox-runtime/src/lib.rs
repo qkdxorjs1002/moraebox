@@ -12,10 +12,11 @@ mod supervisor;
 mod trace;
 
 pub use backend::{
-    Backend, BackendController, BackendError, BoxedReader, BoxedWriter, SpawnedSandbox,
+    Backend, BackendController, BackendError, BoxedReader, BoxedWriter, RootMode, SpawnedSandbox,
+    StartupMetrics,
 };
 pub use doctor::{DoctorReport, LibraryProbe, NativeRuntimePaths, ToolProbe};
-pub use libkrun::{LibkrunBackend, LibkrunConfig};
+pub use libkrun::{BoxRootSource, BoxRuntimeConfig, LibkrunBackend, LibkrunConfig};
 pub use pool::{PoolConfig, PoolError, PoolStats, PreparedKey, PreparedLease, PreparedPool};
 pub use process::ProcessBackend;
 pub use session::{SessionError, SessionHandle, SessionManager, SessionStatus};

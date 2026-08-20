@@ -10,6 +10,8 @@ fn run_mcp(args: &[&str]) -> Output {
         "MORAE_HELPER_PATH",
         "MORAE_LIBKRUN_PATH",
         "MORAE_LIB_DIR",
+        "MORAE_MKE2FS",
+        "MORAE_E2FSCK",
         "MORAE_REGISTRY_USERNAME",
         "MORAE_REGISTRY_PASSWORD",
     ] {
@@ -39,6 +41,8 @@ fn dry_run(agent: &str) -> Value {
 
 #[test]
 fn codex_dry_run_uses_official_stdio_cli_shape() {
+    let cache = std::env::current_dir().unwrap().join(".moraebox/cache");
+    let state = std::env::current_dir().unwrap().join(".moraebox/state");
     assert_eq!(
         dry_run("codex"),
         json!({
@@ -48,6 +52,9 @@ fn codex_dry_run_uses_official_stdio_cli_shape() {
                 "--env", "MORAE_ROOTFS=fixture-rootfs",
                 "--", "morae-mcp",
                 "--backend", "libkrun",
+                "--cache-dir", cache.to_str().unwrap(),
+                "--state-dir", state.to_str().unwrap(),
+                "--disk-size", "8589934592",
                 "--cpus", "2",
                 "--memory-mib", "512"
             ]
@@ -57,6 +64,8 @@ fn codex_dry_run_uses_official_stdio_cli_shape() {
 
 #[test]
 fn claude_dry_run_is_user_scoped_and_uses_stdio() {
+    let cache = std::env::current_dir().unwrap().join(".moraebox/cache");
+    let state = std::env::current_dir().unwrap().join(".moraebox/state");
     assert_eq!(
         dry_run("claude-code"),
         json!({
@@ -69,6 +78,9 @@ fn claude_dry_run_is_user_scoped_and_uses_stdio() {
                 "moraebox",
                 "--", "morae-mcp",
                 "--backend", "libkrun",
+                "--cache-dir", cache.to_str().unwrap(),
+                "--state-dir", state.to_str().unwrap(),
+                "--disk-size", "8589934592",
                 "--cpus", "2",
                 "--memory-mib", "512"
             ]
@@ -78,6 +90,8 @@ fn claude_dry_run_is_user_scoped_and_uses_stdio() {
 
 #[test]
 fn process_dry_run_warns_and_never_claims_isolation() {
+    let cache = std::env::current_dir().unwrap().join(".moraebox/cache");
+    let state = std::env::current_dir().unwrap().join(".moraebox/state");
     let output = run_mcp(&[
         "install",
         "codex",
@@ -96,7 +110,12 @@ fn process_dry_run_warns_and_never_claims_isolation() {
             "program": "codex",
             "args": [
                 "mcp", "add", "moraebox",
-                "--", "morae-mcp", "--backend", "process"
+                "--", "morae-mcp", "--backend", "process",
+                "--cache-dir", cache.to_str().unwrap(),
+                "--state-dir", state.to_str().unwrap(),
+                "--disk-size", "8589934592",
+                "--cpus", "2",
+                "--memory-mib", "512"
             ]
         })
     );

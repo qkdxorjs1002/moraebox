@@ -732,11 +732,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "moraebox-box"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "moraebox-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "moraebox-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
  "humantime",
+ "moraebox-box",
  "moraebox-core",
  "moraebox-image",
  "moraebox-runtime",
@@ -780,12 +794,14 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "clap",
+ "moraebox-box",
  "moraebox-core",
  "moraebox-image",
  "moraebox-runtime",
  "moraebox-sdk",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -802,6 +818,7 @@ name = "moraebox-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "moraebox-box",
  "moraebox-core",
  "nix",
  "serde",
@@ -815,9 +832,11 @@ dependencies = [
 name = "moraebox-sdk"
 version = "0.1.0"
 dependencies = [
+ "moraebox-box",
  "moraebox-core",
  "moraebox-runtime",
  "serde",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

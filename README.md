@@ -118,6 +118,23 @@ Registry manifests and blobs are digest-verified before layers are materialized.
 
 `--rootfs /path/to/rootfs` is an advanced alternative for an already materialized guest root directory. It bypasses image resolution and is mutually exclusive with `--image`.
 
+### Continue work with a persistent Box
+
+A normal run gets a new `SessionId`, a new microVM, and an ephemeral copy-on-write root disk that is deleted after cleanup. Create a Box only when later runs should keep filesystem changes:
+
+```sh
+BOX_ID=$(morae box create --image alpine:latest --json | jq -r .box_id)
+
+morae run --box "$BOX_ID" -- /bin/sh -c 'echo retained > /root/result'
+morae run --box "$BOX_ID" -- cat /root/result
+
+morae box clone "$BOX_ID" --yes
+morae box reset "$BOX_ID" --yes
+morae box delete "$BOX_ID" --yes
+```
+
+`BoxId` identifies a persistent root filesystem lineage, not a VM or an authentication credential. Every `morae run --box` still creates a new microVM and `SessionId`; only files on that Box disk continue. Different Boxes have independent disks, and a second writer for the same Box fails immediately. `--box` cannot be combined with `--image`, `--rootfs`, or `--workspace`, and the non-isolating `process` backend rejects it.
+
 ### Attach a read-only workspace
 
 ```sh
@@ -143,6 +160,13 @@ morae image pull python:3.12
 morae image list
 morae image remove python:3.12
 
+morae box create --image python:3.12
+morae box list
+morae box show BOX_ID
+morae box clone BOX_ID --yes
+morae box reset BOX_ID --yes
+morae box delete BOX_ID --yes
+
 morae cache info
 morae cache prune --dry-run
 morae cache prune --yes
@@ -150,7 +174,7 @@ morae cache clean --all --dry-run
 morae cache clean --all --yes
 ```
 
-Destructive cache operations require either `--dry-run` or `--yes`. Image and cache commands support `--json` where structured output is useful.
+Destructive cache operations require either `--dry-run` or `--yes`; durable Box mutations require `--yes`. `morae cache clean` removes rebuildable image, immutable base-disk, and ephemeral data, but never persistent Box disks under `.moraebox/state`. Image, Box, and cache commands support `--json` where structured output is useful.
 
 ### Exercise the lifecycle without isolation
 
@@ -160,6 +184,15 @@ morae benchmark --backend process --iterations 100 -- /usr/bin/true
 ```
 
 The `process` backend is useful for deterministic tests, CI, and integration development. It is not a sandbox and must not be presented as one.
+
+For native cached-start qualification, use a command that writes immediately so the report can measure the first guest output as a conservative command-start signal:
+
+```sh
+morae benchmark --backend libkrun --image alpine:latest \
+  --iterations 100 -- /bin/echo ready
+```
+
+The JSON report separates immutable-base lookup, Box lock, CoW clone, root preparation, helper spawn, first guest output, and full completion percentiles.
 
 ## Connect a coding agent
 
@@ -178,15 +211,19 @@ Preview the exact command and argv without changing agent configuration:
 morae-mcp install codex --dry-run
 ```
 
-The installer uses the agent's official CLI and does not edit configuration files directly. Use `--image`, `--cache-dir`, `--cpus`, `--memory-mib`, or `--gvproxy` to customize the registration. For lifecycle testing without isolation, opt in with `--backend process`.
+The installer uses the agent's official CLI and does not edit configuration files directly. Use `--image`, `--cache-dir`, `--state-dir`, `--disk-size`, `--cpus`, `--memory-mib`, or `--gvproxy` to customize the registration. For lifecycle testing without isolation, opt in with `--backend process`.
 
-The server exposes three tools:
+The server exposes execution tools plus persistent Box management:
 
 | Tool | Purpose |
 | --- | --- |
-| `sandbox_exec` | Run one command or start an asynchronous session; network access defaults to off |
+| `sandbox_exec` | Run one command or start an asynchronous session; optional `box_id` reuses persistent files |
 | `sandbox_io` | Read bounded output, write or close stdin, resize, or send a signal |
 | `sandbox_stop` | Stop a session and wait for cleanup |
+| `sandbox_box_create` | Create a persistent Box from an OCI image |
+| `sandbox_box_list` / `sandbox_box_get` | Inspect persistent Box metadata |
+| `sandbox_box_delete` / `sandbox_box_reset` | Permanently mutate an idle Box with explicit confirmation |
+| `sandbox_box_clone` | Create a new independent durable Box with explicit confirmation |
 
 Commands remain argv arrays in the MCP schema. Output chunks are exposed as UTF-8 text so agents can read them directly; invalid UTF-8 bytes are replaced with `U+FFFD`. Stdin bytes remain base64-encoded.
 
@@ -197,6 +234,10 @@ CLI / Rust SDK / MCP server
              │
       runtime supervisor
    lifecycle · deadline · I/O
+             │
+ image rootfs → immutable base ext4
+       ├─ no BoxId: per-run CoW disk → delete
+       └─ BoxId: persistent disk → retain
              │
     one VMM helper process
        released libkrun ABI
@@ -223,6 +264,7 @@ prepare → start → ready → running → stop → dead
 | Crate | Responsibility |
 | --- | --- |
 | `moraebox-core` | Run specification, lifecycle states, signals, and bounded output |
+| `moraebox-box` | Persistent Box metadata, leases, immutable base disks, and ephemeral CoW disks |
 | `moraebox-image` | OCI registry access, digest verification, cache, and workspace snapshots |
 | `moraebox-runtime` | Backends, supervision, sessions, diagnostics, and traces |
 | `moraebox-sdk` | Async embedding API |
@@ -247,6 +289,8 @@ Security-relevant defaults include:
 - a one-hour default deadline with TERM-to-KILL escalation;
 - single-use prepared units and cleanup after parent loss.
 
+Persistent Boxes are an explicit exception to filesystem disposal, not to VM disposal. They can retain untrusted guest changes across runs, so reuse a Box only for related work and delete or reset it before crossing a trust boundary. Exclusive leases prevent concurrent writers to one Box.
+
 moraebox does **not** claim to protect against a hostile host user, a compromised hypervisor or VMM, or hostile multi-tenant operation. The process backend does not provide isolation.
 
 ## Platform support and current limits
@@ -258,6 +302,7 @@ moraebox does **not** claim to protect against a hostile host user, a compromise
 | libkrun stack | Validated with released libkrun 1.19.4 and libkrunfw 5.5.0 |
 | Image sources | Remote OCI registries; local OCI layouts and Docker archives are not imported yet |
 | VM reuse | Materialized artifacts may be cached; booted untrusted VMs are never reused |
+| Box persistence | Opt-in full root filesystem persistence; each run still uses a fresh microVM |
 | Workspaces | Read-only snapshots; writable overlays and copy-out/diff are future work |
 | Interactive I/O | PTY supported; live resize is future work |
 
@@ -278,7 +323,7 @@ codesign --force --sign - \
   target/release/morae-vmm-helper
 ```
 
-Native execution additionally needs compatible released libkrun/libkrunfw builds, Hypervisor.framework, `gvproxy` for opt-in networking, and `mke2fs` from `e2fsprogs` when a workspace is attached. `morae doctor --json` reports base native readiness and network readiness separately.
+Native execution additionally needs compatible released libkrun/libkrunfw builds, Hypervisor.framework, `mke2fs` and `e2fsck` from `e2fsprogs`, and `gvproxy` for opt-in networking. `morae doctor --json` reports base native readiness and network readiness separately.
 
 ## Development
 

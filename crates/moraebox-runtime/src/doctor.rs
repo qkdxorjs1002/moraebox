@@ -14,6 +14,7 @@ const REQUIRED_LIBKRUN_SYMBOLS: &[&str] = &[
     "krun_set_exec",
     "krun_set_workdir",
     "krun_add_disk",
+    "krun_set_root_disk_remount",
     "krun_add_vsock",
     "krun_add_virtio_console_default",
     "krun_start_enter",
@@ -33,6 +34,18 @@ const GVPROXY_CANDIDATES: &[&str] = &[
     "/usr/local/bin/gvproxy",
     "/usr/bin/gvproxy",
 ];
+const MKE2FS_CANDIDATES: &[&str] = &[
+    "/opt/homebrew/opt/e2fsprogs/sbin/mke2fs",
+    "/usr/local/opt/e2fsprogs/sbin/mke2fs",
+    "/usr/local/sbin/mke2fs",
+    "/usr/sbin/mke2fs",
+];
+const E2FSCK_CANDIDATES: &[&str] = &[
+    "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck",
+    "/usr/local/opt/e2fsprogs/sbin/e2fsck",
+    "/usr/local/sbin/e2fsck",
+    "/usr/sbin/e2fsck",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -50,6 +63,9 @@ pub struct DoctorReport {
     pub libkrunfw: LibraryProbe,
     pub krunvm: ToolProbe,
     pub gvproxy: ToolProbe,
+    pub mke2fs: ToolProbe,
+    pub e2fsck: ToolProbe,
+    pub cow_clone_supported: Option<bool>,
     pub libkrun_network_api: Option<bool>,
     pub native_backend_ready: bool,
     pub native_network_ready: bool,
@@ -150,6 +166,9 @@ impl DoctorReport {
                 .or_else(|| find_in_path("gvproxy"))
                 .or_else(|| find_candidate(GVPROXY_CANDIDATES)),
         );
+        let mke2fs = probe_tool_with_candidates("mke2fs", MKE2FS_CANDIDATES);
+        let e2fsck = probe_tool_with_candidates("e2fsck", E2FSCK_CANDIDATES);
+        let cow_clone_supported = probe_cow_clone();
         let libkrun_network_api = libkrun
             .path
             .as_deref()
@@ -159,7 +178,10 @@ impl DoctorReport {
             && hypervisor_entitlement
             && libkrun.found
             && libkrun.required_symbols_present == Some(true)
-            && libkrunfw.found;
+            && libkrunfw.found
+            && mke2fs.found
+            && e2fsck.found
+            && cow_clone_supported == Some(true);
         let native_network_ready =
             native_backend_ready && gvproxy.found && libkrun_network_api == Some(true);
         let mut warnings = Vec::new();
@@ -187,6 +209,17 @@ impl DoctorReport {
                     .into(),
             );
         }
+        if !mke2fs.found || !e2fsck.found {
+            warnings.push(
+                "e2fsprogs mke2fs/e2fsck are required to prepare and recover Box root disks".into(),
+            );
+        }
+        if cow_clone_supported == Some(false) {
+            warnings.push(
+                "the runtime volume does not support strict copy-on-write cloning; ephemeral native runs are unavailable"
+                    .into(),
+            );
+        }
         Self {
             expected_libkrun_version: "1.19.4".into(),
             expected_libkrunfw_version: "5.5.0".into(),
@@ -201,6 +234,9 @@ impl DoctorReport {
             libkrunfw,
             krunvm,
             gvproxy,
+            mke2fs,
+            e2fsck,
+            cow_clone_supported,
             libkrun_network_api,
             native_backend_ready,
             native_network_ready,
@@ -263,6 +299,15 @@ fn probe_tool(name: &str) -> ToolProbe {
     probe_tool_path(find_in_path(name))
 }
 
+fn probe_tool_with_candidates(name: &str, candidates: &[&str]) -> ToolProbe {
+    probe_tool_path(find_in_path(name).or_else(|| {
+        candidates
+            .iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+    }))
+}
+
 fn probe_tool_path(path: Option<PathBuf>) -> ToolProbe {
     let version = path
         .as_ref()
@@ -297,6 +342,36 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
     } else {
         Some(stdout)
     }
+}
+
+fn probe_cow_clone() -> Option<bool> {
+    let directory = tempfile::tempdir().ok()?;
+    let source = directory.path().join("source");
+    let destination = directory.path().join("destination");
+    let file = std::fs::File::create(&source).ok()?;
+    file.set_len(1024 * 1024).ok()?;
+    drop(file);
+
+    #[cfg(target_os = "macos")]
+    let output = Command::new("/bin/cp")
+        .arg("-c")
+        .arg(&source)
+        .arg(&destination)
+        .output()
+        .ok()?;
+
+    #[cfg(target_os = "linux")]
+    let output = Command::new("cp")
+        .args(["--reflink=always", "--sparse=always", "--"])
+        .arg(&source)
+        .arg(&destination)
+        .output()
+        .ok()?;
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return None;
+
+    Some(output.status.success())
 }
 
 fn find_helper() -> Option<PathBuf> {

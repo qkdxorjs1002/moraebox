@@ -21,6 +21,11 @@ impl Backend for ProcessBackend {
 
     async fn spawn(&self, spec: &RunSpec) -> Result<SpawnedSandbox, BackendError> {
         spec.validate().map_err(BackendError::InvalidSpec)?;
+        if spec.box_id.is_some() {
+            return Err(BackendError::Unsupported(
+                "Box persistence on the process backend; it does not provide VM isolation",
+            ));
+        }
         if spec.tty {
             return Err(BackendError::Unsupported(
                 "PTY on the deterministic process backend",
@@ -70,6 +75,7 @@ impl Backend for ProcessBackend {
             stderr,
             exit,
             controller,
+            startup: crate::StartupMetrics::default(),
         })
     }
 }
@@ -201,6 +207,17 @@ mod tests {
         assert!(matches!(
             ProcessBackend.spawn(&spec).await,
             Err(BackendError::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_box_persistence() {
+        let mut spec = RunSpec::command(["true"]);
+        spec.box_id = Some(moraebox_core::BoxId::new());
+
+        assert!(matches!(
+            ProcessBackend.spawn(&spec).await,
+            Err(BackendError::Unsupported(message)) if message.contains("Box persistence")
         ));
     }
 }

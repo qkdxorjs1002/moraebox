@@ -25,6 +25,8 @@ type DisableImplicitVsock = unsafe extern "C" fn(u32) -> i32;
 type AddVsock = unsafe extern "C" fn(u32, u32) -> i32;
 type AddNetUnixgram = unsafe extern "C" fn(u32, *const c_char, i32, *mut u8, u32, u32) -> i32;
 type AddDisk = unsafe extern "C" fn(u32, *const c_char, *const c_char, bool) -> i32;
+type SetRootDiskRemount =
+    unsafe extern "C" fn(u32, *const c_char, *const c_char, *const c_char) -> i32;
 type DisableImplicitConsole = unsafe extern "C" fn(u32) -> i32;
 type AddVirtioConsoleDefault = unsafe extern "C" fn(u32, i32, i32, i32) -> i32;
 type StartEnter = unsafe extern "C" fn(u32) -> i32;
@@ -44,7 +46,11 @@ struct Args {
     #[arg(long)]
     libkrun: PathBuf,
     #[arg(long)]
-    root: PathBuf,
+    #[arg(required_unless_present = "root_disk", conflicts_with = "root_disk")]
+    root: Option<PathBuf>,
+    /// Writable raw ext4 block device to pivot to as the guest root filesystem.
+    #[arg(long, required_unless_present = "root", conflicts_with = "root")]
+    root_disk: Option<PathBuf>,
     #[arg(long, default_value_t = 2)]
     cpus: u8,
     #[arg(long, default_value_t = 512)]
@@ -96,7 +102,15 @@ fn run(args: Args) -> Result<i32, HelperError> {
         // context is live for the duration of this call.
         (api.set_vm_config)(context.id, args.cpus, args.memory_mib)
     })?;
-    api.configure_root(context.id, &args.root)?;
+    if let Some(root_disk) = args.root_disk.as_deref() {
+        api.configure_root_disk(context.id, root_disk)?;
+    } else if let Some(root) = args.root.as_deref() {
+        api.configure_root(context.id, root)?;
+    } else {
+        return Err(HelperError::Invalid(
+            "exactly one of --root or --root-disk is required",
+        ));
+    }
     api.configure_networking(context.id, args.network_socket.as_deref())?;
     api.configure_console(context.id)?;
     if let Some(workspace) = args.workspace_disk.as_deref() {
@@ -112,7 +126,7 @@ fn run(args: Args) -> Result<i32, HelperError> {
     }
 
     let effective_command = if args.workspace_disk.is_some() {
-        workspace_command(&args.command)
+        workspace_command(&args.command, args.root_disk.is_some())
     } else {
         args.command
     };
@@ -165,6 +179,7 @@ struct KrunApi {
     add_vsock: AddVsock,
     add_net_unixgram: Option<AddNetUnixgram>,
     add_disk: Option<AddDisk>,
+    set_root_disk_remount: Option<SetRootDiskRemount>,
     disable_implicit_console: Option<DisableImplicitConsole>,
     add_virtio_console_default: Option<AddVirtioConsoleDefault>,
     start_enter: StartEnter,
@@ -189,6 +204,7 @@ impl KrunApi {
             add_vsock: required(&library, b"krun_add_vsock\0")?,
             add_net_unixgram: optional(&library, b"krun_add_net_unixgram\0"),
             add_disk: optional(&library, b"krun_add_disk\0"),
+            set_root_disk_remount: optional(&library, b"krun_set_root_disk_remount\0"),
             disable_implicit_console: optional(&library, b"krun_disable_implicit_console\0"),
             add_virtio_console_default: optional(&library, b"krun_add_virtio_console_default\0"),
             start_enter: required(&library, b"krun_start_enter\0")?,
@@ -244,6 +260,34 @@ impl KrunApi {
             self.add_vsock,
             self.add_net_unixgram,
         )
+    }
+
+    fn configure_root_disk(&self, context: u32, path: &Path) -> Result<(), HelperError> {
+        Self::configure_root_disk_with(context, path, self.add_disk, self.set_root_disk_remount)
+    }
+
+    fn configure_root_disk_with(
+        context: u32,
+        path: &Path,
+        add_disk: Option<AddDisk>,
+        set_root_disk_remount: Option<SetRootDiskRemount>,
+    ) -> Result<(), HelperError> {
+        let add_disk = add_disk.ok_or(HelperError::MissingDiskApi)?;
+        let set_root_disk_remount = set_root_disk_remount.ok_or(HelperError::MissingRootDiskApi)?;
+        let path = path_to_cstring(path)?;
+        Self::check("krun_add_disk(root, read_only=false)", unsafe {
+            // SAFETY: block ID and path are valid C strings and false requests writable access.
+            add_disk(context, c"root".as_ptr(), path.as_ptr(), false)
+        })?;
+        Self::check("krun_set_root_disk_remount(/dev/vda, ext4)", unsafe {
+            // SAFETY: all static strings are NUL-terminated and the root disk was added first.
+            set_root_disk_remount(
+                context,
+                c"/dev/vda".as_ptr(),
+                c"ext4".as_ptr(),
+                std::ptr::null(),
+            )
+        })
     }
 
     fn configure_networking_with(
@@ -420,11 +464,14 @@ fn parse_env(input: &str) -> Result<(String, String), String> {
     Ok((key.to_owned(), value.to_owned()))
 }
 
-fn workspace_command(command: &[String]) -> Vec<String> {
+fn workspace_command(command: &[String], block_root: bool) -> Vec<String> {
+    let device = if block_root { "/dev/vdb" } else { "/dev/vda" };
     let mut wrapped = vec![
         "/bin/sh".into(),
         "-c".into(),
-        "mkdir -p /workspace && mount -t ext4 -o ro /dev/vda /workspace && cd /workspace && exec \"$@\"".into(),
+        format!(
+            "mkdir -p /workspace && mount -t ext4 -o ro {device} /workspace && cd /workspace && exec \"$@\""
+        ),
         "moraebox-workspace".into(),
     ];
     wrapped.extend_from_slice(command);
@@ -465,6 +512,8 @@ enum HelperError {
     MissingRootApi,
     #[error("libkrun does not provide krun_add_disk required for workspace isolation")]
     MissingDiskApi,
+    #[error("libkrun does not provide krun_set_root_disk_remount required for block root")]
+    MissingRootDiskApi,
     #[error("libkrun does not provide krun_add_net_unixgram required for network access")]
     MissingNetworkApi,
     #[error("failed to load libkrun symbol: {0}")]
@@ -569,9 +618,65 @@ mod tests {
 
     #[test]
     fn workspace_wrapper_preserves_argv() {
-        let wrapped = workspace_command(&["/bin/echo".into(), "hello".into()]);
+        let wrapped = workspace_command(&["/bin/echo".into(), "hello".into()], false);
         assert_eq!(&wrapped[4..], ["/bin/echo", "hello"]);
         assert!(wrapped[2].contains("-o ro"));
+        assert!(wrapped[2].contains("/dev/vda"));
+    }
+
+    #[test]
+    fn workspace_uses_the_second_disk_with_a_block_root() {
+        let wrapped = workspace_command(&["/bin/true".into()], true);
+        assert!(wrapped[2].contains("/dev/vdb"));
+    }
+
+    static ROOT_DISK_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static ROOT_DISK_CALL_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn record_add_root_disk(
+        context: u32,
+        block_id: *const c_char,
+        path: *const c_char,
+        read_only: bool,
+    ) -> i32 {
+        let block_id = unsafe { CStr::from_ptr(block_id) };
+        let path = unsafe { CStr::from_ptr(path) };
+        if context == 11 && block_id == c"root" && path == c"/tmp/root.ext4" && !read_only {
+            let _ =
+                ROOT_DISK_CALL_SEQUENCE.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
+        }
+        0
+    }
+
+    unsafe extern "C" fn record_root_remount(
+        context: u32,
+        device: *const c_char,
+        fstype: *const c_char,
+        options: *const c_char,
+    ) -> i32 {
+        let device = unsafe { CStr::from_ptr(device) };
+        let fstype = unsafe { CStr::from_ptr(fstype) };
+        if context == 11 && device == c"/dev/vda" && fstype == c"ext4" && options.is_null() {
+            let _ =
+                ROOT_DISK_CALL_SEQUENCE.compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst);
+        }
+        0
+    }
+
+    #[test]
+    fn adds_writable_root_disk_before_configuring_the_pivot() {
+        let _guard = ROOT_DISK_TEST_LOCK.lock().unwrap();
+        ROOT_DISK_CALL_SEQUENCE.store(0, Ordering::SeqCst);
+
+        KrunApi::configure_root_disk_with(
+            11,
+            Path::new("/tmp/root.ext4"),
+            Some(record_add_root_disk),
+            Some(record_root_remount),
+        )
+        .unwrap();
+
+        assert_eq!(ROOT_DISK_CALL_SEQUENCE.load(Ordering::SeqCst), 2);
     }
 
     #[test]

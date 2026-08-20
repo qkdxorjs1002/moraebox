@@ -7,6 +7,10 @@ use std::{
 };
 
 use async_trait::async_trait;
+use moraebox_box::{
+    BaseDiskSpec, BaseDiskStore, BoxLease, BoxState, BoxStore, BoxStoreError, EphemeralDisk,
+    EphemeralDiskStore,
+};
 use moraebox_core::{OutputChannel, RunSpec, Signal};
 use tempfile::TempDir;
 use tokio::{
@@ -14,7 +18,7 @@ use tokio::{
     time::{Instant, sleep},
 };
 
-use crate::{Backend, BackendController, BackendError, SpawnedSandbox};
+use crate::{Backend, BackendController, BackendError, RootMode, SpawnedSandbox, StartupMetrics};
 
 const NETWORK_PROXY_START_TIMEOUT: Duration = Duration::from_secs(5);
 const NETWORK_PROXY_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -24,12 +28,31 @@ pub struct LibkrunConfig {
     pub helper_path: PathBuf,
     pub library_path: PathBuf,
     pub root_path: PathBuf,
+    pub root_disk: Option<PathBuf>,
     pub library_search_path: Option<PathBuf>,
     pub vcpus: u8,
     pub memory_mib: u32,
     pub workspace_disk: Option<PathBuf>,
     pub gvproxy_path: Option<PathBuf>,
     pub network_runtime_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoxRootSource {
+    pub rootfs_path: PathBuf,
+    pub manifest_digest: String,
+    pub platform: String,
+    pub virtual_size_bytes: u64,
+    pub mke2fs_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoxRuntimeConfig {
+    pub boxes: BoxStore,
+    pub base_disks: BaseDiskStore,
+    pub ephemeral_disks: EphemeralDiskStore,
+    pub source: Option<BoxRootSource>,
+    pub e2fsck_path: PathBuf,
 }
 
 impl LibkrunConfig {
@@ -42,6 +65,7 @@ impl LibkrunConfig {
             helper_path: helper_path.into(),
             library_path: library_path.into(),
             root_path: root_path.into(),
+            root_disk: None,
             library_search_path: None,
             vcpus: 2,
             memory_mib: 512,
@@ -51,7 +75,13 @@ impl LibkrunConfig {
         }
     }
 
-    fn validate(&self) -> Result<(), BackendError> {
+    #[must_use]
+    pub fn with_root_disk(mut self, root_disk: impl Into<PathBuf>) -> Self {
+        self.root_disk = Some(root_disk.into());
+        self
+    }
+
+    fn validate(&self, managed_root: bool) -> Result<(), BackendError> {
         if self.vcpus == 0 {
             return Err(BackendError::InvalidSpec("vCPU count must be non-zero"));
         }
@@ -61,7 +91,6 @@ impl LibkrunConfig {
         for (name, path) in [
             ("VMM helper", &self.helper_path),
             ("libkrun", &self.library_path),
-            ("root filesystem", &self.root_path),
         ] {
             if !path.exists() {
                 return Err(BackendError::Control(format!(
@@ -69,6 +98,21 @@ impl LibkrunConfig {
                     path.display()
                 )));
             }
+        }
+        if managed_root {
+            // A managed Box lease supplies the root disk immediately before helper spawn.
+        } else if let Some(path) = &self.root_disk {
+            if !path.is_file() {
+                return Err(BackendError::Control(format!(
+                    "root disk does not exist: {}",
+                    path.display()
+                )));
+            }
+        } else if !self.root_path.is_dir() {
+            return Err(BackendError::Control(format!(
+                "root filesystem does not exist: {}",
+                self.root_path.display()
+            )));
         }
         if let Some(path) = &self.workspace_disk
             && !path.is_file()
@@ -100,11 +144,21 @@ impl LibkrunConfig {
 #[derive(Debug, Clone)]
 pub struct LibkrunBackend {
     config: LibkrunConfig,
+    box_runtime: Option<BoxRuntimeConfig>,
 }
 
 impl LibkrunBackend {
     pub fn new(config: LibkrunConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            box_runtime: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_box_runtime(mut self, config: BoxRuntimeConfig) -> Self {
+        self.box_runtime = Some(config);
+        self
     }
 }
 
@@ -116,20 +170,40 @@ impl Backend for LibkrunBackend {
 
     async fn spawn(&self, spec: &RunSpec) -> Result<SpawnedSandbox, BackendError> {
         spec.validate().map_err(BackendError::InvalidSpec)?;
-        self.config.validate()?;
+        self.config.validate(self.box_runtime.is_some())?;
+        if spec.box_id.is_some() && self.box_runtime.is_none() {
+            return Err(BackendError::Control(
+                "run requested a BoxId but no Box store is configured".into(),
+            ));
+        }
 
+        let mut startup = StartupMetrics::default();
         let network_proxy = if spec.network {
-            Some(NetworkProxy::start(&self.config).await?)
+            let started = Instant::now();
+            let proxy = NetworkProxy::start(&self.config).await?;
+            startup.network_setup_micros = Some(elapsed_micros(started));
+            Some(proxy)
         } else {
             None
         };
+        let root_started = Instant::now();
+        let (prepared_root, root_startup) = self.prepare_root(spec).await?;
+        startup.root_prepare_micros = Some(elapsed_micros(root_started));
+        startup.root_mode = root_startup.root_mode;
+        startup.cache_lookup_micros = root_startup.cache_lookup_micros;
+        startup.box_lock_micros = root_startup.box_lock_micros;
+        startup.base_prepare_micros = root_startup.base_prepare_micros;
+        startup.disk_clone_micros = root_startup.disk_clone_micros;
+        startup.repair_micros = root_startup.repair_micros;
 
         let mut command = Command::new(&self.config.helper_path);
+        command.arg("--libkrun").arg(&self.config.library_path);
+        if let Some(root_disk) = prepared_root.disk_path() {
+            command.arg("--root-disk").arg(root_disk);
+        } else {
+            command.arg("--root").arg(&self.config.root_path);
+        }
         command
-            .arg("--libkrun")
-            .arg(&self.config.library_path)
-            .arg("--root")
-            .arg(&self.config.root_path)
             .arg("--cpus")
             .arg(self.config.vcpus.to_string())
             .arg("--memory-mib")
@@ -164,17 +238,234 @@ impl Backend for LibkrunBackend {
             command.as_std_mut().process_group(0);
         }
 
-        if spec.tty {
-            spawn_pty(command, spec, network_proxy)
+        let helper_started = Instant::now();
+        let mut spawned = if spec.tty {
+            spawn_pty(command, spec, network_proxy, prepared_root.into_lease())?
         } else {
-            spawn_piped(command, network_proxy)
+            spawn_piped(command, network_proxy, prepared_root.into_lease())?
+        };
+        startup.helper_spawn_micros = Some(elapsed_micros(helper_started));
+        spawned.startup = startup;
+        Ok(spawned)
+    }
+}
+
+impl LibkrunBackend {
+    async fn prepare_root(
+        &self,
+        spec: &RunSpec,
+    ) -> Result<(PreparedRoot, StartupMetrics), BackendError> {
+        let Some(runtime) = &self.box_runtime else {
+            return Ok(self.config.root_disk.as_ref().map_or_else(
+                || {
+                    (
+                        PreparedRoot::Directory,
+                        StartupMetrics {
+                            root_mode: Some(RootMode::Directory),
+                            ..StartupMetrics::default()
+                        },
+                    )
+                },
+                |path| {
+                    (
+                        PreparedRoot::StaticDisk(path.clone()),
+                        StartupMetrics {
+                            root_mode: Some(RootMode::StaticDisk),
+                            ..StartupMetrics::default()
+                        },
+                    )
+                },
+            ));
+        };
+
+        if let Some(box_id) = spec.box_id {
+            return Self::prepare_persistent_root(runtime, box_id).await;
+        }
+        Self::prepare_ephemeral_root(runtime, spec).await
+    }
+
+    async fn prepare_persistent_root(
+        runtime: &BoxRuntimeConfig,
+        box_id: moraebox_core::BoxId,
+    ) -> Result<(PreparedRoot, StartupMetrics), BackendError> {
+        let lock_started = Instant::now();
+        let mut lease = runtime
+            .boxes
+            .try_acquire(box_id)
+            .map_err(box_backend_error)?;
+        let mut startup = StartupMetrics {
+            root_mode: Some(RootMode::Persistent),
+            box_lock_micros: Some(elapsed_micros(lock_started)),
+            ..StartupMetrics::default()
+        };
+        if lease.metadata().state == BoxState::Dirty {
+            let repair_started = Instant::now();
+            repair_dirty_box(&runtime.boxes, &mut lease, &runtime.e2fsck_path).await?;
+            startup.repair_micros = Some(elapsed_micros(repair_started));
+        }
+        runtime
+            .boxes
+            .set_state(&mut lease, BoxState::Dirty)
+            .map_err(box_backend_error)?;
+        Ok((
+            PreparedRoot::Managed(ManagedRootLease::Persistent {
+                store: runtime.boxes.clone(),
+                lease,
+            }),
+            startup,
+        ))
+    }
+
+    async fn prepare_ephemeral_root(
+        runtime: &BoxRuntimeConfig,
+        spec: &RunSpec,
+    ) -> Result<(PreparedRoot, StartupMetrics), BackendError> {
+        let source = runtime.source.clone().ok_or_else(|| {
+            BackendError::Control(
+                "ephemeral native run requires an image-backed Box root source".into(),
+            )
+        })?;
+        let base_store = runtime.base_disks.clone();
+        let base_spec = BaseDiskSpec::new(
+            source.manifest_digest,
+            source.platform,
+            source.virtual_size_bytes,
+        );
+        let lookup_store = base_store.clone();
+        let lookup_spec = base_spec.clone();
+        let lookup_started = Instant::now();
+        let cached = tokio::task::spawn_blocking(move || lookup_store.get(&lookup_spec))
+            .await
+            .map_err(|error| BackendError::Control(format!("base disk task failed: {error}")))?
+            .map_err(box_backend_error)?;
+        let mut startup = StartupMetrics {
+            root_mode: Some(RootMode::Ephemeral),
+            cache_lookup_micros: Some(elapsed_micros(lookup_started)),
+            ..StartupMetrics::default()
+        };
+        let base = if let Some(base) = cached {
+            base
+        } else {
+            let rootfs = source.rootfs_path;
+            let mke2fs = source.mke2fs_path;
+            let prepare_started = Instant::now();
+            let base = tokio::task::spawn_blocking(move || {
+                base_store.prepare(&base_spec, &rootfs, &mke2fs)
+            })
+            .await
+            .map_err(|error| BackendError::Control(format!("base disk task failed: {error}")))?
+            .map_err(box_backend_error)?;
+            startup.base_prepare_micros = Some(elapsed_micros(prepare_started));
+            base
+        };
+        let ephemeral_store = runtime.ephemeral_disks.clone();
+        let session_id = spec.session_id;
+        let clone_started = Instant::now();
+        let disk = tokio::task::spawn_blocking(move || {
+            ephemeral_store.clone_for_session(&base, session_id)
+        })
+        .await
+        .map_err(|error| BackendError::Control(format!("CoW clone task failed: {error}")))?
+        .map_err(box_backend_error)?;
+        startup.disk_clone_micros = Some(elapsed_micros(clone_started));
+        Ok((
+            PreparedRoot::Managed(ManagedRootLease::Ephemeral(disk)),
+            startup,
+        ))
+    }
+}
+
+enum PreparedRoot {
+    Directory,
+    StaticDisk(PathBuf),
+    Managed(ManagedRootLease),
+}
+
+impl PreparedRoot {
+    fn disk_path(&self) -> Option<&Path> {
+        match self {
+            Self::Directory => None,
+            Self::StaticDisk(path) => Some(path),
+            Self::Managed(lease) => Some(lease.disk_path()),
         }
     }
+
+    fn into_lease(self) -> Option<ManagedRootLease> {
+        match self {
+            Self::Managed(lease) => Some(lease),
+            Self::Directory | Self::StaticDisk(_) => None,
+        }
+    }
+}
+
+enum ManagedRootLease {
+    Persistent { store: BoxStore, lease: BoxLease },
+    Ephemeral(EphemeralDisk),
+}
+
+impl ManagedRootLease {
+    fn disk_path(&self) -> &Path {
+        match self {
+            Self::Persistent { lease, .. } => lease.disk_path(),
+            Self::Ephemeral(disk) => disk.disk_path(),
+        }
+    }
+
+    fn mark_clean(&mut self) -> Result<(), BoxStoreError> {
+        if let Self::Persistent { store, lease } = self {
+            store.set_state(lease, BoxState::Ready)?;
+        }
+        Ok(())
+    }
+}
+
+async fn repair_dirty_box(
+    store: &BoxStore,
+    lease: &mut BoxLease,
+    e2fsck: &Path,
+) -> Result<(), BackendError> {
+    if !e2fsck.is_file() {
+        return Err(BackendError::Control(format!(
+            "dirty Box {} requires e2fsck, but it was not found at {}",
+            lease.id(),
+            e2fsck.display()
+        )));
+    }
+    let output = Command::new(e2fsck)
+        .arg("-p")
+        .arg(lease.disk_path())
+        .env_clear()
+        .output()
+        .await?;
+    if matches!(output.status.code(), Some(0 | 1)) {
+        store
+            .set_state(lease, BoxState::Ready)
+            .map_err(box_backend_error)?;
+        return Ok(());
+    }
+    store
+        .set_state(lease, BoxState::NeedsRepair)
+        .map_err(box_backend_error)?;
+    Err(BackendError::Control(format!(
+        "e2fsck could not repair Box {} (status {:?}): {}",
+        lease.id(),
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "this function is a map_err adapter and owns the source error"
+)]
+fn box_backend_error(error: BoxStoreError) -> BackendError {
+    BackendError::Control(error.to_string())
 }
 
 fn spawn_piped(
     mut command: Command,
     network_proxy: Option<NetworkProxy>,
+    root_lease: Option<ManagedRootLease>,
 ) -> Result<SpawnedSandbox, BackendError> {
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
@@ -188,7 +479,7 @@ fn spawn_piped(
         .map(|reader| Box::pin(reader) as _)
         .ok_or_else(|| BackendError::Control("helper stdout pipe was not created".into()))?;
     let stderr = child.stderr.take().map(|reader| Box::pin(reader) as _);
-    let exit = managed_exit(child, network_proxy);
+    let exit = managed_exit(child, network_proxy, root_lease);
     Ok(SpawnedSandbox {
         stdin,
         stdout,
@@ -196,6 +487,7 @@ fn spawn_piped(
         stderr,
         exit,
         controller: Box::new(LibkrunController { pid: Arc::new(pid) }),
+        startup: StartupMetrics::default(),
     })
 }
 
@@ -204,6 +496,7 @@ fn spawn_pty(
     mut command: Command,
     spec: &RunSpec,
     network_proxy: Option<NetworkProxy>,
+    root_lease: Option<ManagedRootLease>,
 ) -> Result<SpawnedSandbox, BackendError> {
     use std::fs::File;
 
@@ -225,7 +518,7 @@ fn spawn_pty(
 
     let child = command.spawn()?;
     let pid = child.id().ok_or(BackendError::MissingProcessId)?;
-    let exit = managed_exit(child, network_proxy);
+    let exit = managed_exit(child, network_proxy, root_lease);
     Ok(SpawnedSandbox {
         stdin: Some(Box::pin(tokio::fs::File::from_std(master))),
         stdout: Box::pin(tokio::fs::File::from_std(master_reader)),
@@ -233,6 +526,7 @@ fn spawn_pty(
         stderr: None,
         exit,
         controller: Box::new(LibkrunController { pid: Arc::new(pid) }),
+        startup: StartupMetrics::default(),
     })
 }
 
@@ -241,6 +535,7 @@ fn spawn_pty(
     _command: Command,
     _spec: &RunSpec,
     _network_proxy: Option<NetworkProxy>,
+    _root_lease: Option<ManagedRootLease>,
 ) -> Result<SpawnedSandbox, BackendError> {
     Err(BackendError::Unsupported("PTY on this platform"))
 }
@@ -248,17 +543,51 @@ fn spawn_pty(
 fn managed_exit(
     mut child: Child,
     network_proxy: Option<NetworkProxy>,
+    mut root_lease: Option<ManagedRootLease>,
 ) -> crate::backend::ExitFuture {
-    Box::pin(async move {
+    let task = tokio::spawn(async move {
         let status = child.wait().await;
-        if let Some(proxy) = network_proxy {
-            let cleanup = proxy.stop().await;
-            if status.is_ok() {
-                cleanup?;
-            }
+        let root_cleanup = if let Ok(status) = &status
+            && helper_exit_is_clean(*status)
+            && let Some(lease) = root_lease.as_mut()
+        {
+            lease
+                .mark_clean()
+                .map_err(|error| io::Error::other(error.to_string()))
+        } else {
+            Ok(())
+        };
+        let network_cleanup = if let Some(proxy) = network_proxy {
+            proxy.stop().await
+        } else {
+            Ok(())
+        };
+        root_cleanup?;
+        if status.is_ok() {
+            network_cleanup?;
         }
         status
+    });
+    Box::pin(async move {
+        task.await
+            .map_err(|error| io::Error::other(format!("helper wait task failed: {error}")))?
     })
+}
+
+fn helper_exit_is_clean(status: std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().is_none() && !matches!(status.code(), Some(125 | 137) | None)
+    }
+    #[cfg(not(unix))]
+    {
+        !matches!(status.code(), Some(125 | 137) | None)
+    }
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug)]
@@ -271,19 +600,14 @@ struct NetworkProxy {
 impl NetworkProxy {
     async fn start(config: &LibkrunConfig) -> Result<Self, BackendError> {
         let executable = config.network_proxy_path()?;
-        std::fs::create_dir_all(&config.network_runtime_dir)?;
-        let state = tempfile::Builder::new()
-            .prefix("run-")
-            .tempdir_in(&config.network_runtime_dir)?;
+        let state = create_network_state(config)?;
         let socket_path = state.path().join("gvproxy.sock");
-        let socket = socket_path.to_str().ok_or_else(|| {
-            BackendError::Control("gvproxy socket path must be valid UTF-8".into())
-        })?;
+        let socket = vfkit_socket_uri(&socket_path)?;
 
         let mut command = Command::new(executable);
         command
             .arg("--listen-vfkit")
-            .arg(format!("unixgram://{socket}"))
+            .arg(socket)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -337,6 +661,44 @@ impl NetworkProxy {
     }
 }
 
+fn create_network_state(config: &LibkrunConfig) -> Result<TempDir, BackendError> {
+    std::fs::create_dir_all(&config.network_runtime_dir)?;
+    let runtime_root = std::fs::canonicalize(&config.network_runtime_dir)?;
+    let configured = tempfile::Builder::new()
+        .prefix("run-")
+        .tempdir_in(runtime_root)?;
+    if vfkit_socket_uri(&configured.path().join("gvproxy.sock")).is_ok() {
+        return Ok(configured);
+    }
+    drop(configured);
+
+    let temporary_root = std::fs::canonicalize(std::env::temp_dir())?;
+    let fallback = tempfile::Builder::new()
+        .prefix("morae-net-")
+        .tempdir_in(temporary_root)?;
+    vfkit_socket_uri(&fallback.path().join("gvproxy.sock"))?;
+    Ok(fallback)
+}
+
+fn vfkit_socket_uri(path: &Path) -> Result<String, BackendError> {
+    if !path.is_absolute() {
+        return Err(BackendError::Control(
+            "gvproxy socket path must be absolute".into(),
+        ));
+    }
+    let path = path
+        .to_str()
+        .ok_or_else(|| BackendError::Control("gvproxy socket path must be valid UTF-8".into()))?;
+    #[cfg(unix)]
+    if path.len() >= 104 {
+        return Err(BackendError::Control(format!(
+            "gvproxy socket path exceeds the Unix limit: {} bytes",
+            path.len()
+        )));
+    }
+    Ok(format!("unixgram://{path}"))
+}
+
 #[derive(Debug)]
 struct LibkrunController {
     #[cfg_attr(
@@ -347,6 +709,19 @@ struct LibkrunController {
         )
     )]
     pid: Arc<u32>,
+}
+
+impl Drop for LibkrunController {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use nix::{sys::signal::Signal as NixSignal, unistd::Pid};
+
+            if let Ok(pid) = i32::try_from(*self.pid) {
+                let _ = nix::sys::signal::kill(Pid::from_raw(-pid), NixSignal::SIGKILL);
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -387,13 +762,31 @@ impl BackendController for LibkrunController {
 mod tests {
     use super::*;
 
+    use moraebox_box::CreateBox;
+
+    const MANAGED_TEST_DISK_BYTES: u64 = 8 * 1024 * 1024;
+
     #[cfg(unix)]
     use std::{fs, os::unix::fs::PermissionsExt};
 
     #[test]
     fn rejects_missing_native_paths() {
         let config = LibkrunConfig::new("missing-helper", "missing-lib", "missing-root");
-        assert!(config.validate().is_err());
+        assert!(config.validate(false).is_err());
+    }
+
+    #[test]
+    fn gvproxy_socket_uri_requires_an_absolute_path() {
+        assert!(vfkit_socket_uri(Path::new("relative/gvproxy.sock")).is_err());
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                vfkit_socket_uri(Path::new("/private/tmp/gvproxy.sock")).unwrap(),
+                "unixgram:///private/tmp/gvproxy.sock"
+            );
+            let overlong = PathBuf::from(format!("/private/tmp/{}", "x".repeat(104)));
+            assert!(vfkit_socket_uri(&overlong).is_err());
+        }
     }
 
     #[tokio::test]
@@ -436,6 +829,198 @@ mod tests {
 
         assert_eq!(report.exit_code, Some(0));
         assert!(!network_runtime_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn passes_a_block_root_to_the_helper() {
+        let state = tempfile::tempdir().unwrap();
+        let helper = state.path().join("helper");
+        let library = state.path().join("libkrun");
+        let root = state.path().join("unused-root");
+        let root_disk = state.path().join("root.ext4");
+        write_executable(&helper, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+        fs::write(&library, []).unwrap();
+        fs::write(&root_disk, []).unwrap();
+
+        let config = LibkrunConfig::new(helper, library, root).with_root_disk(&root_disk);
+        let report = crate::Supervisor::new(LibkrunBackend::new(config))
+            .run(RunSpec::command(["/usr/bin/true"]))
+            .await
+            .unwrap();
+        let output = report
+            .output
+            .iter()
+            .flat_map(|chunk| chunk.data.iter().copied())
+            .collect::<Vec<_>>();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("--root-disk"));
+        assert!(output.contains(root_disk.to_str().unwrap()));
+        assert!(!output.contains("--root\n"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_box_lease_is_cleaned_after_helper_exit() {
+        let fixture = ManagedFixture::new("#!/bin/sh\nprintf '%s\\n' \"$@\"\n", "exit 0\n");
+        let (box_id, disk_path) = fixture.create_box();
+        let backend = fixture.backend(None);
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.box_id = Some(box_id);
+
+        let report = crate::Supervisor::new(backend).run(spec).await.unwrap();
+        let output = report
+            .output
+            .iter()
+            .flat_map(|chunk| chunk.data.iter().copied())
+            .collect::<Vec<_>>();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("--root-disk"));
+        assert!(output.contains(disk_path.to_str().unwrap()));
+        assert_eq!(report.startup.root_mode, Some(RootMode::Persistent));
+        assert!(report.startup.box_lock_micros.is_some());
+        assert!(report.startup.helper_spawn_micros.is_some());
+        assert_eq!(fixture.boxes.get(box_id).unwrap().state, BoxState::Ready);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_box_rejects_a_second_writer_and_stays_dirty_when_dropped() {
+        let fixture =
+            ManagedFixture::new("#!/bin/sh\nwhile :; do /bin/sleep 1; done\n", "exit 0\n");
+        let (box_id, _) = fixture.create_box();
+        let backend = fixture.backend(None);
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.box_id = Some(box_id);
+
+        let running = backend.spawn(&spec).await.unwrap();
+        assert_eq!(fixture.boxes.get(box_id).unwrap().state, BoxState::Dirty);
+        assert!(matches!(
+            backend.spawn(&spec).await,
+            Err(BackendError::Control(message)) if message.contains("already in use")
+        ));
+        drop(running);
+
+        assert_eq!(fixture.boxes.get(box_id).unwrap().state, BoxState::Dirty);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_leaves_the_persistent_box_dirty_after_reaping_helper() {
+        let fixture = ManagedFixture::new(
+            "#!/bin/sh\nwhile :; do /bin/sleep 1; done\n",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let (box_id, _) = fixture.create_box();
+        let backend = fixture.backend(None);
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.box_id = Some(box_id);
+        spec.timeout = moraebox_core::TimeoutPolicy::Limited(20);
+        spec.kill_grace = Duration::from_millis(20);
+
+        let report = crate::Supervisor::new(backend).run(spec).await.unwrap();
+
+        assert!(report.timed_out);
+        assert_eq!(fixture.boxes.get(box_id).unwrap().state, BoxState::Dirty);
+        assert!(fixture.boxes.try_acquire(box_id).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn helper_backend_failure_leaves_the_persistent_box_dirty() {
+        let fixture = ManagedFixture::new("#!/bin/sh\nexit 125\n", "#!/bin/sh\nexit 0\n");
+        let (box_id, _) = fixture.create_box();
+        let backend = fixture.backend(None);
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.box_id = Some(box_id);
+
+        let report = crate::Supervisor::new(backend).run(spec).await.unwrap();
+
+        assert_eq!(report.exit_code, Some(125));
+        assert_eq!(fixture.boxes.get(box_id).unwrap().state, BoxState::Dirty);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dirty_box_runs_e2fsck_before_the_next_helper() {
+        let fixture = ManagedFixture::new(
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nprintf repaired > \"$0.called\"\nexit 1\n",
+        );
+        let (box_id, _) = fixture.create_box();
+        fixture.set_box_state(box_id, BoxState::Dirty);
+        let backend = fixture.backend(None);
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.box_id = Some(box_id);
+
+        crate::Supervisor::new(backend).run(spec).await.unwrap();
+
+        assert!(fixture.e2fsck.with_extension("called").exists());
+        assert_eq!(fixture.boxes.get(box_id).unwrap().state, BoxState::Ready);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_repair_blocks_the_box() {
+        let fixture = ManagedFixture::new("#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 4\n");
+        let (box_id, _) = fixture.create_box();
+        fixture.set_box_state(box_id, BoxState::Dirty);
+        let backend = fixture.backend(None);
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.box_id = Some(box_id);
+
+        assert!(matches!(
+            backend.spawn(&spec).await,
+            Err(BackendError::Control(message)) if message.contains("could not repair")
+        ));
+        assert_eq!(
+            fixture.boxes.get(box_id).unwrap().state,
+            BoxState::NeedsRepair
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ephemeral_root_is_deleted_after_the_helper_exits() {
+        let fixture = ManagedFixture::new("#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let rootfs = fixture.state.path().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        fs::write(rootfs.join("payload"), b"rootfs").unwrap();
+        let mke2fs = fixture.state.path().join("mke2fs");
+        write_executable(&mke2fs, "#!/bin/sh\nexit 0\n");
+        let source = BoxRootSource {
+            rootfs_path: rootfs,
+            manifest_digest: "sha256:ephemeral".into(),
+            platform: "linux/arm64".into(),
+            virtual_size_bytes: 8 * 1024 * 1024,
+            mke2fs_path: mke2fs,
+        };
+        let runtime_root = fixture.state.path().join("runtime");
+        let backend = fixture.backend(Some((source, runtime_root.clone())));
+
+        let supervisor = crate::Supervisor::new(backend);
+        let cold = supervisor
+            .run(RunSpec::command(["/usr/bin/true"]))
+            .await
+            .unwrap();
+        assert_eq!(cold.startup.root_mode, Some(RootMode::Ephemeral));
+        assert!(cold.startup.cache_lookup_micros.is_some());
+        assert!(cold.startup.base_prepare_micros.is_some());
+        assert!(cold.startup.disk_clone_micros.is_some());
+
+        let cached = supervisor
+            .run(RunSpec::command(["/usr/bin/true"]))
+            .await
+            .unwrap();
+        assert_eq!(cached.startup.root_mode, Some(RootMode::Ephemeral));
+        assert!(cached.startup.cache_lookup_micros.is_some());
+        assert_eq!(cached.startup.base_prepare_micros, None);
+        assert!(cached.startup.disk_clone_micros.is_some());
+
+        let ephemeral = runtime_root.join("ephemeral-boxes");
+        assert_eq!(fs::read_dir(ephemeral).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
@@ -580,5 +1165,80 @@ mod tests {
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    struct ManagedFixture {
+        state: tempfile::TempDir,
+        helper: PathBuf,
+        library: PathBuf,
+        e2fsck: PathBuf,
+        boxes: BoxStore,
+    }
+
+    #[cfg(unix)]
+    impl ManagedFixture {
+        fn new(helper_script: &str, e2fsck_script: &str) -> Self {
+            let state = tempfile::tempdir().unwrap();
+            let helper = state.path().join("helper");
+            let library = state.path().join("libkrun");
+            let e2fsck = state.path().join("e2fsck");
+            write_executable(&helper, helper_script);
+            write_executable(&e2fsck, e2fsck_script);
+            fs::write(&library, []).unwrap();
+            let boxes = BoxStore::new(state.path().join("state"));
+            Self {
+                state,
+                helper,
+                library,
+                e2fsck,
+                boxes,
+            }
+        }
+
+        fn create_box(&self) -> (moraebox_core::BoxId, PathBuf) {
+            let source = self
+                .state
+                .path()
+                .join(format!("{}.ext4", moraebox_core::BoxId::new()));
+            let file = fs::File::create(&source).unwrap();
+            file.set_len(MANAGED_TEST_DISK_BYTES).unwrap();
+            drop(file);
+            let metadata = self
+                .boxes
+                .create(
+                    &CreateBox::new("sha256:persistent", "linux/arm64", MANAGED_TEST_DISK_BYTES),
+                    &source,
+                )
+                .unwrap();
+            let disk = self.boxes.try_acquire(metadata.box_id).unwrap();
+            let path = disk.disk_path().to_path_buf();
+            drop(disk);
+            (metadata.box_id, path)
+        }
+
+        fn set_box_state(&self, box_id: moraebox_core::BoxId, state: BoxState) {
+            let mut lease = self.boxes.try_acquire(box_id).unwrap();
+            self.boxes.set_state(&mut lease, state).unwrap();
+        }
+
+        fn backend(&self, source: Option<(BoxRootSource, PathBuf)>) -> LibkrunBackend {
+            let config = LibkrunConfig::new(
+                &self.helper,
+                &self.library,
+                self.state.path().join("unused-root"),
+            );
+            let runtime = BoxRuntimeConfig {
+                boxes: self.boxes.clone(),
+                base_disks: BaseDiskStore::new(self.state.path().join("cache")),
+                ephemeral_disks: EphemeralDiskStore::new(source.as_ref().map_or_else(
+                    || self.state.path().join("runtime"),
+                    |(_, path)| path.clone(),
+                )),
+                source: source.map(|(source, _)| source),
+                e2fsck_path: self.e2fsck.clone(),
+            };
+            LibkrunBackend::new(config).with_box_runtime(runtime)
+        }
     }
 }

@@ -2,9 +2,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use moraebox_core::{OutputChunk, RunSpec, SessionId, Signal};
+use moraebox_box::{BoxMetadata, BoxStore, BoxStoreError, CreateBox};
+use moraebox_core::{BoxId, OutputChunk, RunSpec, SessionId, Signal};
 use moraebox_runtime::{Backend, SessionError, SessionHandle, SessionManager, SessionStatus};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,6 +15,7 @@ use tokio::sync::RwLock;
 pub struct SandboxSdk {
     manager: SessionManager,
     sessions: Arc<RwLock<HashMap<SessionId, SessionHandle>>>,
+    box_store: Option<BoxStore>,
 }
 
 impl SandboxSdk {
@@ -21,7 +23,14 @@ impl SandboxSdk {
         Self {
             manager: SessionManager::new(backend),
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            box_store: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_box_store(mut self, store: BoxStore) -> Self {
+        self.box_store = Some(store);
+        self
     }
 
     pub async fn start(&self, spec: RunSpec) -> Result<SessionStatus, SdkError> {
@@ -95,6 +104,62 @@ impl SandboxSdk {
         self.sessions.write().await.remove(&session_id).is_some()
     }
 
+    pub async fn create_box(
+        &self,
+        request: CreateBox,
+        source_disk: PathBuf,
+    ) -> Result<BoxMetadata, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.create(&request, &source_disk))
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
+    pub async fn list_boxes(&self) -> Result<Vec<BoxMetadata>, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.list())
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
+    pub async fn get_box(&self, box_id: BoxId) -> Result<BoxMetadata, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.get(box_id))
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
+    pub async fn delete_box(&self, box_id: BoxId) -> Result<BoxMetadata, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.delete(box_id))
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
+    pub async fn reset_box(
+        &self,
+        box_id: BoxId,
+        source_disk: PathBuf,
+    ) -> Result<BoxMetadata, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.reset(box_id, &source_disk))
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
+    pub async fn clone_box(&self, box_id: BoxId) -> Result<BoxMetadata, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.clone_box(box_id))
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
     async fn session(&self, session_id: SessionId) -> Result<SessionHandle, SdkError> {
         self.sessions
             .read()
@@ -102,6 +167,12 @@ impl SandboxSdk {
             .get(&session_id)
             .cloned()
             .ok_or(SdkError::UnknownSession(session_id))
+    }
+
+    fn box_store(&self) -> Result<BoxStore, SdkError> {
+        self.box_store
+            .clone()
+            .ok_or(SdkError::BoxStoreNotConfigured)
     }
 }
 
@@ -150,6 +221,12 @@ pub enum SdkError {
     Session(#[from] SessionError),
     #[error("unknown sandbox session {0}")]
     UnknownSession(SessionId),
+    #[error("Box store is not configured for this SDK instance")]
+    BoxStoreNotConfigured,
+    #[error("Box background task failed: {0}")]
+    BoxTask(String),
+    #[error(transparent)]
+    BoxStore(#[from] BoxStoreError),
 }
 
 #[cfg(test)]
@@ -193,6 +270,29 @@ mod tests {
                 .iter()
                 .any(|chunk| chunk.data.starts_with(b"sdk"))
         );
+    }
+
+    #[tokio::test]
+    async fn manages_boxes_when_a_store_is_configured() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("base.ext4");
+        let file = std::fs::File::create(&source).unwrap();
+        file.set_len(1024 * 1024).unwrap();
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend))
+            .with_box_store(BoxStore::new(temporary.path().join("state")));
+
+        let created = sdk
+            .create_box(
+                CreateBox::new("sha256:test", "linux/arm64", 1024 * 1024),
+                source,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(sdk.get_box(created.box_id).await.unwrap(), created);
+        assert_eq!(sdk.list_boxes().await.unwrap(), vec![created.clone()]);
+        sdk.delete_box(created.box_id).await.unwrap();
+        assert!(sdk.list_boxes().await.unwrap().is_empty());
     }
 
     #[cfg(unix)]
