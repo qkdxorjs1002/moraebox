@@ -174,7 +174,9 @@ morae cache clean --all --dry-run
 morae cache clean --all --yes
 ```
 
-파괴적인 캐시 작업에는 `--dry-run` 또는 `--yes`가 필요하며 durable Box 변경에는 `--yes`가 필요합니다. `morae cache clean`은 다시 만들 수 있는 image, immutable base disk, ephemeral 데이터만 지우고 `.moraebox/state`의 persistent Box disk는 지우지 않습니다. 구조화된 출력이 필요한 image·Box·cache 명령은 `--json`을 지원합니다.
+모든 명령은 현재 작업 디렉터리와 무관하게 사용자 전역 `~/.moraebox/cache`와 `~/.moraebox/state`를 기본으로 사용합니다. 다른 위치가 필요한 명령에만 `--cache-dir` 또는 `--state-dir`을 지정합니다. 기존 프로젝트 로컬 데이터는 자동으로 옮기지 않으며, 예를 들어 `morae box list --state-dir .moraebox/state`로 계속 사용할 수 있습니다.
+
+파괴적인 캐시 작업에는 `--dry-run` 또는 `--yes`가 필요하며 durable Box 변경에는 `--yes`가 필요합니다. `morae cache clean`은 다시 만들 수 있는 image, immutable base disk, ephemeral 데이터만 지우고 `~/.moraebox/state`의 persistent Box disk는 지우지 않습니다. 구조화된 출력이 필요한 image·Box·cache 명령은 `--json`을 지원합니다.
 
 ### 격리 없이 수명주기만 확인
 
@@ -211,7 +213,7 @@ morae-mcp install claude-code
 morae-mcp install codex --dry-run
 ```
 
-설치기는 에이전트의 공식 CLI를 사용하며 설정 파일을 직접 편집하지 않습니다. `--image`, `--cache-dir`, `--state-dir`, `--disk-size`, `--cpus`, `--memory-mib`, `--gvproxy`로 등록 내용을 조정할 수 있습니다. 격리 없는 수명주기 테스트가 필요하면 `--backend process`를 명시합니다.
+설치기는 에이전트의 공식 CLI를 사용하며 설정 파일을 직접 편집하지 않습니다. 기본 등록에는 해석된 사용자 전역 cache·state 경로를 사용합니다. `--image`, `--cache-dir`, `--state-dir`, `--disk-size`, `--cpus`, `--memory-mib`, `--gvproxy`로 등록 내용을 조정할 수 있습니다. 격리 없는 수명주기 테스트가 필요하면 `--backend process`를 명시합니다.
 
 서버는 실행 도구와 persistent Box 관리 도구를 제공합니다.
 

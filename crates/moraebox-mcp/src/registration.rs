@@ -6,6 +6,7 @@ use std::{
 };
 
 use clap::{Args, ValueEnum};
+use moraebox_core::{resolve_cache_dir, resolve_state_dir};
 use moraebox_image::ImageCache;
 use serde_json::json;
 
@@ -57,11 +58,12 @@ pub struct InstallArgs {
     #[arg(long, conflicts_with = "rootfs")]
     image: Option<String>,
     /// Image and rootfs cache used by the registered server.
-    #[arg(long, default_value = ".moraebox/cache")]
-    cache_dir: PathBuf,
-    /// Persistent Box metadata root.
-    #[arg(long, default_value = ".moraebox/state")]
-    state_dir: PathBuf,
+    /// Cache root; defaults to ~/.moraebox/cache.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
     /// Override the automatically discovered signed VMM helper.
     #[arg(long, env = "MORAE_HELPER_PATH")]
     helper: Option<PathBuf>,
@@ -198,8 +200,12 @@ fn build_command_plan(
 }
 
 fn server_configuration(install: &InstallArgs) -> Result<ServerConfiguration, String> {
-    let cache_dir = absolute_path(&install.cache_dir)?;
-    let state_dir = absolute_path(&install.state_dir)?;
+    let cache_dir =
+        resolve_cache_dir(install.cache_dir.as_deref()).map_err(|error| error.to_string())?;
+    let state_dir =
+        resolve_state_dir(install.state_dir.as_deref()).map_err(|error| error.to_string())?;
+    let cache_dir = absolute_path(&cache_dir)?;
+    let state_dir = absolute_path(&state_dir)?;
     if install.backend == RegistrationBackend::Process {
         if install.rootfs.is_some() || install.image.is_some() {
             return Err("--rootfs and --image require --backend libkrun".into());
@@ -211,13 +217,13 @@ fn server_configuration(install: &InstallArgs) -> Result<ServerConfiguration, St
     }
 
     let mut environment = Vec::new();
-    let mut server_args = common_server_args(install, cache_dir, state_dir);
+    let mut server_args = common_server_args(install, cache_dir.clone(), state_dir);
     if let Some(rootfs) = &install.rootfs {
         environment.push(("MORAE_ROOTFS", rootfs.as_os_str().to_owned()));
     } else {
         let reference = match &install.image {
             Some(reference) => reference.clone(),
-            None => ImageCache::new(&install.cache_dir)
+            None => ImageCache::new(&cache_dir)
                 .default_reference()
                 .map_err(|error| error.to_string())?,
         };
@@ -342,8 +348,8 @@ mod tests {
             backend: RegistrationBackend::Libkrun,
             rootfs: Some("/rootfs".into()),
             image: None,
-            cache_dir: ".moraebox/cache".into(),
-            state_dir: ".moraebox/state".into(),
+            cache_dir: None,
+            state_dir: None,
             helper: None,
             libkrun: None,
             gvproxy: None,
@@ -367,8 +373,8 @@ mod tests {
 
     #[test]
     fn builds_codex_user_registration() {
-        let cache = env::current_dir().unwrap().join(".moraebox/cache");
-        let state = env::current_dir().unwrap().join(".moraebox/state");
+        let cache = resolve_cache_dir(None).unwrap();
+        let state = resolve_state_dir(None).unwrap();
         let plan =
             build_command_plan(&install_args(Agent::Codex), "/bin/morae-mcp".into()).unwrap();
         assert_eq!(plan.program, "codex");
@@ -400,8 +406,8 @@ mod tests {
 
     #[test]
     fn builds_claude_user_registration() {
-        let cache = env::current_dir().unwrap().join(".moraebox/cache");
-        let state = env::current_dir().unwrap().join(".moraebox/state");
+        let cache = resolve_cache_dir(None).unwrap();
+        let state = resolve_state_dir(None).unwrap();
         let plan =
             build_command_plan(&install_args(Agent::ClaudeCode), "/bin/morae-mcp".into()).unwrap();
         assert_eq!(plan.program, "claude");
@@ -453,10 +459,10 @@ mod tests {
     #[test]
     fn libkrun_registration_uses_python_default_without_a_rootfs() {
         let cache = TestCache::new("default");
-        let state = env::current_dir().unwrap().join(".moraebox/state");
+        let state = resolve_state_dir(None).unwrap();
         let mut install = install_args(Agent::Codex);
         install.rootfs = None;
-        install.cache_dir = cache.path.clone();
+        install.cache_dir = Some(cache.path.clone());
         let (environment, server_args) = server_configuration(&install).unwrap();
         assert!(environment.is_empty());
         assert_eq!(
@@ -486,7 +492,7 @@ mod tests {
         let mut install = install_args(Agent::ClaudeCode);
         install.rootfs = None;
         install.image = Some("debian:bookworm".into());
-        install.cache_dir = cache.path.clone();
+        install.cache_dir = Some(cache.path.clone());
         let (environment, server_args) = server_configuration(&install).unwrap();
         assert!(environment.is_empty());
         let rendered = string_args_from(&server_args);
@@ -507,6 +513,20 @@ mod tests {
         assert!(
             environment.contains(&("MORAE_GVPROXY_PATH", OsString::from("/opt/tools/gvproxy")))
         );
+    }
+
+    #[test]
+    fn explicit_relative_storage_paths_are_resolved_from_the_install_directory() {
+        let mut install = install_args(Agent::Codex);
+        install.cache_dir = Some("custom-cache".into());
+        install.state_dir = Some("custom-state".into());
+
+        let (_, server_args) = server_configuration(&install).unwrap();
+        let rendered = string_args_from(&server_args);
+        let current = env::current_dir().unwrap();
+
+        assert!(rendered.contains(&current.join("custom-cache").to_string_lossy().into_owned()));
+        assert!(rendered.contains(&current.join("custom-state").to_string_lossy().into_owned()));
     }
 
     #[test]

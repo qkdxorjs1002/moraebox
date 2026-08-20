@@ -13,7 +13,9 @@ use clap::{Args, Parser, Subcommand};
 use moraebox_box::{
     BaseDiskSpec, BaseDiskStore, BoxMetadata, BoxStore, CreateBox, EphemeralDiskStore,
 };
-use moraebox_core::{BoxId, OutputChannel, RunSpec, TimeoutPolicy};
+use moraebox_core::{
+    BoxId, OutputChannel, RunSpec, TimeoutPolicy, resolve_cache_dir, resolve_state_dir,
+};
 use moraebox_image::{
     CacheUsage, CachedImage, CleanReport, Credentials, ImageCache, Platform, PreparedImage,
     PruneReport, RemoveReport, WorkspaceSnapshot, digest_tree,
@@ -145,11 +147,12 @@ struct RunArgs {
     /// Host directory to copy into an immutable read-only ext4 guest workspace.
     #[arg(long)]
     workspace: Option<PathBuf>,
-    #[arg(long, default_value = ".moraebox/cache")]
-    cache_dir: PathBuf,
-    /// Persistent Box metadata root; intentionally separate from the disposable cache.
-    #[arg(long, default_value = ".moraebox/state")]
-    state_dir: PathBuf,
+    /// Cache root; defaults to ~/.moraebox/cache.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
     #[arg(long, env = "MORAE_REGISTRY_USERNAME", requires = "registry_password")]
     registry_username: Option<String>,
     #[arg(
@@ -200,10 +203,12 @@ struct BoxCreateArgs {
     /// OCI registry reference; uses the configured default when omitted.
     #[arg(long)]
     image: Option<String>,
-    #[arg(long, default_value = ".moraebox/cache")]
-    cache_dir: PathBuf,
-    #[arg(long, default_value = ".moraebox/state")]
-    state_dir: PathBuf,
+    /// Cache root; defaults to ~/.moraebox/cache.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
     #[arg(long, default_value = "8GiB", value_parser = parse_disk_size)]
     disk_size: u64,
     #[arg(long, env = "MORAE_MKE2FS")]
@@ -223,8 +228,9 @@ struct BoxCreateArgs {
 
 #[derive(Debug, Args)]
 struct BoxListArgs {
-    #[arg(long, default_value = ".moraebox/state")]
-    state_dir: PathBuf,
+    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
     #[arg(long)]
     json: bool,
 }
@@ -232,8 +238,9 @@ struct BoxListArgs {
 #[derive(Debug, Args)]
 struct BoxShowArgs {
     box_id: BoxId,
-    #[arg(long, default_value = ".moraebox/state")]
-    state_dir: PathBuf,
+    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
     #[arg(long)]
     json: bool,
 }
@@ -241,8 +248,9 @@ struct BoxShowArgs {
 #[derive(Debug, Args)]
 struct BoxDeleteArgs {
     box_id: BoxId,
-    #[arg(long, default_value = ".moraebox/state")]
-    state_dir: PathBuf,
+    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
     /// Confirm permanent deletion of the Box disk.
     #[arg(long, required = true)]
     yes: bool,
@@ -253,10 +261,12 @@ struct BoxDeleteArgs {
 #[derive(Debug, Args)]
 struct BoxResetArgs {
     box_id: BoxId,
-    #[arg(long, default_value = ".moraebox/cache")]
-    cache_dir: PathBuf,
-    #[arg(long, default_value = ".moraebox/state")]
-    state_dir: PathBuf,
+    /// Cache root; defaults to ~/.moraebox/cache.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
     /// Confirm replacement of every change in the Box disk.
     #[arg(long, required = true)]
     yes: bool,
@@ -267,8 +277,9 @@ struct BoxResetArgs {
 #[derive(Debug, Args)]
 struct BoxCloneArgs {
     box_id: BoxId,
-    #[arg(long, default_value = ".moraebox/state")]
-    state_dir: PathBuf,
+    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
     /// Confirm creation of a new durable Box disk.
     #[arg(long, required = true)]
     yes: bool,
@@ -279,8 +290,9 @@ struct BoxCloneArgs {
 #[derive(Debug, Args)]
 struct ImagePullArgs {
     reference: String,
-    #[arg(long, default_value = ".moraebox/cache")]
-    cache_dir: PathBuf,
+    /// Cache root; defaults to ~/.moraebox/cache.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
     #[arg(long, default_value = "linux")]
     os: String,
     #[arg(long)]
@@ -300,8 +312,9 @@ struct ImagePullArgs {
 
 #[derive(Debug, Args)]
 struct ImageListArgs {
-    #[arg(long, default_value = ".moraebox/cache")]
-    cache_dir: PathBuf,
+    /// Cache root; defaults to ~/.moraebox/cache.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
     #[arg(long)]
     json: bool,
 }
@@ -310,8 +323,9 @@ struct ImageListArgs {
 struct ImageRemoveArgs {
     /// Registry reference or sha256 manifest digest.
     target: String,
-    #[arg(long, default_value = ".moraebox/cache")]
-    cache_dir: PathBuf,
+    /// Cache root; defaults to ~/.moraebox/cache.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
     /// Show what would be removed without changing the cache.
     #[arg(long)]
     dry_run: bool,
@@ -327,24 +341,27 @@ struct ImageDefaultArgs {
     /// Remove the override and return to the built-in python:3.12 default.
     #[arg(long)]
     unset: bool,
-    #[arg(long, default_value = ".moraebox/cache")]
-    cache_dir: PathBuf,
+    /// Cache root; defaults to ~/.moraebox/cache.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Debug, Args)]
 struct CacheInfoArgs {
-    #[arg(long, default_value = ".moraebox/cache")]
-    cache_dir: PathBuf,
+    /// Cache root; defaults to ~/.moraebox/cache.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Debug, Args)]
 struct CachePruneArgs {
-    #[arg(long, default_value = ".moraebox/cache")]
-    cache_dir: PathBuf,
+    /// Cache root; defaults to ~/.moraebox/cache.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
     /// Show what would be removed without changing the cache.
     #[arg(long, conflicts_with = "yes")]
     dry_run: bool,
@@ -358,8 +375,9 @@ struct CachePruneArgs {
 #[derive(Debug, Args)]
 #[allow(clippy::struct_excessive_bools)]
 struct CacheCleanArgs {
-    #[arg(long, default_value = ".moraebox/cache")]
-    cache_dir: PathBuf,
+    /// Cache root; defaults to ~/.moraebox/cache.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
     /// Confirm that every managed cache category is in scope.
     #[arg(long, required = true)]
     all: bool,
@@ -390,10 +408,12 @@ struct BenchmarkArgs {
     image: Option<String>,
     #[arg(long = "box", conflicts_with_all = ["rootfs", "image"])]
     box_id: Option<BoxId>,
-    #[arg(long, default_value = ".moraebox/cache")]
-    cache_dir: PathBuf,
-    #[arg(long, default_value = ".moraebox/state")]
-    state_dir: PathBuf,
+    /// Cache root; defaults to ~/.moraebox/cache.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
     #[arg(long, env = "MORAE_MKE2FS")]
     mke2fs: Option<PathBuf>,
     #[arg(long, env = "MORAE_E2FSCK")]
@@ -574,6 +594,12 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
         return Err("--box cannot be combined with --rootfs, --image, or --workspace".into());
     }
     validate_network_option(&args.backend, spec.network)?;
+    let cache_dir = (args.backend == "libkrun")
+        .then(|| resolve_cache_dir(args.cache_dir.as_deref()))
+        .transpose()?;
+    let state_dir = (args.backend == "libkrun")
+        .then(|| resolve_state_dir(args.state_dir.as_deref()))
+        .transpose()?;
     let image_reference = if spec.box_id.is_some() {
         None
     } else {
@@ -581,15 +607,18 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
             &args.backend,
             args.rootfs.is_some(),
             args.image,
-            &args.cache_dir,
+            cache_dir.as_deref(),
         )?
     };
     let platform = Platform::host_linux();
     let prepared_image = if let Some(reference) = image_reference.as_deref() {
+        let cache_dir = cache_dir
+            .as_deref()
+            .ok_or("libkrun image selection requires a cache directory")?;
         Some(
             resolve_or_pull(
                 reference,
-                &args.cache_dir,
+                cache_dir,
                 &platform,
                 credentials(args.registry_username, args.registry_password),
             )
@@ -607,7 +636,10 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
         if spec.cwd.is_some() {
             return Err("--cwd and --workspace cannot be combined in this version".into());
         }
-        Some(WorkspaceSnapshot::create(source, &args.cache_dir, &mke2fs)?)
+        let cache_dir = cache_dir
+            .as_deref()
+            .ok_or("--workspace requires a cache directory")?;
+        Some(WorkspaceSnapshot::create(source, cache_dir, &mke2fs)?)
     } else {
         None
     };
@@ -615,6 +647,12 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let report = match args.backend.as_str() {
         "process" => Supervisor::new(ProcessBackend).run(spec).await?,
         "libkrun" => {
+            let cache_dir = cache_dir
+                .as_deref()
+                .ok_or("libkrun backend requires a cache directory")?;
+            let state_dir = state_dir
+                .as_deref()
+                .ok_or("libkrun backend requires a state directory")?;
             let root_source = if spec.box_id.is_some() {
                 None
             } else if let Some(prepared) = prepared_image.as_ref() {
@@ -652,12 +690,12 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
             config.workspace_disk = workspace
                 .as_ref()
                 .map(|snapshot| snapshot.image_path.clone());
-            config.network_runtime_dir = args.cache_dir.join("network");
-            let ephemeral_disks = EphemeralDiskStore::new(args.cache_dir.join("runtime"));
+            config.network_runtime_dir = cache_dir.join("network");
+            let ephemeral_disks = EphemeralDiskStore::new(cache_dir.join("runtime"));
             let _ = ephemeral_disks.garbage_collect()?;
             let runtime = BoxRuntimeConfig {
-                boxes: BoxStore::new(args.state_dir),
-                base_disks: BaseDiskStore::new(&args.cache_dir),
+                boxes: BoxStore::new(state_dir),
+                base_disks: BaseDiskStore::new(cache_dir),
                 ephemeral_disks,
                 source: root_source,
                 e2fsck_path: args.e2fsck.unwrap_or_else(default_e2fsck),
@@ -700,7 +738,7 @@ fn select_image_reference(
     backend: &str,
     has_rootfs: bool,
     explicit_image: Option<String>,
-    cache_dir: &std::path::Path,
+    cache_dir: Option<&std::path::Path>,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     if backend != "libkrun" {
         if has_rootfs {
@@ -714,6 +752,7 @@ fn select_image_reference(
     if has_rootfs {
         return Ok(None);
     }
+    let cache_dir = cache_dir.ok_or("libkrun image selection requires a cache directory")?;
     explicit_image
         .map_or_else(
             || ImageCache::new(cache_dir).default_reference().map(Some),
@@ -735,7 +774,9 @@ async fn resolve_or_pull(
 }
 
 async fn box_create(args: BoxCreateArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let cache = ImageCache::new(&args.cache_dir);
+    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+    let cache = ImageCache::new(&cache_dir);
     let reference = match args.image {
         Some(reference) => reference,
         None => cache.default_reference()?,
@@ -753,12 +794,12 @@ async fn box_create(args: BoxCreateArgs) -> Result<i32, Box<dyn std::error::Erro
         platform_name(&platform),
         args.disk_size,
     );
-    let base = BaseDiskStore::new(&args.cache_dir).prepare(
+    let base = BaseDiskStore::new(&cache_dir).prepare(
         &spec,
         &prepared.rootfs,
         &args.mke2fs.unwrap_or_else(default_mke2fs),
     )?;
-    let metadata = BoxStore::new(args.state_dir).create(
+    let metadata = BoxStore::new(state_dir).create(
         &CreateBox::new(
             prepared.manifest_digest,
             platform_name(&platform),
@@ -771,7 +812,8 @@ async fn box_create(args: BoxCreateArgs) -> Result<i32, Box<dyn std::error::Erro
 }
 
 fn box_list(args: &BoxListArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let boxes = BoxStore::new(&args.state_dir).list()?;
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+    let boxes = BoxStore::new(state_dir).list()?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&boxes)?);
     } else {
@@ -792,14 +834,16 @@ fn box_list(args: &BoxListArgs) -> Result<i32, Box<dyn std::error::Error>> {
 }
 
 fn box_show(args: &BoxShowArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let metadata = BoxStore::new(&args.state_dir).get(args.box_id)?;
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+    let metadata = BoxStore::new(state_dir).get(args.box_id)?;
     print_box_result(&metadata, args.json)?;
     Ok(0)
 }
 
 fn box_delete(args: &BoxDeleteArgs) -> Result<i32, Box<dyn std::error::Error>> {
     debug_assert!(args.yes, "clap requires --yes");
-    let metadata = BoxStore::new(&args.state_dir).delete(args.box_id)?;
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+    let metadata = BoxStore::new(state_dir).delete(args.box_id)?;
     if args.json {
         println!(
             "{}",
@@ -817,14 +861,16 @@ fn box_delete(args: &BoxDeleteArgs) -> Result<i32, Box<dyn std::error::Error>> {
 
 fn box_reset(args: &BoxResetArgs) -> Result<i32, Box<dyn std::error::Error>> {
     debug_assert!(args.yes, "clap requires --yes");
-    let store = BoxStore::new(&args.state_dir);
+    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+    let store = BoxStore::new(state_dir);
     let current = store.get(args.box_id)?;
     let spec = BaseDiskSpec::new(
         current.manifest_digest.clone(),
         current.platform.clone(),
         current.virtual_size_bytes,
     );
-    let base = BaseDiskStore::new(&args.cache_dir)
+    let base = BaseDiskStore::new(cache_dir)
         .get(&spec)?
         .ok_or_else(|| {
             format!(
@@ -839,7 +885,8 @@ fn box_reset(args: &BoxResetArgs) -> Result<i32, Box<dyn std::error::Error>> {
 
 fn box_clone(args: &BoxCloneArgs) -> Result<i32, Box<dyn std::error::Error>> {
     debug_assert!(args.yes, "clap requires --yes");
-    let metadata = BoxStore::new(&args.state_dir).clone_box(args.box_id)?;
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+    let metadata = BoxStore::new(state_dir).clone_box(args.box_id)?;
     print_box_result(&metadata, args.json)?;
     Ok(0)
 }
@@ -859,6 +906,7 @@ fn print_box_result(metadata: &BoxMetadata, json: bool) -> Result<(), Box<dyn st
 }
 
 async fn image_pull(args: ImagePullArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
     let platform = Platform {
         os: args.os,
         architecture: args
@@ -868,7 +916,7 @@ async fn image_pull(args: ImagePullArgs) -> Result<i32, Box<dyn std::error::Erro
     };
     let prepared = pull_and_materialize(
         &args.reference,
-        &args.cache_dir,
+        &cache_dir,
         &platform,
         credentials(args.registry_username, args.registry_password),
     )
@@ -896,7 +944,8 @@ async fn pull_and_materialize(
 }
 
 fn image_list(args: &ImageListArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let images = ImageCache::new(&args.cache_dir).list()?;
+    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+    let images = ImageCache::new(cache_dir).list()?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&images)?);
     } else {
@@ -906,7 +955,8 @@ fn image_list(args: &ImageListArgs) -> Result<i32, Box<dyn std::error::Error>> {
 }
 
 fn image_remove(args: &ImageRemoveArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let report = ImageCache::new(&args.cache_dir).remove(&args.target, !args.dry_run)?;
+    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+    let report = ImageCache::new(cache_dir).remove(&args.target, !args.dry_run)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -916,7 +966,8 @@ fn image_remove(args: &ImageRemoveArgs) -> Result<i32, Box<dyn std::error::Error
 }
 
 fn image_default(args: &ImageDefaultArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let cache = ImageCache::new(&args.cache_dir);
+    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+    let cache = ImageCache::new(cache_dir);
     let reference = if args.unset {
         cache.clear_default()?;
         cache.default_reference()?
@@ -989,7 +1040,8 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn cache_info(args: &CacheInfoArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let usage = ImageCache::new(&args.cache_dir).usage()?;
+    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+    let usage = ImageCache::new(cache_dir).usage()?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&usage)?);
     } else {
@@ -1000,7 +1052,8 @@ fn cache_info(args: &CacheInfoArgs) -> Result<i32, Box<dyn std::error::Error>> {
 
 fn cache_prune(args: &CachePruneArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let apply = destructive_mode(args.dry_run, args.yes, "cache prune")?;
-    let report = ImageCache::new(&args.cache_dir).prune(apply)?;
+    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+    let report = ImageCache::new(cache_dir).prune(apply)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -1012,7 +1065,8 @@ fn cache_prune(args: &CachePruneArgs) -> Result<i32, Box<dyn std::error::Error>>
 fn cache_clean(args: &CacheCleanArgs) -> Result<i32, Box<dyn std::error::Error>> {
     debug_assert!(args.all, "clap requires --all");
     let apply = destructive_mode(args.dry_run, args.yes, "cache clean --all")?;
-    let report = ImageCache::new(&args.cache_dir).clean(apply)?;
+    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+    let report = ImageCache::new(cache_dir).clean(apply)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -1099,9 +1153,11 @@ async fn benchmark(args: BenchmarkArgs) -> Result<i32, Box<dyn std::error::Error
             .await?
         }
         "libkrun" => {
+            let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+            let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
             let platform = Platform::host_linux();
             let prepared_image = if args.box_id.is_none() && args.rootfs.is_none() {
-                let cache = ImageCache::new(&args.cache_dir);
+                let cache = ImageCache::new(&cache_dir);
                 let reference = match args.image {
                     Some(reference) => reference,
                     None => cache.default_reference()?,
@@ -1153,12 +1209,12 @@ async fn benchmark(args: BenchmarkArgs) -> Result<i32, Box<dyn std::error::Error
             )?;
             config.vcpus = args.cpus;
             config.memory_mib = args.memory_mib;
-            config.network_runtime_dir = args.cache_dir.join("network");
-            let ephemeral_disks = EphemeralDiskStore::new(args.cache_dir.join("runtime"));
+            config.network_runtime_dir = cache_dir.join("network");
+            let ephemeral_disks = EphemeralDiskStore::new(cache_dir.join("runtime"));
             let _ = ephemeral_disks.garbage_collect()?;
             let runtime = BoxRuntimeConfig {
-                boxes: BoxStore::new(args.state_dir),
-                base_disks: BaseDiskStore::new(&args.cache_dir),
+                boxes: BoxStore::new(state_dir),
+                base_disks: BaseDiskStore::new(&cache_dir),
                 ephemeral_disks,
                 source: root_source,
                 e2fsck_path: args.e2fsck.unwrap_or_else(default_e2fsck),
@@ -1513,6 +1569,33 @@ mod tests {
     }
 
     #[test]
+    fn storage_paths_are_optional_explicit_overrides() {
+        let default = Cli::try_parse_from(["morae", "run", "--", "/bin/true"]).unwrap();
+        let Command::Run(default) = default.command else {
+            panic!("expected run command");
+        };
+        assert!(default.cache_dir.is_none());
+        assert!(default.state_dir.is_none());
+
+        let explicit = Cli::try_parse_from([
+            "morae",
+            "run",
+            "--cache-dir",
+            "custom-cache",
+            "--state-dir",
+            "custom-state",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let Command::Run(explicit) = explicit.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(explicit.cache_dir, Some("custom-cache".into()));
+        assert_eq!(explicit.state_dir, Some("custom-state".into()));
+    }
+
+    #[test]
     fn parses_environment_without_shell_expansion() {
         assert_eq!(
             parse_env("A=hello world").unwrap(),
@@ -1681,27 +1764,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cache_dir);
 
         assert_eq!(
-            select_image_reference("process", false, None, &cache_dir).unwrap(),
+            select_image_reference("process", false, None, Some(&cache_dir)).unwrap(),
             None
         );
         assert_eq!(
-            select_image_reference("process", true, None, &cache_dir)
+            select_image_reference("process", true, None, Some(&cache_dir))
                 .unwrap_err()
                 .to_string(),
             "--rootfs requires --backend libkrun"
         );
         assert_eq!(
-            select_image_reference("libkrun", true, None, &cache_dir).unwrap(),
+            select_image_reference("libkrun", true, None, Some(&cache_dir)).unwrap(),
             None
         );
         assert_eq!(
-            select_image_reference("libkrun", false, Some("debian:bookworm".into()), &cache_dir)
-                .unwrap()
-                .as_deref(),
+            select_image_reference(
+                "libkrun",
+                false,
+                Some("debian:bookworm".into()),
+                Some(&cache_dir),
+            )
+            .unwrap()
+            .as_deref(),
             Some("debian:bookworm")
         );
         assert_eq!(
-            select_image_reference("libkrun", false, None, &cache_dir)
+            select_image_reference("libkrun", false, None, Some(&cache_dir))
                 .unwrap()
                 .as_deref(),
             Some("docker.io/library/python:3.12")
@@ -1711,7 +1799,7 @@ mod tests {
             .set_default("debian:bookworm")
             .unwrap();
         assert_eq!(
-            select_image_reference("libkrun", false, None, &cache_dir)
+            select_image_reference("libkrun", false, None, Some(&cache_dir))
                 .unwrap()
                 .as_deref(),
             Some("docker.io/library/debian:bookworm")

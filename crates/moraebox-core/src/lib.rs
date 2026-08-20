@@ -5,6 +5,7 @@
 mod output;
 mod spec;
 mod state;
+mod storage;
 
 pub use output::{OutputBuffer, OutputChannel, OutputChunk, OutputRead, OutputReadError};
 pub use spec::{
@@ -12,3 +13,4 @@ pub use spec::{
     TimeoutPolicy,
 };
 pub use state::{Lifecycle, LifecycleError, LifecycleEvent, SessionState, TerminationReason};
+pub use storage::{StoragePathError, StoragePaths, resolve_cache_dir, resolve_state_dir};

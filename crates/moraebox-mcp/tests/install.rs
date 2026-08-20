@@ -1,5 +1,6 @@
 use std::process::{Command, Output};
 
+use moraebox_core::{resolve_cache_dir, resolve_state_dir};
 use serde_json::{Value, json};
 
 fn run_mcp(args: &[&str]) -> Output {
@@ -41,8 +42,8 @@ fn dry_run(agent: &str) -> Value {
 
 #[test]
 fn codex_dry_run_uses_official_stdio_cli_shape() {
-    let cache = std::env::current_dir().unwrap().join(".moraebox/cache");
-    let state = std::env::current_dir().unwrap().join(".moraebox/state");
+    let cache = resolve_cache_dir(None).unwrap();
+    let state = resolve_state_dir(None).unwrap();
     assert_eq!(
         dry_run("codex"),
         json!({
@@ -64,8 +65,8 @@ fn codex_dry_run_uses_official_stdio_cli_shape() {
 
 #[test]
 fn claude_dry_run_is_user_scoped_and_uses_stdio() {
-    let cache = std::env::current_dir().unwrap().join(".moraebox/cache");
-    let state = std::env::current_dir().unwrap().join(".moraebox/state");
+    let cache = resolve_cache_dir(None).unwrap();
+    let state = resolve_state_dir(None).unwrap();
     assert_eq!(
         dry_run("claude-code"),
         json!({
@@ -90,8 +91,8 @@ fn claude_dry_run_is_user_scoped_and_uses_stdio() {
 
 #[test]
 fn process_dry_run_warns_and_never_claims_isolation() {
-    let cache = std::env::current_dir().unwrap().join(".moraebox/cache");
-    let state = std::env::current_dir().unwrap().join(".moraebox/state");
+    let cache = resolve_cache_dir(None).unwrap();
+    let state = resolve_state_dir(None).unwrap();
     let output = run_mcp(&[
         "install",
         "codex",

@@ -174,7 +174,9 @@ morae cache clean --all --dry-run
 morae cache clean --all --yes
 ```
 
-Destructive cache operations require either `--dry-run` or `--yes`; durable Box mutations require `--yes`. `morae cache clean` removes rebuildable image, immutable base-disk, and ephemeral data, but never persistent Box disks under `.moraebox/state`. Image, Box, and cache commands support `--json` where structured output is useful.
+By default, every command uses the user-wide `~/.moraebox/cache` and `~/.moraebox/state` directories, independent of the current working directory. Use `--cache-dir` or `--state-dir` only when a command should use another location. Existing project-local data is not moved automatically; for example, continue using it with `morae box list --state-dir .moraebox/state`.
+
+Destructive cache operations require either `--dry-run` or `--yes`; durable Box mutations require `--yes`. `morae cache clean` removes rebuildable image, immutable base-disk, and ephemeral data, but never persistent Box disks under `~/.moraebox/state`. Image, Box, and cache commands support `--json` where structured output is useful.
 
 ### Exercise the lifecycle without isolation
 
@@ -211,7 +213,7 @@ Preview the exact command and argv without changing agent configuration:
 morae-mcp install codex --dry-run
 ```
 
-The installer uses the agent's official CLI and does not edit configuration files directly. Use `--image`, `--cache-dir`, `--state-dir`, `--disk-size`, `--cpus`, `--memory-mib`, or `--gvproxy` to customize the registration. For lifecycle testing without isolation, opt in with `--backend process`.
+The installer uses the agent's official CLI and does not edit configuration files directly. It registers the resolved user-wide cache and state paths by default. Use `--image`, `--cache-dir`, `--state-dir`, `--disk-size`, `--cpus`, `--memory-mib`, or `--gvproxy` to customize the registration. For lifecycle testing without isolation, opt in with `--backend process`.
 
 The server exposes execution tools plus persistent Box management:
 

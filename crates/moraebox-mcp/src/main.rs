@@ -7,7 +7,10 @@ use std::{ffi::OsString, path::PathBuf, process::ExitCode, str::FromStr, sync::A
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand};
 use moraebox_box::{BaseDiskSpec, BaseDiskStore, BoxStore, CreateBox, EphemeralDiskStore};
-use moraebox_core::{BoxId, OutputChunk, RunSpec, SessionId, Signal, TimeoutPolicy};
+use moraebox_core::{
+    BoxId, OutputChunk, RunSpec, SessionId, Signal, TimeoutPolicy, resolve_cache_dir,
+    resolve_state_dir,
+};
 use moraebox_image::{Credentials, ImageCache, Platform, digest_tree};
 use moraebox_runtime::{
     Backend, BoxRootSource, BoxRuntimeConfig, LibkrunBackend, LibkrunConfig, NativeRuntimePaths,
@@ -65,11 +68,12 @@ struct ServerArgs {
     /// OCI image reference. Uses the configured default image when omitted.
     #[arg(long, conflicts_with = "rootfs")]
     image: Option<String>,
-    #[arg(long, default_value = ".moraebox/cache")]
-    cache_dir: PathBuf,
-    /// Persistent Box metadata root; intentionally separate from the disposable cache.
-    #[arg(long, default_value = ".moraebox/state")]
-    state_dir: PathBuf,
+    /// Cache root; defaults to ~/.moraebox/cache.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
     #[arg(long, env = "MORAE_REGISTRY_USERNAME", requires = "registry_password")]
     registry_username: Option<String>,
     #[arg(
@@ -166,14 +170,16 @@ fn should_show_bare_help(raw_args: &[OsString], parsed: &Args) -> bool {
 
 #[allow(clippy::too_many_lines)]
 async fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error::Error>> {
+    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     let platform = Platform::host_linux();
-    let images = ImageCache::new(&args.cache_dir);
+    let images = ImageCache::new(&cache_dir);
     let credentials = args
         .registry_username
         .zip(args.registry_password)
         .map(|(username, password)| Credentials { username, password });
-    let box_store = BoxStore::new(&args.state_dir);
-    let base_disks = BaseDiskStore::new(&args.cache_dir);
+    let box_store = BoxStore::new(&state_dir);
+    let base_disks = BaseDiskStore::new(&cache_dir);
     let mke2fs_path = args.mke2fs.unwrap_or_else(default_mke2fs);
     let backend: Arc<dyn Backend> = match args.backend.as_str() {
         "process" => {
@@ -222,10 +228,10 @@ async fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error
             let mut config = LibkrunConfig::new(helper, library, &root_source.rootfs_path);
             config.library_search_path = paths.library_search_path;
             config.gvproxy_path = paths.gvproxy;
-            config.network_runtime_dir = args.cache_dir.join("network");
+            config.network_runtime_dir = cache_dir.join("network");
             config.vcpus = args.cpus;
             config.memory_mib = args.memory_mib;
-            let ephemeral_disks = EphemeralDiskStore::new(args.cache_dir.join("runtime"));
+            let ephemeral_disks = EphemeralDiskStore::new(cache_dir.join("runtime"));
             let _ = ephemeral_disks.garbage_collect()?;
             Arc::new(
                 LibkrunBackend::new(config).with_box_runtime(BoxRuntimeConfig {
@@ -1094,6 +1100,8 @@ mod tests {
         let raw_args = [OsString::from("morae-mcp")];
         let mut configured = Args::try_parse_from(["morae-mcp"]).unwrap();
         assert_eq!(configured.server.backend, "libkrun");
+        assert!(configured.server.cache_dir.is_none());
+        assert!(configured.server.state_dir.is_none());
         assert!(should_show_bare_help(&raw_args, &configured));
         configured.server.rootfs = Some("rootfs".into());
         assert!(!should_show_bare_help(&raw_args, &configured));
@@ -1106,6 +1114,19 @@ mod tests {
 
         let process = parse_args_from(["morae-mcp", "--backend", "process"]).unwrap();
         assert_eq!(process.server.backend, "process");
+
+        let explicit = parse_args_from([
+            "morae-mcp",
+            "--cache-dir",
+            "custom-cache",
+            "--state-dir",
+            "custom-state",
+            "--image",
+            "python:3.12",
+        ])
+        .unwrap();
+        assert_eq!(explicit.server.cache_dir, Some("custom-cache".into()));
+        assert_eq!(explicit.server.state_dir, Some("custom-state".into()));
     }
 
     #[tokio::test]
@@ -1117,8 +1138,8 @@ mod tests {
             gvproxy: None,
             rootfs: Some("ignored-rootfs".into()),
             image: None,
-            cache_dir: ".moraebox/cache".into(),
-            state_dir: ".moraebox/state".into(),
+            cache_dir: Some(".moraebox/cache".into()),
+            state_dir: Some(".moraebox/state".into()),
             registry_username: None,
             registry_password: None,
             lib_dir: None,
@@ -1165,8 +1186,8 @@ mod tests {
             gvproxy: None,
             rootfs: None,
             image: Some("python:3.12".into()),
-            cache_dir: cache_dir.clone(),
-            state_dir: cache_dir.join("state"),
+            cache_dir: Some(cache_dir.clone()),
+            state_dir: Some(cache_dir.join("state")),
             registry_username: None,
             registry_password: None,
             lib_dir: None,
