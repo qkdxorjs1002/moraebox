@@ -12,11 +12,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, mpsc, oneshot, watch},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     time::sleep,
 };
 
 use crate::{Backend, BackendError};
+
+const STDIN_QUEUE_ITEMS: usize = 32;
+const STDIN_QUEUE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct SessionManager {
@@ -28,7 +31,7 @@ impl SessionManager {
         Self { backend }
     }
 
-    pub async fn start(&self, spec: RunSpec) -> Result<SessionHandle, SessionError> {
+    pub async fn start(&self, mut spec: RunSpec) -> Result<SessionHandle, SessionError> {
         spec.validate().map_err(BackendError::InvalidSpec)?;
         let started = Instant::now();
         let spawned = self.backend.spawn(&spec).await?;
@@ -46,6 +49,17 @@ impl SessionManager {
         let output = Arc::new(Mutex::new(OutputBuffer::new(spec.output_limit)));
         let (output_cursor_sender, output_cursor_receiver) = watch::channel(0_u64);
         let (command_sender, command_receiver) = mpsc::channel(32);
+        let (stdin_sender, stdin_receiver) = mpsc::channel(STDIN_QUEUE_ITEMS);
+        let stdin_bytes = Arc::new(Semaphore::new(STDIN_QUEUE_BYTES));
+        let (stdin_shutdown_sender, stdin_shutdown_receiver) = watch::channel(false);
+        let initial_stdin = std::mem::take(&mut spec.stdin);
+        let stdin_task = tokio::spawn(pump_stdin(
+            spawned.stdin,
+            initial_stdin,
+            stdin_receiver,
+            stdin_shutdown_receiver,
+            Arc::clone(&stdin_bytes),
+        ));
         let stdout_task = tokio::spawn(pump_output(
             spawned.stdout,
             spawned.stdout_channel,
@@ -66,10 +80,11 @@ impl SessionManager {
         tokio::spawn(drive_session(
             spec,
             started,
-            spawned.stdin,
             spawned.exit,
             spawned.controller,
             command_receiver,
+            stdin_shutdown_sender,
+            stdin_task,
             status_sender,
             stdout_task,
             stderr_task,
@@ -80,6 +95,8 @@ impl SessionManager {
             output_cursor: output_cursor_receiver,
             status: status_receiver,
             commands: command_sender,
+            stdin: stdin_sender,
+            stdin_bytes,
         })
     }
 }
@@ -91,6 +108,8 @@ pub struct SessionHandle {
     output_cursor: watch::Receiver<u64>,
     status: watch::Receiver<SessionStatus>,
     commands: mpsc::Sender<SessionCommand>,
+    stdin: mpsc::Sender<StdinRequest>,
+    stdin_bytes: Arc<Semaphore>,
 }
 
 impl SessionHandle {
@@ -125,12 +144,40 @@ impl SessionHandle {
     }
 
     pub async fn write(&self, bytes: impl Into<Vec<u8>>) -> Result<(), SessionError> {
-        self.request(|reply| SessionCommand::Write(bytes.into(), reply))
+        let bytes = bytes.into();
+        if bytes.len() > STDIN_QUEUE_BYTES {
+            return Err(SessionError::StdinWriteTooLarge {
+                requested: bytes.len(),
+                maximum: STDIN_QUEUE_BYTES,
+            });
+        }
+        let permits = u32::try_from(bytes.len()).map_err(|_| SessionError::StdinWriteTooLarge {
+            requested: bytes.len(),
+            maximum: STDIN_QUEUE_BYTES,
+        })?;
+        let permit = Arc::clone(&self.stdin_bytes)
+            .acquire_many_owned(permits)
             .await
+            .map_err(|_| SessionError::SessionClosed)?;
+        let (reply, receiver) = oneshot::channel();
+        self.stdin
+            .send(StdinRequest::Write {
+                bytes,
+                permit,
+                reply,
+            })
+            .await
+            .map_err(|_| SessionError::SessionClosed)?;
+        receive_reply(receiver).await
     }
 
     pub async fn close_stdin(&self) -> Result<(), SessionError> {
-        self.request(SessionCommand::CloseStdin).await
+        let (reply, receiver) = oneshot::channel();
+        self.stdin
+            .send(StdinRequest::Close(reply))
+            .await
+            .map_err(|_| SessionError::SessionClosed)?;
+        receive_reply(receiver).await
     }
 
     pub async fn signal(&self, signal: Signal) -> Result<(), SessionError> {
@@ -177,33 +224,43 @@ impl SessionHandle {
     }
 }
 
+async fn receive_reply(
+    receiver: oneshot::Receiver<Result<(), String>>,
+) -> Result<(), SessionError> {
+    receiver
+        .await
+        .map_err(|_| SessionError::SessionClosed)?
+        .map_err(SessionError::Control)
+}
+
 enum SessionCommand {
-    Write(Vec<u8>, oneshot::Sender<Result<(), String>>),
-    CloseStdin(oneshot::Sender<Result<(), String>>),
     Signal(Signal, oneshot::Sender<Result<(), String>>),
     Resize(u16, u16, oneshot::Sender<Result<(), String>>),
     Stop(oneshot::Sender<Result<(), String>>),
+}
+
+enum StdinRequest {
+    Write {
+        bytes: Vec<u8>,
+        permit: OwnedSemaphorePermit,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Close(oneshot::Sender<Result<(), String>>),
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn drive_session(
     spec: RunSpec,
     started: Instant,
-    mut stdin: Option<crate::BoxedWriter>,
     mut exit: crate::backend::ExitFuture,
     controller: Box<dyn crate::BackendController>,
     mut commands: mpsc::Receiver<SessionCommand>,
+    stdin_shutdown: watch::Sender<bool>,
+    mut stdin_task: tokio::task::JoinHandle<std::io::Result<()>>,
     status_sender: watch::Sender<SessionStatus>,
     stdout_task: tokio::task::JoinHandle<std::io::Result<()>>,
     stderr_task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
 ) {
-    if !spec.stdin.is_empty()
-        && let Some(writer) = stdin.as_mut()
-        && let Err(error) = writer.write_all(&spec.stdin).await
-    {
-        publish_failure(&status_sender, &spec, started, error.to_string());
-        return;
-    }
     let mut deadline = spec
         .timeout
         .duration()
@@ -213,6 +270,7 @@ async fn drive_session(
     let mut timed_out = false;
     let mut commands_open = true;
     let mut shutdown_started = false;
+    let mut stdin_open = true;
 
     let exit_status = loop {
         tokio::select! {
@@ -223,6 +281,24 @@ async fn drive_session(
                     break None;
                 }
             },
+            result = &mut stdin_task, if stdin_open => {
+                stdin_open = false;
+                if flatten_stdin_task(result).is_err() {
+                    shutdown_started = true;
+                    reason = TerminationReason::Failed;
+                    publish_running_state(
+                        &status_sender,
+                        &spec,
+                        started,
+                        SessionState::Failed,
+                        reason,
+                        false,
+                    );
+                    deadline = None;
+                    let _ = controller.signal(Signal::Terminate).await;
+                    kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
+                }
+            }
             command = commands.recv(), if commands_open => {
                 let Some(command) = command else {
                     commands_open = false;
@@ -237,7 +313,7 @@ async fn drive_session(
                             reason,
                             false,
                         );
-                        drop(stdin.take());
+                        stdin_shutdown.send_replace(true);
                         let _ = controller.signal(Signal::Terminate).await;
                         kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
                         deadline = None;
@@ -247,22 +323,6 @@ async fn drive_session(
                     continue;
                 };
                 match command {
-                    SessionCommand::Write(bytes, reply) => {
-                        let result = if let Some(writer) = stdin.as_mut() {
-                            writer.write_all(&bytes).await.map_err(|error| error.to_string())
-                        } else {
-                            Err("stdin is closed".into())
-                        };
-                        let _ = reply.send(result);
-                    }
-                    SessionCommand::CloseStdin(reply) => {
-                        let result = if let Some(mut writer) = stdin.take() {
-                            writer.shutdown().await.map_err(|error| error.to_string())
-                        } else {
-                            Ok(())
-                        };
-                        let _ = reply.send(result);
-                    }
                     SessionCommand::Signal(signal, reply) => {
                         let result = controller.signal(signal).await.map_err(|error| error.to_string());
                         let _ = reply.send(result);
@@ -275,6 +335,7 @@ async fn drive_session(
                         shutdown_started = true;
                         reason = TerminationReason::Cancelled;
                         publish_running_state(&status_sender, &spec, started, SessionState::Stopping, reason, false);
+                        stdin_shutdown.send_replace(true);
                         let result = controller.signal(Signal::Terminate).await.map_err(|error| error.to_string());
                         if result.is_ok() {
                             kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
@@ -289,6 +350,7 @@ async fn drive_session(
                 timed_out = true;
                 reason = TerminationReason::TimedOut;
                 publish_running_state(&status_sender, &spec, started, SessionState::TimedOut, reason, true);
+                stdin_shutdown.send_replace(true);
                 let _ = controller.signal(Signal::Terminate).await;
                 kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
                 deadline = None;
@@ -299,7 +361,10 @@ async fn drive_session(
             }
         }
     };
-    drop(stdin);
+    stdin_shutdown.send_replace(true);
+    if stdin_open {
+        let _ = stdin_task.await;
+    }
     let _ = stdout_task.await;
     if let Some(task) = stderr_task {
         let _ = task.await;
@@ -366,6 +431,105 @@ fn publish_failure(
     });
 }
 
+fn flatten_stdin_task(
+    result: Result<std::io::Result<()>, tokio::task::JoinError>,
+) -> std::io::Result<()> {
+    result.map_err(|error| std::io::Error::other(format!("stdin task failed: {error}")))?
+}
+
+async fn pump_stdin(
+    mut writer: Option<crate::BoxedWriter>,
+    initial: Vec<u8>,
+    mut requests: mpsc::Receiver<StdinRequest>,
+    mut shutdown: watch::Receiver<bool>,
+    byte_budget: Arc<Semaphore>,
+) -> std::io::Result<()> {
+    let result = pump_stdin_inner(&mut writer, &initial, &mut requests, &mut shutdown).await;
+    requests.close();
+    byte_budget.close();
+    while let Ok(request) = requests.try_recv() {
+        reply_stdin_closed(request);
+    }
+    result
+}
+
+async fn pump_stdin_inner(
+    writer: &mut Option<crate::BoxedWriter>,
+    initial: &[u8],
+    requests: &mut mpsc::Receiver<StdinRequest>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    if writer.is_none() && !initial.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "backend stdin is unavailable",
+        ));
+    }
+    if !initial.is_empty()
+        && let Some(writer) = writer.as_mut()
+    {
+        tokio::select! {
+            biased;
+            () = stdin_shutdown(shutdown) => return Ok(()),
+            result = writer.write_all(initial) => result?,
+        }
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+            () = stdin_shutdown(shutdown) => return Ok(()),
+            request = requests.recv() => {
+                let Some(request) = request else {
+                    return Ok(());
+                };
+                match request {
+                    StdinRequest::Write { bytes, permit, reply } => {
+                        let result = if let Some(writer) = writer.as_mut() {
+                            tokio::select! {
+                                biased;
+                                () = stdin_shutdown(shutdown) => Err("stdin is closed".into()),
+                                result = writer.write_all(&bytes) => {
+                                    result.map_err(|error| error.to_string())
+                                },
+                            }
+                        } else {
+                            Err("stdin is closed".into())
+                        };
+                        let failed = result.is_err();
+                        let _ = reply.send(result);
+                        drop(permit);
+                        if failed {
+                            return Ok(());
+                        }
+                    }
+                    StdinRequest::Close(reply) => {
+                        let result = if let Some(mut writer) = writer.take() {
+                            writer.shutdown().await.map_err(|error| error.to_string())
+                        } else {
+                            Ok(())
+                        };
+                        let _ = reply.send(result);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn stdin_shutdown(receiver: &mut watch::Receiver<bool>) {
+    if !*receiver.borrow() {
+        let _ = receiver.changed().await;
+    }
+}
+
+fn reply_stdin_closed(request: StdinRequest) {
+    let reply = match request {
+        StdinRequest::Write { reply, .. } | StdinRequest::Close(reply) => reply,
+    };
+    let _ = reply.send(Err("stdin is closed".into()));
+}
+
 async fn pump_output<R>(
     mut reader: R,
     channel: OutputChannel,
@@ -427,6 +591,8 @@ pub enum SessionError {
     SessionClosed,
     #[error("session control failed: {0}")]
     Control(String),
+    #[error("stdin write is {requested} bytes, exceeding the {maximum}-byte queue limit")]
+    StdinWriteTooLarge { requested: usize, maximum: usize },
 }
 
 #[cfg(test)]
@@ -436,7 +602,7 @@ mod tests {
     #[cfg(unix)]
     use std::fs;
 
-    use moraebox_core::RunSpec;
+    use moraebox_core::{RunSpec, TimeoutPolicy};
 
     use super::*;
     use crate::ProcessBackend;
@@ -471,6 +637,79 @@ mod tests {
             status.termination_reason,
             Some(TerminationReason::Cancelled)
         );
+    }
+
+    #[tokio::test]
+    async fn initial_stdin_cannot_block_the_wall_timeout() {
+        let manager = SessionManager::new(Arc::new(ProcessBackend));
+        let mut spec = RunSpec::command(long_running_command());
+        spec.stdin = vec![b'x'; STDIN_QUEUE_BYTES * 4];
+        spec.timeout = TimeoutPolicy::Limited(50);
+        spec.kill_grace = Duration::from_millis(20);
+
+        let session = manager.start(spec).await.unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(2), session.wait())
+            .await
+            .expect("blocked initial stdin must not stop the wall timeout")
+            .unwrap();
+
+        assert!(status.timed_out);
+        assert_eq!(status.termination_reason, Some(TerminationReason::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn blocked_incremental_stdin_does_not_block_stop() {
+        let manager = SessionManager::new(Arc::new(ProcessBackend));
+        let mut spec = RunSpec::command(long_running_command());
+        spec.kill_grace = Duration::from_millis(20);
+        let session = manager.start(spec).await.unwrap();
+        assert_eq!(session.stdin.max_capacity(), STDIN_QUEUE_ITEMS);
+        let writer = session.clone();
+        let write = tokio::spawn(async move { writer.write(vec![b'x'; STDIN_QUEUE_BYTES]).await });
+        sleep(Duration::from_millis(50)).await;
+        assert!(!write.is_finished(), "test write must fill the guest pipe");
+        assert_eq!(session.stdin_bytes.available_permits(), 0);
+
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            session.stop().await.unwrap();
+            session.wait().await.unwrap()
+        })
+        .await
+        .expect("stop must remain responsive while stdin is blocked");
+        let write_result = tokio::time::timeout(Duration::from_secs(2), write)
+            .await
+            .expect("blocked write must be released during stop")
+            .unwrap();
+
+        assert_eq!(
+            status.termination_reason,
+            Some(TerminationReason::Cancelled)
+        );
+        assert!(write_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_a_single_write_larger_than_the_byte_budget() {
+        let manager = SessionManager::new(Arc::new(ProcessBackend));
+        let session = manager
+            .start(RunSpec::command(long_running_command()))
+            .await
+            .unwrap();
+
+        let error = session
+            .write(vec![0; STDIN_QUEUE_BYTES + 1])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionError::StdinWriteTooLarge {
+                requested,
+                maximum: STDIN_QUEUE_BYTES,
+            } if requested == STDIN_QUEUE_BYTES + 1
+        ));
+        session.stop().await.unwrap();
+        session.wait().await.unwrap();
     }
 
     #[cfg(unix)]

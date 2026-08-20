@@ -57,7 +57,7 @@
   - `commands.recv() == None`을 owner-loss 이벤트로 취급한다.
   - child/helper, network proxy, I/O pump, 임시 disk와 socket이 모두 회수되는 회귀 테스트를 추가한다.
 
-- [ ] stdin write가 timeout, stop, signal, process exit 처리를 막지 않도록 전용 bounded writer task/queue로 분리한다.
+- [x] stdin write가 timeout, stop, signal, process exit 처리를 막지 않도록 전용 bounded writer task/queue로 분리한다.
   - 초기 stdin을 쓰기 전부터 wall-clock deadline을 적용한다.
   - guest가 stdin을 읽지 않는 상태에서도 timeout과 `sandbox_stop`이 완료되어야 한다.
   - queue의 byte/item 상한과 backpressure 동작을 명시한다.
