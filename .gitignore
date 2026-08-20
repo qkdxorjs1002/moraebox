@@ -5,3 +5,4 @@ target/
 *.profraw
 *.trace.jsonl
 TODO.md
+.DS_Store
