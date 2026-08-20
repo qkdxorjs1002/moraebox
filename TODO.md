@@ -53,7 +53,7 @@
 
 ### Runtime lifecycle
 
-- [ ] session command channel의 owner가 사라지면 busy-loop하지 말고 즉시 stop·cleanup으로 수렴한다.
+- [x] session command channel의 owner가 사라지면 busy-loop하지 말고 즉시 stop·cleanup으로 수렴한다.
   - `commands.recv() == None`을 owner-loss 이벤트로 취급한다.
   - child/helper, network proxy, I/O pump, 임시 disk와 socket이 모두 회수되는 회귀 테스트를 추가한다.
 

@@ -1160,6 +1160,90 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn session_owner_loss_reaps_all_managed_native_resources() {
+        use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+
+        let fixture = ManagedFixture::new(
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nwhile :; do :; done\n",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let rootfs = fixture.state.path().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        fs::write(rootfs.join("payload"), b"rootfs").unwrap();
+        let mke2fs = fixture.state.path().join("mke2fs");
+        write_executable(&mke2fs, "#!/bin/sh\nexit 0\n");
+        let source = BoxRootSource {
+            rootfs_path: rootfs,
+            manifest_digest: "sha256:owner-loss".into(),
+            platform: "linux/arm64".into(),
+            virtual_size_bytes: MANAGED_TEST_DISK_BYTES,
+            mke2fs_path: mke2fs,
+        };
+        let runtime_root = fixture.state.path().join("runtime");
+        let network_runtime_dir = fixture.state.path().join("network");
+        let gvproxy = fixture.state.path().join("gvproxy");
+        write_executable(
+            &gvproxy,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nsocket=${2#unixgram://}\n: > \"$socket\"\nwhile :; do :; done\n",
+        );
+        let mut backend = fixture.backend(Some((source, runtime_root.clone())));
+        backend.config.gvproxy_path = Some(gvproxy.clone());
+        backend.config.network_runtime_dir = network_runtime_dir.clone();
+        let manager = crate::SessionManager::new(Arc::new(backend));
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.network = true;
+        spec.kill_grace = Duration::from_millis(20);
+        let session_id = spec.session_id;
+
+        let session = manager.start(spec).await.unwrap();
+        let helper_pid_path = fixture.helper.with_extension("pid");
+        let proxy_pid_path = gvproxy.with_extension("pid");
+        wait_for_paths([&helper_pid_path, &proxy_pid_path]).await;
+        let helper_pid = read_pid(&helper_pid_path);
+        let proxy_pid = read_pid(&proxy_pid_path);
+        let ephemeral_directory = runtime_root
+            .join("ephemeral-boxes")
+            .join(session_id.to_string());
+        assert!(ephemeral_directory.is_dir());
+        assert_eq!(fs::read_dir(&network_runtime_dir).unwrap().count(), 1);
+
+        drop(session);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let helper_gone = kill(Pid::from_raw(helper_pid), None) == Err(Errno::ESRCH);
+                let proxy_gone = kill(Pid::from_raw(proxy_pid), None) == Err(Errno::ESRCH);
+                let disk_gone = !ephemeral_directory.exists();
+                let network_gone =
+                    fs::read_dir(&network_runtime_dir).is_ok_and(|entries| entries.count() == 0);
+                if helper_gone && proxy_gone && disk_gone && network_gone {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owner loss must reap helper, proxy, disk, and socket state");
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_paths<const N: usize>(paths: [&Path; N]) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while paths.iter().any(|path| !path.exists()) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child process did not publish its pid");
+    }
+
+    #[cfg(unix)]
+    fn read_pid(path: &Path) -> i32 {
+        fs::read_to_string(path).unwrap().parse::<i32>().unwrap()
+    }
+
+    #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
         fs::write(path, contents).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();

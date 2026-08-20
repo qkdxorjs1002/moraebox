@@ -211,6 +211,8 @@ async fn drive_session(
     let mut kill_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut reason = TerminationReason::Exited;
     let mut timed_out = false;
+    let mut commands_open = true;
+    let mut shutdown_started = false;
 
     let exit_status = loop {
         tokio::select! {
@@ -221,8 +223,29 @@ async fn drive_session(
                     break None;
                 }
             },
-            command = commands.recv() => {
-                let Some(command) = command else { continue };
+            command = commands.recv(), if commands_open => {
+                let Some(command) = command else {
+                    commands_open = false;
+                    if !shutdown_started {
+                        shutdown_started = true;
+                        reason = TerminationReason::Cancelled;
+                        publish_running_state(
+                            &status_sender,
+                            &spec,
+                            started,
+                            SessionState::Stopping,
+                            reason,
+                            false,
+                        );
+                        drop(stdin.take());
+                        let _ = controller.signal(Signal::Terminate).await;
+                        kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
+                        deadline = None;
+                    } else if kill_deadline.is_none() {
+                        let _ = controller.force_stop().await;
+                    }
+                    continue;
+                };
                 match command {
                     SessionCommand::Write(bytes, reply) => {
                         let result = if let Some(writer) = stdin.as_mut() {
@@ -249,6 +272,7 @@ async fn drive_session(
                         let _ = reply.send(result);
                     }
                     SessionCommand::Stop(reply) => {
+                        shutdown_started = true;
                         reason = TerminationReason::Cancelled;
                         publish_running_state(&status_sender, &spec, started, SessionState::Stopping, reason, false);
                         let result = controller.signal(Signal::Terminate).await.map_err(|error| error.to_string());
@@ -261,6 +285,7 @@ async fn drive_session(
                 }
             }
             () = wait_timer(&mut deadline), if deadline.is_some() => {
+                shutdown_started = true;
                 timed_out = true;
                 reason = TerminationReason::TimedOut;
                 publish_running_state(&status_sender, &spec, started, SessionState::TimedOut, reason, true);
@@ -408,6 +433,9 @@ pub enum SessionError {
 mod tests {
     use std::sync::Arc;
 
+    #[cfg(unix)]
+    use std::fs;
+
     use moraebox_core::RunSpec;
 
     use super::*;
@@ -443,6 +471,52 @@ mod tests {
             status.termination_reason,
             Some(TerminationReason::Cancelled)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_last_handle_terminates_and_reaps_the_process() {
+        use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+
+        let state = tempfile::tempdir().unwrap();
+        let pid_path = state.path().join("child.pid");
+        let script = format!(
+            "printf '%s' \"$$\" > '{}'; while :; do :; done",
+            pid_path.display()
+        );
+        let manager = SessionManager::new(Arc::new(ProcessBackend));
+        let session = manager
+            .start(RunSpec::command(["/bin/sh", "-c", &script]))
+            .await
+            .unwrap();
+        let output = Arc::downgrade(&session.output);
+        wait_for_path(&pid_path).await;
+        let pid = fs::read_to_string(&pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+
+        drop(session);
+
+        let pid = Pid::from_raw(pid);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while kill(pid, None) != Err(Errno::ESRCH) || output.upgrade().is_some() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owner loss must terminate the process and output pumps");
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_path(path: &std::path::Path) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !path.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child did not publish its pid");
     }
 
     #[cfg(unix)]
