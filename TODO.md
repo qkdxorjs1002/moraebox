@@ -62,7 +62,7 @@
   - guest가 stdin을 읽지 않는 상태에서도 timeout과 `sandbox_stop`이 완료되어야 한다.
   - queue의 byte/item 상한과 backpressure 동작을 명시한다.
 
-- [ ] 모든 backend 오류 경로에 teardown guard와 hard cleanup deadline을 적용한다.
+- [x] 모든 backend 오류 경로에 teardown guard와 hard cleanup deadline을 적용한다.
   - TERM 실패 후에도 KILL/force-stop과 resource cleanup을 계속한다.
   - `force_stop`, exit wait, stdout/stderr pump 오류를 무시하지 않는다.
   - `dead`는 모든 host resource가 회수된 뒤에만 publish한다.

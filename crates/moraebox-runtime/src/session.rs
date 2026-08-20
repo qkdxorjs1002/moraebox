@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     process::ExitStatus,
     sync::Arc,
     time::{Duration, Instant},
@@ -13,7 +14,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
-    time::sleep,
+    time::{sleep, timeout},
 };
 
 use crate::{Backend, BackendError};
@@ -261,25 +262,36 @@ async fn drive_session(
     stdout_task: tokio::task::JoinHandle<std::io::Result<()>>,
     stderr_task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
 ) {
+    let mut controller = Some(controller);
     let mut deadline = spec
         .timeout
         .duration()
         .map(|duration| Box::pin(sleep(duration)));
     let mut kill_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    let mut cleanup_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut reason = TerminationReason::Exited;
     let mut timed_out = false;
+    let mut cleanup_failed = false;
     let mut commands_open = true;
     let mut shutdown_started = false;
     let mut stdin_open = true;
 
     let exit_status = loop {
         tokio::select! {
-            result = &mut exit => match result {
-                Ok(status) => break Some(status),
-                Err(error) => {
-                    publish_failure(&status_sender, &spec, started, error.to_string());
-                    break None;
-                }
+            result = &mut exit => if let Ok(status) = result {
+                break Some(status);
+            } else {
+                cleanup_failed = true;
+                reason = TerminationReason::Failed;
+                publish_running_state(
+                    &status_sender,
+                    &spec,
+                    started,
+                    SessionState::Failed,
+                    reason,
+                    timed_out,
+                );
+                break None;
             },
             result = &mut stdin_task, if stdin_open => {
                 stdin_open = false;
@@ -295,8 +307,23 @@ async fn drive_session(
                         false,
                     );
                     deadline = None;
-                    let _ = controller.signal(Signal::Terminate).await;
-                    kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
+                    let term_result = bounded_session_control(
+                        "TERM",
+                        spec.kill_grace,
+                        controller
+                            .as_deref()
+                            .expect("controller must exist before teardown")
+                            .signal(Signal::Terminate),
+                    )
+                    .await;
+                    if term_result.is_ok() {
+                        kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
+                    } else {
+                        cleanup_failed = true;
+                        let force_result = force_and_release(&mut controller, spec.kill_grace).await;
+                        cleanup_failed |= force_result.is_err();
+                        cleanup_deadline = Some(Box::pin(sleep(spec.kill_grace)));
+                    }
                 }
             }
             command = commands.recv(), if commands_open => {
@@ -314,21 +341,56 @@ async fn drive_session(
                             false,
                         );
                         stdin_shutdown.send_replace(true);
-                        let _ = controller.signal(Signal::Terminate).await;
-                        kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
+                        let term_result = bounded_session_control(
+                            "TERM",
+                            spec.kill_grace,
+                            controller
+                                .as_deref()
+                                .expect("controller must exist before teardown")
+                                .signal(Signal::Terminate),
+                        )
+                        .await;
+                        if term_result.is_ok() {
+                            kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
+                        } else {
+                            cleanup_failed = true;
+                            reason = TerminationReason::Failed;
+                            publish_running_state(
+                                &status_sender,
+                                &spec,
+                                started,
+                                SessionState::Failed,
+                                reason,
+                                false,
+                            );
+                            let force_result = force_and_release(&mut controller, spec.kill_grace).await;
+                            cleanup_failed |= force_result.is_err();
+                            cleanup_deadline = Some(Box::pin(sleep(spec.kill_grace)));
+                        }
                         deadline = None;
-                    } else if kill_deadline.is_none() {
-                        let _ = controller.force_stop().await;
+                    } else if kill_deadline.is_none()
+                        && cleanup_deadline.is_none()
+                        && controller.is_some()
+                    {
+                        let force_result = force_and_release(&mut controller, spec.kill_grace).await;
+                        cleanup_failed |= force_result.is_err();
+                        cleanup_deadline = Some(Box::pin(sleep(spec.kill_grace)));
                     }
                     continue;
                 };
                 match command {
                     SessionCommand::Signal(signal, reply) => {
-                        let result = controller.signal(signal).await.map_err(|error| error.to_string());
+                        let result = match controller.as_deref() {
+                            Some(controller) => controller.signal(signal).await.map_err(|error| error.to_string()),
+                            None => Err("session teardown is already forced".into()),
+                        };
                         let _ = reply.send(result);
                     }
                     SessionCommand::Resize(rows, columns, reply) => {
-                        let result = controller.resize(rows, columns).await.map_err(|error| error.to_string());
+                        let result = match controller.as_deref() {
+                            Some(controller) => controller.resize(rows, columns).await.map_err(|error| error.to_string()),
+                            None => Err("session teardown is already forced".into()),
+                        };
                         let _ = reply.send(result);
                     }
                     SessionCommand::Stop(reply) => {
@@ -336,9 +398,32 @@ async fn drive_session(
                         reason = TerminationReason::Cancelled;
                         publish_running_state(&status_sender, &spec, started, SessionState::Stopping, reason, false);
                         stdin_shutdown.send_replace(true);
-                        let result = controller.signal(Signal::Terminate).await.map_err(|error| error.to_string());
+                        let result = match controller.as_deref() {
+                            Some(controller) => bounded_session_control(
+                                "TERM",
+                                spec.kill_grace,
+                                controller.signal(Signal::Terminate),
+                            )
+                            .await,
+                            None => Err("session teardown is already forced".into()),
+                        };
                         if result.is_ok() {
                             kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
+                            deadline = None;
+                        } else if controller.is_some() {
+                            cleanup_failed = true;
+                            reason = TerminationReason::Failed;
+                            publish_running_state(
+                                &status_sender,
+                                &spec,
+                                started,
+                                SessionState::Failed,
+                                reason,
+                                false,
+                            );
+                            let force_result = force_and_release(&mut controller, spec.kill_grace).await;
+                            cleanup_failed |= force_result.is_err();
+                            cleanup_deadline = Some(Box::pin(sleep(spec.kill_grace)));
                             deadline = None;
                         }
                         let _ = reply.send(result);
@@ -351,23 +436,86 @@ async fn drive_session(
                 reason = TerminationReason::TimedOut;
                 publish_running_state(&status_sender, &spec, started, SessionState::TimedOut, reason, true);
                 stdin_shutdown.send_replace(true);
-                let _ = controller.signal(Signal::Terminate).await;
-                kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
+                let term_result = bounded_session_control(
+                    "TERM",
+                    spec.kill_grace,
+                    controller
+                        .as_deref()
+                        .expect("controller must exist before teardown")
+                        .signal(Signal::Terminate),
+                )
+                .await;
+                if term_result.is_ok() {
+                    kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
+                } else {
+                    cleanup_failed = true;
+                    reason = TerminationReason::Failed;
+                    publish_running_state(
+                        &status_sender,
+                        &spec,
+                        started,
+                        SessionState::Failed,
+                        reason,
+                        true,
+                    );
+                    let force_result = force_and_release(&mut controller, spec.kill_grace).await;
+                    cleanup_failed |= force_result.is_err();
+                    cleanup_deadline = Some(Box::pin(sleep(spec.kill_grace)));
+                }
                 deadline = None;
             }
             () = wait_timer(&mut kill_deadline), if kill_deadline.is_some() => {
-                let _ = controller.force_stop().await;
+                let force_result = force_and_release(&mut controller, spec.kill_grace).await;
+                if force_result.is_err() {
+                    cleanup_failed = true;
+                    reason = TerminationReason::Failed;
+                    publish_running_state(
+                        &status_sender,
+                        &spec,
+                        started,
+                        SessionState::Failed,
+                        reason,
+                        timed_out,
+                    );
+                }
                 kill_deadline = None;
+                cleanup_deadline = Some(Box::pin(sleep(spec.kill_grace)));
+            }
+            () = wait_timer(&mut cleanup_deadline), if cleanup_deadline.is_some() => {
+                cleanup_failed = true;
+                reason = TerminationReason::Failed;
+                publish_running_state(
+                    &status_sender,
+                    &spec,
+                    started,
+                    SessionState::Failed,
+                    reason,
+                    timed_out,
+                );
+                break None;
             }
         }
     };
     stdin_shutdown.send_replace(true);
     if stdin_open {
-        let _ = stdin_task.await;
+        cleanup_failed |= finish_session_io_task("stdin", stdin_task, spec.kill_grace)
+            .await
+            .is_err();
     }
-    let _ = stdout_task.await;
-    if let Some(task) = stderr_task {
-        let _ = task.await;
+    cleanup_failed |= !finish_session_output_tasks(stdout_task, stderr_task, spec.kill_grace)
+        .await
+        .is_empty();
+    drop(controller.take());
+    if cleanup_failed {
+        reason = TerminationReason::Failed;
+        publish_running_state(
+            &status_sender,
+            &spec,
+            started,
+            SessionState::Failed,
+            reason,
+            timed_out,
+        );
     }
     if let Some(status) = exit_status {
         let (exit_code, signal) = decode_exit_status(status);
@@ -382,6 +530,83 @@ async fn drive_session(
             timed_out,
             elapsed_micros: duration_micros(started.elapsed()),
         });
+    }
+}
+
+async fn bounded_session_control<F>(
+    operation: &'static str,
+    deadline: Duration,
+    future: F,
+) -> Result<(), String>
+where
+    F: Future<Output = Result<(), BackendError>>,
+{
+    match timeout(deadline, future).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("backend {operation} failed: {error}")),
+        Err(_) => Err(format!(
+            "backend {operation} did not complete within {deadline:?}"
+        )),
+    }
+}
+
+async fn force_and_release(
+    controller: &mut Option<Box<dyn crate::BackendController>>,
+    deadline: Duration,
+) -> Result<(), String> {
+    let result = match controller.as_deref() {
+        Some(controller) => {
+            bounded_session_control("force-stop", deadline, controller.force_stop()).await
+        }
+        None => Err("backend controller was already released".into()),
+    };
+    drop(controller.take());
+    result
+}
+
+async fn finish_session_output_tasks(
+    stdout: tokio::task::JoinHandle<std::io::Result<()>>,
+    stderr: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    deadline: Duration,
+) -> Vec<String> {
+    let stdout = finish_session_io_task("stdout", stdout, deadline);
+    let stderr = async {
+        match stderr {
+            Some(task) => finish_session_io_task("stderr", task, deadline).await,
+            None => Ok(()),
+        }
+    };
+    let (stdout, stderr) = tokio::join!(stdout, stderr);
+    [stdout, stderr]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect()
+}
+
+async fn finish_session_io_task(
+    name: &'static str,
+    mut task: tokio::task::JoinHandle<std::io::Result<()>>,
+    deadline: Duration,
+) -> Result<(), String> {
+    if let Ok(result) = timeout(deadline, &mut task).await {
+        flatten_session_io_task(name, result)
+    } else {
+        task.abort();
+        let _ = task.await;
+        Err(format!(
+            "{name} pump did not stop within the {deadline:?} cleanup deadline"
+        ))
+    }
+}
+
+fn flatten_session_io_task(
+    name: &'static str,
+    result: Result<std::io::Result<()>, tokio::task::JoinError>,
+) -> Result<(), String> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("{name} pump failed: {error}")),
+        Err(error) => Err(format!("{name} pump task failed: {error}")),
     }
 }
 
@@ -408,25 +633,6 @@ fn publish_running_state(
         exit_code: None,
         signal: None,
         timed_out,
-        elapsed_micros: duration_micros(started.elapsed()),
-    });
-}
-
-fn publish_failure(
-    sender: &watch::Sender<SessionStatus>,
-    spec: &RunSpec,
-    started: Instant,
-    _error: String,
-) {
-    let backend = sender.borrow().backend.clone();
-    let _ = sender.send(SessionStatus {
-        session_id: spec.session_id,
-        backend,
-        state: SessionState::Dead,
-        termination_reason: Some(TerminationReason::Failed),
-        exit_code: None,
-        signal: None,
-        timed_out: false,
         elapsed_micros: duration_micros(started.elapsed()),
     });
 }
@@ -597,12 +803,22 @@ pub enum SessionError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        io,
+        pin::Pin,
+        sync::{
+            Arc, Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
 
     #[cfg(unix)]
     use std::fs;
 
+    use async_trait::async_trait;
     use moraebox_core::{RunSpec, TimeoutPolicy};
+    use tokio::{io::ReadBuf, sync::Notify};
 
     use super::*;
     use crate::ProcessBackend;
@@ -710,6 +926,200 @@ mod tests {
         ));
         session.stop().await.unwrap();
         session.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_errors_still_force_and_reach_dead_after_cleanup() {
+        let state = Arc::new(SessionBackendState::default());
+        let manager = SessionManager::new(Arc::new(SessionTestBackend {
+            mode: SessionBackendMode::ControlFailure,
+            state: Arc::clone(&state),
+        }));
+        let mut spec = RunSpec::command(["fake"]);
+        spec.kill_grace = Duration::from_millis(50);
+        let session = manager.start(spec).await.unwrap();
+
+        let error = session.stop().await.unwrap_err();
+        let status = session.wait().await.unwrap();
+
+        assert!(error.to_string().contains("TERM failed"));
+        assert_eq!(state.term_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.force_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.exit_cleanups.load(Ordering::SeqCst), 1);
+        assert_eq!(status.state, SessionState::Dead);
+        assert_eq!(status.termination_reason, Some(TerminationReason::Failed));
+    }
+
+    #[tokio::test]
+    async fn hard_cleanup_deadline_never_publishes_dead_without_exit() {
+        let state = Arc::new(SessionBackendState::default());
+        let manager = SessionManager::new(Arc::new(SessionTestBackend {
+            mode: SessionBackendMode::ExitHangs,
+            state: Arc::clone(&state),
+        }));
+        let mut spec = RunSpec::command(["fake"]);
+        spec.timeout = TimeoutPolicy::Limited(1);
+        spec.kill_grace = Duration::from_millis(10);
+        let session = manager.start(spec).await.unwrap();
+
+        sleep(Duration::from_millis(80)).await;
+
+        assert_eq!(state.force_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(session.status().state, SessionState::Failed);
+        assert!(matches!(
+            session.wait().await,
+            Err(SessionError::SessionClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn output_pump_error_marks_the_completed_session_failed() {
+        let manager = SessionManager::new(Arc::new(SessionTestBackend {
+            mode: SessionBackendMode::OutputFailure,
+            state: Arc::new(SessionBackendState::default()),
+        }));
+
+        let session = manager.start(RunSpec::command(["fake"])).await.unwrap();
+        let status = session.wait().await.unwrap();
+
+        assert_eq!(status.state, SessionState::Dead);
+        assert_eq!(status.termination_reason, Some(TerminationReason::Failed));
+    }
+
+    #[tokio::test]
+    async fn dead_is_published_only_after_output_pump_is_reclaimed() {
+        let state = Arc::new(SessionBackendState::default());
+        let manager = SessionManager::new(Arc::new(SessionTestBackend {
+            mode: SessionBackendMode::OutputGate,
+            state: Arc::clone(&state),
+        }));
+        let mut spec = RunSpec::command(["fake"]);
+        spec.kill_grace = Duration::from_secs(1);
+        let session = manager.start(spec).await.unwrap();
+
+        sleep(Duration::from_millis(20)).await;
+        assert_ne!(session.status().state, SessionState::Dead);
+        drop(state.output_writer.lock().unwrap().take());
+
+        assert_eq!(session.wait().await.unwrap().state, SessionState::Dead);
+    }
+
+    #[derive(Clone, Copy)]
+    enum SessionBackendMode {
+        ControlFailure,
+        ExitHangs,
+        OutputFailure,
+        OutputGate,
+    }
+
+    #[derive(Default)]
+    struct SessionBackendState {
+        term_calls: AtomicUsize,
+        force_calls: AtomicUsize,
+        exit_cleanups: AtomicUsize,
+        forced: Notify,
+        output_writer: StdMutex<Option<tokio::io::DuplexStream>>,
+    }
+
+    struct SessionTestBackend {
+        mode: SessionBackendMode,
+        state: Arc<SessionBackendState>,
+    }
+
+    #[async_trait]
+    impl Backend for SessionTestBackend {
+        fn name(&self) -> &'static str {
+            "session-test"
+        }
+
+        async fn spawn(&self, _spec: &RunSpec) -> Result<crate::SpawnedSandbox, BackendError> {
+            let exit_state = Arc::clone(&self.state);
+            let exit: crate::backend::ExitFuture = match self.mode {
+                SessionBackendMode::ControlFailure => Box::pin(async move {
+                    exit_state.forced.notified().await;
+                    exit_state.exit_cleanups.fetch_add(1, Ordering::SeqCst);
+                    Ok(success_status())
+                }),
+                SessionBackendMode::ExitHangs => Box::pin(std::future::pending()),
+                SessionBackendMode::OutputFailure | SessionBackendMode::OutputGate => {
+                    Box::pin(async { Ok(success_status()) })
+                }
+            };
+            let stdout: crate::BoxedReader = match self.mode {
+                SessionBackendMode::OutputFailure => Box::pin(SessionFailingReader),
+                SessionBackendMode::OutputGate => {
+                    let (writer, reader) = tokio::io::duplex(8);
+                    *self.state.output_writer.lock().unwrap() = Some(writer);
+                    Box::pin(reader)
+                }
+                SessionBackendMode::ControlFailure | SessionBackendMode::ExitHangs => {
+                    Box::pin(tokio::io::empty())
+                }
+            };
+            Ok(crate::SpawnedSandbox {
+                stdin: None,
+                stdout,
+                stdout_channel: OutputChannel::Stdout,
+                stderr: None,
+                exit,
+                controller: Box::new(SessionTestController {
+                    mode: self.mode,
+                    state: Arc::clone(&self.state),
+                }),
+                startup: crate::StartupMetrics::default(),
+            })
+        }
+    }
+
+    struct SessionTestController {
+        mode: SessionBackendMode,
+        state: Arc<SessionBackendState>,
+    }
+
+    #[async_trait]
+    impl crate::BackendController for SessionTestController {
+        async fn signal(&self, signal: Signal) -> Result<(), BackendError> {
+            if signal == Signal::Terminate {
+                self.state.term_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            if matches!(self.mode, SessionBackendMode::ControlFailure) {
+                return Err(BackendError::Control("injected TERM failure".into()));
+            }
+            Ok(())
+        }
+
+        async fn force_stop(&self) -> Result<(), BackendError> {
+            self.state.force_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.mode, SessionBackendMode::ControlFailure) {
+                self.state.forced.notify_one();
+                return Err(BackendError::Control("injected force-stop failure".into()));
+            }
+            Ok(())
+        }
+    }
+
+    struct SessionFailingReader;
+
+    impl AsyncRead for SessionFailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("injected read failure")))
+        }
+    }
+
+    #[cfg(unix)]
+    fn success_status() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn success_status() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
     }
 
     #[cfg(unix)]
