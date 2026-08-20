@@ -6,6 +6,7 @@ use std::{
     io::{self, IsTerminal, Read, Write},
     path::PathBuf,
     process::ExitCode,
+    sync::Arc,
     time::Duration,
 };
 
@@ -14,7 +15,8 @@ use moraebox_box::{
     BaseDiskSpec, BaseDiskStore, BoxMetadata, BoxStore, CreateBox, EphemeralDiskStore,
 };
 use moraebox_core::{
-    BoxId, OutputChannel, RunSpec, TimeoutPolicy, resolve_cache_dir, resolve_state_dir,
+    BoxId, OutputChannel, OutputReadError, RunSpec, SessionState, Signal, TimeoutPolicy,
+    resolve_cache_dir, resolve_state_dir,
 };
 use moraebox_image::{
     CacheUsage, CachedImage, CleanReport, Credentials, ImageCache, Platform, PreparedImage,
@@ -22,9 +24,11 @@ use moraebox_image::{
 };
 use moraebox_runtime::{
     Backend, BoxRootSource, BoxRuntimeConfig, DoctorReport, LibkrunBackend, LibkrunConfig,
-    NativeRuntimePaths, ProcessBackend, Supervisor,
+    NativeRuntimePaths, ProcessBackend, SessionError, SessionHandle, SessionManager, SessionStatus,
+    Supervisor,
 };
 use serde::Serialize;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -567,6 +571,9 @@ fn doctor(args: &DoctorArgs) -> Result<i32, Box<dyn std::error::Error>> {
 
 #[allow(clippy::too_many_lines)]
 async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    if args.interactive && args.json {
+        return Err("--interactive cannot be combined with --json".into());
+    }
     let mut spec = RunSpec::command(args.command);
     spec.box_id = args.box_id;
     spec.timeout = parse_timeout(&args.timeout)?;
@@ -578,7 +585,7 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     if spec.inherit_env {
         spec.env.extend(std::env::vars());
     }
-    if args.interactive || !io::stdin().is_terminal() {
+    if !args.interactive && !io::stdin().is_terminal() {
         io::stdin().read_to_end(&mut spec.stdin)?;
     }
 
@@ -645,7 +652,12 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     };
 
     let report = match args.backend.as_str() {
-        "process" => Supervisor::new(ProcessBackend).run(spec).await?,
+        "process" => {
+            if args.interactive {
+                return run_interactive(ProcessBackend, spec).await;
+            }
+            Supervisor::new(ProcessBackend).run(spec).await?
+        }
         "libkrun" => {
             let cache_dir = cache_dir
                 .as_deref()
@@ -700,9 +712,11 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
                 source: root_source,
                 e2fsck_path: args.e2fsck.unwrap_or_else(default_e2fsck),
             };
-            Supervisor::new(LibkrunBackend::new(config).with_box_runtime(runtime))
-                .run(spec)
-                .await?
+            let backend = LibkrunBackend::new(config).with_box_runtime(runtime);
+            if args.interactive {
+                return run_interactive(backend, spec).await;
+            }
+            Supervisor::new(backend).run(spec).await?
         }
         _ => unreachable!("clap validates backend values"),
     };
@@ -731,6 +745,324 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
         Ok(128 + signal)
     } else {
         Ok(125)
+    }
+}
+
+const INTERACTIVE_READ_BYTES: usize = 64 * 1024;
+
+async fn run_interactive<B>(backend: B, spec: RunSpec) -> Result<i32, Box<dyn std::error::Error>>
+where
+    B: Backend + 'static,
+{
+    let _terminal = RawTerminalGuard::enter(spec.tty && io::stdin().is_terminal())?;
+    let mut input = InteractiveInput::new()?;
+    let mut signals = HostSignals::new()?;
+    let session = SessionManager::new(Arc::new(backend)).start(spec).await?;
+    let mut stdout = tokio::io::stdout();
+    let mut stderr = tokio::io::stderr();
+    let mut cursor = 0_u64;
+    let mut input_open = true;
+
+    let input_session = session.clone();
+    let input_future = forward_interactive_input(&mut input, input_session);
+    tokio::pin!(input_future);
+    let wait_future = session.wait();
+    tokio::pin!(wait_future);
+
+    let status = loop {
+        drain_interactive_output(&session, &mut cursor, &mut stdout, &mut stderr).await?;
+        let output_future = session.wait_for_output(cursor);
+        tokio::pin!(output_future);
+
+        tokio::select! {
+            status = &mut wait_future => break status?,
+            input_result = &mut input_future, if input_open => {
+                match input_result {
+                    Ok(()) => input_open = false,
+                    Err(_) if session.status().state == SessionState::Dead => {
+                        input_open = false;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            output_result = &mut output_future => {
+                output_result?;
+            }
+            signal_result = signals.recv() => {
+                let signal = signal_result?;
+                if let Err(error) = session.signal(signal).await
+                    && session.status().state != SessionState::Dead
+                {
+                    return Err(error.into());
+                }
+            }
+        }
+    };
+
+    drain_interactive_output(&session, &mut cursor, &mut stdout, &mut stderr).await?;
+    stdout.flush().await?;
+    stderr.flush().await?;
+    Ok(session_exit_code(&status))
+}
+
+async fn forward_interactive_input(
+    input: &mut InteractiveInput,
+    session: SessionHandle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buffer = vec![0_u8; 16 * 1024];
+    loop {
+        let count = input.read(&mut buffer).await?;
+        if count == 0 {
+            session.close_stdin().await?;
+            return Ok(());
+        }
+        session.write(buffer[..count].to_vec()).await?;
+    }
+}
+
+async fn drain_interactive_output(
+    session: &SessionHandle,
+    cursor: &mut u64,
+    stdout: &mut tokio::io::Stdout,
+    stderr: &mut tokio::io::Stderr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let output = match session.read_output(*cursor, INTERACTIVE_READ_BYTES).await {
+            Ok(output) => output,
+            Err(SessionError::Output(OutputReadError::CursorExpired { earliest, .. })) => {
+                let warning =
+                    format!("morae: interactive output before cursor {earliest} was dropped\n");
+                stderr.write_all(warning.as_bytes()).await?;
+                *cursor = earliest;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if output.chunks.is_empty() {
+            return Ok(());
+        }
+        for chunk in output.chunks {
+            match chunk.channel {
+                OutputChannel::Stdout | OutputChannel::Tty => {
+                    stdout.write_all(&chunk.data).await?;
+                }
+                OutputChannel::Stderr => stderr.write_all(&chunk.data).await?,
+            }
+        }
+        *cursor = output.next_cursor;
+        stdout.flush().await?;
+        stderr.flush().await?;
+    }
+}
+
+fn session_exit_code(status: &SessionStatus) -> i32 {
+    if status.timed_out {
+        124
+    } else if let Some(code) = status.exit_code {
+        code
+    } else if let Some(signal) = status.signal {
+        128 + signal
+    } else {
+        125
+    }
+}
+
+#[cfg(unix)]
+struct RawTerminalGuard {
+    original: nix::sys::termios::Termios,
+}
+
+#[cfg(unix)]
+impl RawTerminalGuard {
+    fn enter(enabled: bool) -> io::Result<Option<Self>> {
+        use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
+
+        if !enabled {
+            return Ok(None);
+        }
+        let stdin = io::stdin();
+        let original = tcgetattr(&stdin).map_err(io::Error::from)?;
+        let mut raw = original.clone();
+        cfmakeraw(&mut raw);
+        tcsetattr(&stdin, SetArg::TCSANOW, &raw).map_err(io::Error::from)?;
+        Ok(Some(Self { original }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawTerminalGuard {
+    fn drop(&mut self) {
+        use nix::sys::termios::{SetArg, tcsetattr};
+
+        let _ = tcsetattr(io::stdin(), SetArg::TCSANOW, &self.original);
+    }
+}
+
+#[cfg(not(unix))]
+struct RawTerminalGuard;
+
+#[cfg(not(unix))]
+impl RawTerminalGuard {
+    fn enter(_enabled: bool) -> io::Result<Option<Self>> {
+        Ok(None)
+    }
+}
+
+#[cfg(unix)]
+struct InteractiveInput {
+    inner: tokio::io::unix::AsyncFd<io::Stdin>,
+    original_flags: nix::fcntl::OFlag,
+}
+
+#[cfg(unix)]
+impl InteractiveInput {
+    fn new() -> io::Result<Self> {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+        let inner = tokio::io::unix::AsyncFd::new(io::stdin())?;
+        let original_flags = OFlag::from_bits_truncate(
+            fcntl(inner.get_ref(), FcntlArg::F_GETFL).map_err(io::Error::from)?,
+        );
+        fcntl(
+            inner.get_ref(),
+            FcntlArg::F_SETFL(original_flags | OFlag::O_NONBLOCK),
+        )
+        .map_err(io::Error::from)?;
+        Ok(Self {
+            inner,
+            original_flags,
+        })
+    }
+
+    async fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let mut guard = self.inner.readable_mut().await?;
+            if let Ok(result) = guard.try_io(|inner| Read::read(inner.get_mut(), buffer)) {
+                return result;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InteractiveInput {
+    fn drop(&mut self) {
+        use nix::fcntl::{FcntlArg, fcntl};
+
+        let _ = fcntl(self.inner.get_ref(), FcntlArg::F_SETFL(self.original_flags));
+    }
+}
+
+#[cfg(not(unix))]
+struct InteractiveInput {
+    receiver: tokio::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+}
+
+#[cfg(not(unix))]
+impl InteractiveInput {
+    fn new() -> io::Result<Self> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        std::thread::Builder::new()
+            .name("morae-stdin".into())
+            .spawn(move || {
+                let mut stdin = io::stdin();
+                loop {
+                    let mut buffer = vec![0_u8; 16 * 1024];
+                    let result = Read::read(&mut stdin, &mut buffer).map(|count| {
+                        buffer.truncate(count);
+                        buffer
+                    });
+                    let reached_eof = matches!(&result, Ok(bytes) if bytes.is_empty());
+                    if sender.blocking_send(result).is_err() || reached_eof {
+                        return;
+                    }
+                }
+            })?;
+        Ok(Self { receiver })
+    }
+
+    async fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let bytes = self.receiver.recv().await.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "host stdin reader stopped")
+        })??;
+        if bytes.len() > buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "host stdin chunk exceeds the interactive input buffer",
+            ));
+        }
+        let count = bytes.len();
+        buffer[..count].copy_from_slice(&bytes);
+        Ok(count)
+    }
+}
+
+#[cfg(unix)]
+struct HostSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl HostSignals {
+    fn new() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    async fn recv(&mut self) -> io::Result<Signal> {
+        tokio::select! {
+            value = self.interrupt.recv() => signal_event(value, Signal::Interrupt),
+            value = self.terminate.recv() => signal_event(value, Signal::Terminate),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_event(received: Option<()>, signal: Signal) -> io::Result<Signal> {
+    received
+        .map(|()| signal)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "host signal stream closed"))
+}
+
+#[cfg(windows)]
+struct HostSignals {
+    interrupt: tokio::signal::windows::CtrlC,
+}
+
+#[cfg(windows)]
+impl HostSignals {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            interrupt: tokio::signal::windows::ctrl_c()?,
+        })
+    }
+
+    async fn recv(&mut self) -> io::Result<Signal> {
+        self.interrupt
+            .recv()
+            .await
+            .map(|()| Signal::Interrupt)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "host signal stream closed"))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct HostSignals;
+
+#[cfg(not(any(unix, windows)))]
+impl HostSignals {
+    fn new() -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) -> io::Result<Signal> {
+        tokio::signal::ctrl_c().await?;
+        Ok(Signal::Interrupt)
     }
 }
 

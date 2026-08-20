@@ -44,19 +44,23 @@ impl SessionManager {
         };
         let (status_sender, status_receiver) = watch::channel(initial);
         let output = Arc::new(Mutex::new(OutputBuffer::new(spec.output_limit)));
+        let (output_cursor_sender, output_cursor_receiver) = watch::channel(0_u64);
         let (command_sender, command_receiver) = mpsc::channel(32);
         let stdout_task = tokio::spawn(pump_output(
             spawned.stdout,
             spawned.stdout_channel,
             Arc::clone(&output),
+            output_cursor_sender.clone(),
         ));
         let stderr_task = spawned.stderr.map(|stderr| {
             tokio::spawn(pump_output(
                 stderr,
                 OutputChannel::Stderr,
                 Arc::clone(&output),
+                output_cursor_sender.clone(),
             ))
         });
+        drop(output_cursor_sender);
 
         let session_id = spec.session_id;
         tokio::spawn(drive_session(
@@ -73,6 +77,7 @@ impl SessionManager {
         Ok(SessionHandle {
             session_id,
             output,
+            output_cursor: output_cursor_receiver,
             status: status_receiver,
             commands: command_sender,
         })
@@ -83,6 +88,7 @@ impl SessionManager {
 pub struct SessionHandle {
     session_id: SessionId,
     output: Arc<Mutex<OutputBuffer>>,
+    output_cursor: watch::Receiver<u64>,
     status: watch::Receiver<SessionStatus>,
     commands: mpsc::Sender<SessionCommand>,
 }
@@ -102,6 +108,20 @@ impl SessionHandle {
         max_bytes: usize,
     ) -> Result<OutputRead, SessionError> {
         Ok(self.output.lock().await.read(cursor, max_bytes)?)
+    }
+
+    pub async fn wait_for_output(&self, cursor: u64) -> Result<u64, SessionError> {
+        let mut receiver = self.output_cursor.clone();
+        loop {
+            let next_cursor = *receiver.borrow();
+            if next_cursor > cursor {
+                return Ok(next_cursor);
+            }
+            if receiver.changed().await.is_err() {
+                self.wait().await?;
+                return Ok(cursor);
+            }
+        }
     }
 
     pub async fn write(&self, bytes: impl Into<Vec<u8>>) -> Result<(), SessionError> {
@@ -325,6 +345,7 @@ async fn pump_output<R>(
     mut reader: R,
     channel: OutputChannel,
     output: Arc<Mutex<OutputBuffer>>,
+    output_cursor: watch::Sender<u64>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -335,7 +356,12 @@ where
         if count == 0 {
             return Ok(());
         }
-        output.lock().await.push(channel, &buffer[..count]);
+        let next_cursor = {
+            let mut output = output.lock().await;
+            output.push(channel, &buffer[..count]);
+            output.next_cursor()
+        };
+        output_cursor.send_replace(next_cursor);
     }
 }
 
@@ -417,6 +443,40 @@ mod tests {
             status.termination_reason,
             Some(TerminationReason::Cancelled)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_notification_arrives_before_session_exit() {
+        let manager = SessionManager::new(Arc::new(ProcessBackend));
+        let session = manager
+            .start(RunSpec::command(
+                [
+                    "/bin/sh",
+                    "-c",
+                    "printf ready; read line; printf ':%s' \"$line\"",
+                ]
+                .map(String::from)
+                .to_vec(),
+            ))
+            .await
+            .unwrap();
+
+        let cursor = tokio::time::timeout(Duration::from_secs(2), session.wait_for_output(0))
+            .await
+            .expect("first output must arrive while the command is still running")
+            .unwrap();
+        assert_eq!(cursor, 5);
+        assert_eq!(session.status().state, SessionState::Running);
+        let first = session.read_output(0, 1024).await.unwrap();
+        assert_eq!(first.chunks[0].data, b"ready");
+
+        session.write(b"done\n".to_vec()).await.unwrap();
+        session.close_stdin().await.unwrap();
+        let status = session.wait().await.unwrap();
+        assert_eq!(status.exit_code, Some(0));
+        let rest = session.read_output(cursor, 1024).await.unwrap();
+        assert_eq!(rest.chunks[0].data, b":done");
     }
 
     #[cfg(unix)]

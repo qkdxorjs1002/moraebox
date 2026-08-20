@@ -754,6 +754,7 @@ dependencies = [
  "moraebox-core",
  "moraebox-image",
  "moraebox-runtime",
+ "nix",
  "serde",
  "serde_json",
  "tempfile",
