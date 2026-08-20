@@ -268,6 +268,30 @@ jobs:
           sha256 = ENV.fetch("ARCHIVE_SHA256")
           prerelease = ENV.fetch("RELEASE_PRERELEASE") == "true"
 
+          def gvproxy_formula_content
+            <<~FORMULA
+            class Gvproxy < Formula
+              desc "User-mode network stack for virtual machines"
+              homepage "https://github.com/containers/gvisor-tap-vsock"
+              url "https://github.com/containers/gvisor-tap-vsock/archive/refs/tags/v0.8.9.tar.gz"
+              sha256 "6cbcb7959a5d90b59253ea6d8bdf0285e2cfbc3b301398704b41e3069293f4fb"
+              license "Apache-2.0"
+
+              depends_on "go" => :build
+
+              def install
+                system "make", "gvproxy", "GIT_VERSION=v\#{version}"
+                bin.install "bin/gvproxy"
+              end
+
+              test do
+                assert_match "gvproxy version v\#{version}",
+                             shell_output("\#{bin}/gvproxy --version")
+              end
+            end
+            FORMULA
+          end
+
           def libkrunfw_formula_content
             <<~FORMULA
             class Libkrunfw < Formula
@@ -356,6 +380,7 @@ jobs:
               depends_on "rust" => :build
               depends_on arch: :arm64
               depends_on "e2fsprogs"
+              depends_on "gvproxy"
               depends_on "libkrun"
               depends_on "libkrunfw"
               depends_on :macos
@@ -381,10 +406,10 @@ jobs:
                   with its Hypervisor entitlement. The signature does not identify a
                   developer and the locally built executable is not Apple-notarized.
 
-                  This formula also installs the pinned libkrun 1.19.4 and libkrunfw
-                  5.5.0 runtime dependencies from this tap. moraebox automatically
-                  discovers the signed helper and these libraries, so native execution
-                  requires no shell configuration:
+                  This formula also installs the pinned gvproxy 0.8.9, libkrun 1.19.4,
+                  and libkrunfw 5.5.0 runtime dependencies from this tap. moraebox
+                  automatically discovers the signed helper and these dependencies, so
+                  native execution and opt-in networking require no shell configuration:
 
                     morae run --image alpine@latest -- /bin/uname -a
 
@@ -398,9 +423,11 @@ jobs:
                              shell_output("\#{bin}/morae run --backend process -- /bin/echo morae")
                 assert_match "stdio MCP server", shell_output("\#{bin}/morae-mcp --help")
                 doctor = JSON.parse(shell_output("\#{bin}/morae doctor --json"))
+                assert doctor.dig("gvproxy", "found")
                 assert doctor.dig("libkrun", "found")
                 assert doctor.dig("libkrunfw", "found")
                 assert doctor["native_backend_ready"]
+                assert doctor["native_network_ready"]
                 native_error = shell_output(
                   "\#{bin}/morae run --backend libkrun -- /bin/true 2>&1", 1
                 )
@@ -421,6 +448,7 @@ jobs:
             formula.sub("  __CONFLICT__\n\n", conflict_line)
           end
 
+          (tap_root/"Formula/gvproxy.rb").write(gvproxy_formula_content)
           (tap_root/"Formula/libkrunfw.rb").write(libkrunfw_formula_content)
           (tap_root/"Formula/libkrun.rb").write(libkrun_formula_content)
 
@@ -454,6 +482,7 @@ jobs:
           RUBY
 
           formula_files=(
+            homebrew-tap/Formula/gvproxy.rb
             homebrew-tap/Formula/libkrunfw.rb
             homebrew-tap/Formula/libkrun.rb
             homebrew-tap/Formula/moraebox-pre.rb
@@ -477,6 +506,7 @@ jobs:
           git -C homebrew-tap config user.name "github-actions[bot]"
           git -C homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           tap_paths=(
+            Formula/gvproxy.rb
             Formula/libkrunfw.rb
             Formula/libkrun.rb
             Formula/moraebox-pre.rb

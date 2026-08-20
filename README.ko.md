@@ -35,7 +35,7 @@ moraebox는 더 작은 수명주기를 지향합니다. 소유자 하나, 명령
 
 ### 1. 설치
 
-현재 prerelease 채널은 Apple Silicon macOS를 대상으로 합니다. tap은 moraebox가 요구하는 고정 libkrun 및 libkrunfw 버전도 함께 제공합니다.
+현재 prerelease 채널은 Apple Silicon macOS를 대상으로 합니다. tap은 moraebox가 요구하는 고정 gvproxy, libkrun 및 libkrunfw 버전도 함께 제공합니다.
 
 ```sh
 brew tap qkdxorjs1002/tap
@@ -95,7 +95,7 @@ morae run --image alpine:latest --env MESSAGE=hello \
 morae run --network -- curl -I https://example.com
 ```
 
-네트워크 실행에는 `gvproxy`가 필요합니다. moraebox는 `PATH`에서 `gvproxy`를 찾으며, 다른 위치에 설치했다면 `--gvproxy /path/to/gvproxy` 또는 `MORAE_GVPROXY_PATH`를 사용합니다. 네이티브 런타임은 실행마다 새 gvproxy 프로세스와 virtio-net endpoint를 시작하고 VM과 함께 정리합니다. control vsock은 별도로 유지하며 모든 TSI feature flag를 끕니다.
+네트워크 실행에는 Homebrew formula가 자동으로 설치하는 `gvproxy`가 필요합니다. moraebox는 `PATH`에서 `gvproxy`를 찾으며, Homebrew 외의 방식으로 다른 위치에 설치했다면 `--gvproxy /path/to/gvproxy` 또는 `MORAE_GVPROXY_PATH`를 사용합니다. 네이티브 런타임은 실행마다 새 gvproxy 프로세스와 virtio-net endpoint를 시작하고 VM과 함께 정리합니다. control vsock은 별도로 유지하며 모든 TSI feature flag를 끕니다.
 
 Rust SDK에서는 `RunSpec.network = true`, MCP `sandbox_exec`에서는 `"network": true`가 같은 실행별 opt-in입니다. `process` 백엔드는 호스트 네트워크 문맥에서 직접 실행되고 VM 격리를 제공하지 않으므로 이 VM 전용 옵션을 거부합니다.
 

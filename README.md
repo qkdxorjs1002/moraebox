@@ -35,7 +35,7 @@ moraebox is built around a smaller lifecycle: one owner, one command, one VM, th
 
 ### 1. Install
 
-The current prerelease channel targets Apple Silicon macOS. The tap also provides the pinned libkrun and libkrunfw versions required by moraebox.
+The current prerelease channel targets Apple Silicon macOS. The tap also provides the pinned gvproxy, libkrun, and libkrunfw versions required by moraebox.
 
 ```sh
 brew tap qkdxorjs1002/tap
@@ -95,7 +95,7 @@ Guest networking is disabled by default. Enable it for one native VM run with `-
 morae run --network -- curl -I https://example.com
 ```
 
-Network-enabled runs require `gvproxy`. moraebox discovers `gvproxy` on `PATH`; use `--gvproxy /path/to/gvproxy` or `MORAE_GVPROXY_PATH` when it is installed elsewhere. The native runtime starts a fresh gvproxy process and virtio-net endpoint for the run, then tears both down with the VM. The control vsock remains separate with all TSI feature flags disabled.
+Network-enabled runs require `gvproxy`, which the Homebrew formula installs automatically. moraebox discovers `gvproxy` on `PATH`; for non-Homebrew installations, use `--gvproxy /path/to/gvproxy` or `MORAE_GVPROXY_PATH` when it is installed elsewhere. The native runtime starts a fresh gvproxy process and virtio-net endpoint for the run, then tears both down with the VM. The control vsock remains separate with all TSI feature flags disabled.
 
 The same opt-in is `RunSpec.network = true` in the Rust SDK and `"network": true` in an MCP `sandbox_exec` call. The `process` backend rejects this VM-specific option because it already runs directly in the host network context and does not provide VM isolation.
 
