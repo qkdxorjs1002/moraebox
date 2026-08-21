@@ -116,7 +116,9 @@ impl SandboxSdk {
             return Err(SdkError::RequestCancelled);
         }
         let permit = self.acquire_active_slot()?;
-        let handle = self.start_handle_cancellable(spec, cancellation).await?;
+        let handle = self
+            .start_handle_cancellable(spec, &mut cancellation)
+            .await?;
         Ok(self.register_session(handle, permit).await)
     }
 
@@ -136,19 +138,9 @@ impl SandboxSdk {
             return Err(SdkError::RequestCancelled);
         }
         let _permit = self.acquire_active_slot()?;
-        let mut start = Box::pin(self.manager.start(spec));
-        let handle = tokio::select! {
-            result = &mut start => result?,
-            _ = &mut cancellation => {
-                let handle = start.await?;
-                Self::stop_handle(&handle).await?;
-                return Err(SdkError::RequestCancelled);
-            }
-        };
-        if cancellation.try_recv().is_ok() {
-            Self::stop_handle(&handle).await?;
-            return Err(SdkError::RequestCancelled);
-        }
+        let handle = self
+            .start_handle_cancellable(spec, &mut cancellation)
+            .await?;
         tokio::select! {
             result = Self::finish_execution(&handle) => result,
             _ = &mut cancellation => {
@@ -156,6 +148,104 @@ impl SandboxSdk {
                 Err(SdkError::RequestCancelled)
             }
         }
+    }
+
+    /// Runs a session to completion and retains it for cursor-based output continuation.
+    ///
+    /// Call [`Self::remove`] after the returned page reaches `output_next_cursor`. Otherwise the
+    /// completed session is automatically removed after the configured registry TTL.
+    pub async fn exec_retained(
+        &self,
+        spec: RunSpec,
+        max_bytes: usize,
+    ) -> Result<ExecutionPageResult, SdkError> {
+        Self::validate_output_page_size(max_bytes)?;
+        let permit = self.acquire_active_slot()?;
+        let handle = self.manager.start(spec).await?;
+        self.register_session(handle.clone(), permit).await;
+        self.finish_retained_execution(&handle, max_bytes, None)
+            .await
+    }
+
+    /// Cancellation-safe variant of [`Self::exec_retained`].
+    pub async fn exec_retained_cancellable(
+        &self,
+        spec: RunSpec,
+        max_bytes: usize,
+        mut cancellation: oneshot::Receiver<()>,
+    ) -> Result<ExecutionPageResult, SdkError> {
+        Self::validate_output_page_size(max_bytes)?;
+        if cancellation.try_recv().is_ok() {
+            return Err(SdkError::RequestCancelled);
+        }
+        let permit = self.acquire_active_slot()?;
+        let handle = self
+            .start_handle_cancellable(spec, &mut cancellation)
+            .await?;
+        self.register_session(handle.clone(), permit).await;
+        self.finish_retained_execution(&handle, max_bytes, Some(&mut cancellation))
+            .await
+    }
+
+    async fn finish_retained_execution(
+        &self,
+        handle: &SessionHandle,
+        max_bytes: usize,
+        cancellation: Option<&mut oneshot::Receiver<()>>,
+    ) -> Result<ExecutionPageResult, SdkError> {
+        let session_id = handle.id();
+        if let Err(error) = handle.close_stdin().await
+            && handle.status().state != SessionState::Dead
+        {
+            self.remove(session_id).await?;
+            return Err(error.into());
+        }
+        let status = if let Some(cancellation) = cancellation {
+            tokio::select! {
+                result = handle.wait() => result,
+                _ = cancellation => {
+                    self.remove(session_id).await?;
+                    return Err(SdkError::RequestCancelled);
+                }
+            }
+        } else {
+            handle.wait().await
+        };
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                self.sessions.write().await.remove(&session_id);
+                return Err(error.into());
+            }
+        };
+        let output_next_cursor = handle.wait_for_output(0).await?;
+        let output = match handle.read_output(0, max_bytes).await {
+            Ok(output) => output,
+            Err(SessionError::Output(OutputReadError::CursorExpired { earliest, .. })) => {
+                handle.read_output(earliest, max_bytes).await?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(ExecutionPageResult {
+            status,
+            output: output.chunks,
+            next_cursor: output.next_cursor,
+            output_next_cursor,
+            truncated: output.truncated,
+        })
+    }
+
+    fn validate_output_page_size(max_bytes: usize) -> Result<(), SdkError> {
+        if max_bytes == 0 {
+            return Err(SdkError::OutputReadEmpty);
+        }
+        if max_bytes > MAX_IO_OUTPUT_READ_BYTES {
+            return Err(SdkError::OutputReadTooLarge {
+                requested: max_bytes,
+                maximum: MAX_IO_OUTPUT_READ_BYTES,
+            });
+        }
+        Ok(())
     }
 
     async fn finish_execution(handle: &SessionHandle) -> Result<ExecutionResult, SdkError> {
@@ -209,7 +299,7 @@ impl SandboxSdk {
     async fn start_handle_cancellable(
         &self,
         spec: RunSpec,
-        mut cancellation: oneshot::Receiver<()>,
+        cancellation: &mut oneshot::Receiver<()>,
     ) -> Result<SessionHandle, SdkError> {
         if cancellation.try_recv().is_ok() {
             return Err(SdkError::RequestCancelled);
@@ -217,7 +307,7 @@ impl SandboxSdk {
         let mut start = Box::pin(self.manager.start(spec));
         let handle = tokio::select! {
             result = &mut start => result?,
-            _ = &mut cancellation => {
+            _ = &mut *cancellation => {
                 let handle = start.await?;
                 Self::stop_handle(&handle).await?;
                 return Err(SdkError::RequestCancelled);
@@ -498,6 +588,15 @@ pub struct ExecutionResult {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionPageResult {
+    pub status: SessionStatus,
+    pub output: Vec<OutputChunk>,
+    pub next_cursor: u64,
+    pub output_next_cursor: u64,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IoRequest {
     pub cursor: u64,
@@ -539,6 +638,8 @@ pub enum SdkError {
     SessionLimitExceeded { maximum: usize },
     #[error("output read is {requested} bytes, exceeding the {maximum}-byte SDK limit")]
     OutputReadTooLarge { requested: usize, maximum: usize },
+    #[error("output read must request at least one byte")]
+    OutputReadEmpty,
     #[error("sandbox request was cancelled")]
     RequestCancelled,
     #[error("session cleanup task failed: {0}")]
@@ -713,6 +814,68 @@ mod tests {
             assert!(chunk.data.len() <= 3);
             cursor += chunk.data.len() as u64;
         }
+    }
+
+    #[tokio::test]
+    async fn retained_execution_page_continues_through_session_io() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+
+        let first = sdk
+            .exec_retained(RunSpec::command(mixed_output_command()), 3)
+            .await
+            .unwrap();
+
+        assert_eq!(first.output_next_cursor, 12);
+        assert_eq!(first.next_cursor, 3);
+        assert_eq!(
+            first
+                .output
+                .iter()
+                .map(|chunk| chunk.data.len())
+                .sum::<usize>(),
+            3
+        );
+        let rest = sdk
+            .io(
+                first.status.session_id,
+                IoRequest {
+                    cursor: first.next_cursor,
+                    ..IoRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rest.next_cursor, first.output_next_cursor);
+        assert_eq!(
+            rest.output
+                .iter()
+                .map(|chunk| chunk.data.len())
+                .sum::<usize>(),
+            9
+        );
+        sdk.remove(first.status.session_id).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_retained_execution_is_removed_and_releases_its_slot() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend)).with_session_registry(
+            SessionRegistryConfig::new(NonZeroUsize::new(1).unwrap(), Duration::from_secs(1)),
+        );
+        let mut spec = RunSpec::command(long_running_command());
+        spec.kill_grace = Duration::from_millis(200);
+        let (cancel, cancellation) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = cancel.send(());
+        });
+
+        let result = sdk
+            .exec_retained_cancellable(spec.clone(), 1024, cancellation)
+            .await;
+
+        assert!(matches!(result, Err(SdkError::RequestCancelled)));
+        let replacement = sdk.start(spec).await.unwrap();
+        sdk.remove(replacement.session_id).await.unwrap().unwrap();
     }
 
     #[tokio::test]

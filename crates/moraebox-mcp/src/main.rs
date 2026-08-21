@@ -25,7 +25,7 @@ use moraebox_runtime::{
     ProcessBackend,
 };
 use moraebox_sdk::{
-    ExecutionResult, IoRequest, IoResult, MAX_IO_OUTPUT_READ_BYTES, SandboxSdk, SdkError,
+    ExecutionPageResult, IoRequest, IoResult, MAX_IO_OUTPUT_READ_BYTES, SandboxSdk, SdkError,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -38,11 +38,14 @@ use tokio::{
 const PROTOCOL_VERSION: &str = "2026-07-28";
 const MAX_CONCURRENT_REQUESTS: usize = 32;
 const RESPONSE_QUEUE_CAPACITY: usize = 128;
+const SANDBOX_EXEC_INLINE_OUTPUT_BYTES: usize = 1024 * 1024;
 type InflightRequests = Arc<StdMutex<HashMap<String, Option<oneshot::Sender<()>>>>>;
 const SERVER_INSTRUCTIONS: &str = concat!(
     "Use sandbox_exec when a command benefits from a disposable execution environment, ",
     "including untrusted code, dependency installation, isolated experiments, reproducible ",
-    "Linux checks, or long-running sessions. Use wait=true for one-shot commands and ",
+    "Linux checks, or long-running sessions. Use wait=true for one-shot commands; its inline ",
+    "output is limited to 1 MiB, and has_more output can be read with sandbox_io using the ",
+    "returned SessionId and continuation_cursor within five minutes. Use ",
     "wait=false to start sessions; use sandbox_io for cursor-based I/O and sandbox_stop to ",
     "terminate and clean up sessions. wait=true sessions belong to their request and are ",
     "cleaned when that request is cancelled. wait=false sessions belong to this stdio ",
@@ -543,7 +546,7 @@ async fn call_tool(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let result = match name {
+    let result: Result<ToolOutput, String> = match name {
         "sandbox_exec" => match sandbox_exec(&server.sdk, arguments, cancellation).await {
             Ok(value) => Ok(value),
             Err(ExecError::Cancelled) => {
@@ -551,23 +554,67 @@ async fn call_tool(
             }
             Err(ExecError::Failed(error)) => Err(error),
         },
-        "sandbox_io" => sandbox_io(&server.sdk, arguments).await,
-        "sandbox_stop" => sandbox_stop(&server.sdk, arguments).await,
-        "sandbox_remove" => sandbox_remove(&server.sdk, arguments).await,
-        "sandbox_box_create" => sandbox_box_create(server, arguments).await,
-        "sandbox_box_list" => sandbox_box_list(server, arguments).await,
-        "sandbox_box_get" => sandbox_box_get(server, arguments).await,
-        "sandbox_box_delete" => sandbox_box_delete(server, arguments).await,
-        "sandbox_box_reset" => sandbox_box_reset(server, arguments).await,
-        "sandbox_box_clone" => sandbox_box_clone(server, arguments).await,
+        "sandbox_io" => sandbox_io(&server.sdk, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_stop" => sandbox_stop(&server.sdk, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_remove" => sandbox_remove(&server.sdk, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_box_create" => sandbox_box_create(server, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_box_list" => sandbox_box_list(server, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_box_get" => sandbox_box_get(server, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_box_delete" => sandbox_box_delete(server, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_box_reset" => sandbox_box_reset(server, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_box_clone" => sandbox_box_clone(server, arguments)
+            .await
+            .map(ToolOutput::mirrored),
         _ => return protocol_error(id, -32602, "unknown tool"),
     };
     match result {
         Ok(value) => success(id, tool_result(value, false)),
-        Err(error) => success(id, tool_result(json!({ "error": error }), true)),
+        Err(error) => success(
+            id,
+            tool_result(ToolOutput::mirrored(json!({ "error": error })), true),
+        ),
     }
 }
 
+struct ToolOutput {
+    structured_content: Value,
+    content_text: String,
+}
+
+impl ToolOutput {
+    fn mirrored(structured_content: Value) -> Self {
+        let content_text = structured_content.to_string();
+        Self {
+            structured_content,
+            content_text,
+        }
+    }
+
+    fn summarized(structured_content: Value, content_text: String) -> Self {
+        Self {
+            structured_content,
+            content_text,
+        }
+    }
+}
+
+#[derive(Debug)]
 enum ExecError {
     Cancelled,
     Failed(String),
@@ -586,7 +633,22 @@ async fn sandbox_exec(
     sdk: &SandboxSdk,
     arguments: Value,
     cancellation: Option<oneshot::Receiver<()>>,
-) -> Result<Value, ExecError> {
+) -> Result<ToolOutput, ExecError> {
+    sandbox_exec_with_inline_limit(
+        sdk,
+        arguments,
+        cancellation,
+        SANDBOX_EXEC_INLINE_OUTPUT_BYTES,
+    )
+    .await
+}
+
+async fn sandbox_exec_with_inline_limit(
+    sdk: &SandboxSdk,
+    arguments: Value,
+    cancellation: Option<oneshot::Receiver<()>>,
+    inline_output_bytes: usize,
+) -> Result<ToolOutput, ExecError> {
     let args: ExecArgs =
         serde_json::from_value(arguments).map_err(|error| ExecError::Failed(error.to_string()))?;
     if args.argv.is_empty() {
@@ -613,16 +675,27 @@ async fn sandbox_exec(
     }
     if args.wait {
         let result = match cancellation {
-            Some(cancellation) => sdk.exec_cancellable(spec, cancellation).await,
-            None => sdk.exec(spec).await,
+            Some(cancellation) => {
+                sdk.exec_retained_cancellable(spec, inline_output_bytes, cancellation)
+                    .await
+            }
+            None => sdk.exec_retained(spec, inline_output_bytes).await,
         }?;
-        Ok(execution_json(&result))
+        let has_more = result.next_cursor < result.output_next_cursor;
+        let structured_content = execution_page_json(&result);
+        let content_text = execution_content_summary(&result, has_more);
+        if !has_more {
+            sdk.remove(result.status.session_id).await?;
+        }
+        Ok(ToolOutput::summarized(structured_content, content_text))
     } else {
         let status = match cancellation {
             Some(cancellation) => sdk.start_cancellable(spec, cancellation).await,
             None => sdk.start(spec).await,
         }?;
-        Ok(json!({ "status": status, "next_cursor": 0 }))
+        Ok(ToolOutput::mirrored(
+            json!({ "status": status, "next_cursor": 0 }),
+        ))
     }
 }
 
@@ -811,13 +884,35 @@ fn require_confirmation(confirmed: bool) -> Result<(), String> {
     }
 }
 
-fn execution_json(result: &ExecutionResult) -> Value {
+fn execution_page_json(result: &ExecutionPageResult) -> Value {
+    let has_more = result.next_cursor < result.output_next_cursor;
     json!({
         "status": result.status,
         "output": chunks_json(&result.output),
         "next_cursor": result.next_cursor,
+        "output_next_cursor": result.output_next_cursor,
+        "has_more": has_more,
+        "continuation_cursor": has_more.then_some(result.next_cursor),
         "truncated": result.truncated
     })
+}
+
+fn execution_content_summary(result: &ExecutionPageResult, has_more: bool) -> String {
+    let inline_bytes = result
+        .output
+        .iter()
+        .map(|chunk| chunk.data.len())
+        .sum::<usize>();
+    if has_more {
+        format!(
+            "sandbox_exec completed; {inline_bytes} output bytes are in structuredContent; continue session {} from cursor {} with sandbox_io",
+            result.status.session_id, result.next_cursor
+        )
+    } else {
+        format!(
+            "sandbox_exec completed; {inline_bytes} output bytes are in structuredContent; no continuation is required"
+        )
+    }
 }
 
 fn io_json(result: &IoResult) -> Value {
@@ -852,14 +947,18 @@ fn parse_signal(value: &str) -> Result<Signal, String> {
     }
 }
 
-fn tool_result(value: Value, is_error: bool) -> Value {
-    let result = json!({
-        "content": [{ "type": "text", "text": value.to_string() }],
-        "structuredContent": value,
-        "isError": is_error
-    });
-    drop(value);
-    result
+fn tool_result(output: ToolOutput, is_error: bool) -> Value {
+    let mut content_item = serde_json::Map::with_capacity(2);
+    content_item.insert("type".into(), Value::String("text".into()));
+    content_item.insert("text".into(), Value::String(output.content_text));
+    let mut result = serde_json::Map::with_capacity(3);
+    result.insert(
+        "content".into(),
+        Value::Array(vec![Value::Object(content_item)]),
+    );
+    result.insert("structuredContent".into(), output.structured_content);
+    result.insert("isError".into(), Value::Bool(is_error));
+    Value::Object(result)
 }
 
 fn success(id: Value, result: Value) -> Value {
@@ -882,7 +981,7 @@ fn tools_list() -> Value {
             {
                 "name": "sandbox_exec",
                 "title": "Execute in configured runtime",
-                "description": "Start a command in the configured runtime. Every call receives a new SessionId and, with libkrun, a new microVM. Pass box_id only when the command should reuse that Box's persistent root filesystem. Prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. At most 32 sessions run concurrently. wait=true runs are cleaned when their request is cancelled. wait=false starts a session owned by this stdio connection until sandbox_remove or disconnect; completed status and output expire after five minutes. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
+                "description": "Start a command in the configured runtime. Every call receives a new SessionId and, with libkrun, a new microVM. Pass box_id only when the command should reuse that Box's persistent root filesystem. Prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. At most 32 sessions run concurrently. wait=true returns at most 1 MiB inline; when has_more is true, call sandbox_io with the returned SessionId and continuation_cursor within five minutes. Cancelled wait=true runs are cleaned. wait=false starts a session owned by this stdio connection until sandbox_remove or disconnect; completed status and output expire after five minutes. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1226,6 +1325,7 @@ mod tests {
         assert!(exec_description.contains("with libkrun"));
         assert!(exec_description.contains("reproducible Linux checks"));
         assert!(exec_description.contains("Network access is disabled by default"));
+        assert!(exec_description.contains("continuation_cursor"));
         assert_eq!(
             list.pointer("/result/tools/0/inputSchema/properties/network/default"),
             Some(&json!(false))
@@ -1266,6 +1366,84 @@ mod tests {
             call.pointer("/result/structuredContent/output/0/data_base64")
                 .is_none()
         );
+        let content_text = call
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(content_text.starts_with("sandbox_exec completed"));
+        assert!(!content_text.contains("mcp"));
+    }
+
+    #[tokio::test]
+    async fn waiting_exec_exposes_a_real_continuation_without_duplicating_output() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let result =
+            sandbox_exec_with_inline_limit(&sdk, json!({ "argv": successful_command() }), None, 2)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            result.structured_content.get("has_more"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            result.structured_content.get("continuation_cursor"),
+            Some(&json!(2))
+        );
+        assert_eq!(
+            result.structured_content.get("output_next_cursor"),
+            Some(&json!(3))
+        );
+        assert!(!result.content_text.contains("mcp"));
+        let session_id = result
+            .structured_content
+            .pointer("/status/session_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .parse::<SessionId>()
+            .unwrap();
+        let continuation = sdk
+            .io(
+                session_id,
+                IoRequest {
+                    cursor: 2,
+                    ..IoRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(continuation.next_cursor, 3);
+        assert_eq!(continuation.output[0].data, b"p");
+        sdk.remove(session_id).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn waiting_exec_removes_a_session_when_inline_output_is_complete() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let result =
+            sandbox_exec_with_inline_limit(&sdk, json!({ "argv": successful_command() }), None, 3)
+                .await
+                .unwrap();
+        let session_id = result
+            .structured_content
+            .pointer("/status/session_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .parse::<SessionId>()
+            .unwrap();
+
+        assert_eq!(
+            result.structured_content.get("has_more"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            result.structured_content.get("continuation_cursor"),
+            Some(&Value::Null)
+        );
+        assert!(matches!(
+            sdk.wait(session_id).await,
+            Err(SdkError::UnknownSession(id)) if id == session_id
+        ));
     }
 
     #[test]

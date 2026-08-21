@@ -52,6 +52,95 @@ fn stdio_has_one_json_response_per_request() {
     assert!(trailing.is_empty(), "unexpected stdout: {trailing}");
 }
 
+#[cfg(unix)]
+#[test]
+fn large_waiting_exec_is_bounded_and_continues_with_sandbox_io() {
+    const INLINE_BYTES: usize = 1024 * 1024;
+    const TOTAL_BYTES: usize = INLINE_BYTES + 3;
+    let (mut child, mut stdin, responses, reader) = spawn_server();
+    initialize(&mut stdin, &responses);
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"sandbox_exec","arguments":{
+                "argv":["/bin/sh","-c","yes x | tr -d '\\n' | head -c 1048579"]
+            }}
+        }),
+    );
+    let first = read_response(&responses);
+    assert_eq!(
+        first.pointer("/result/structuredContent/has_more"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        first.pointer("/result/structuredContent/continuation_cursor"),
+        Some(&json!(INLINE_BYTES))
+    );
+    assert_eq!(
+        first.pointer("/result/structuredContent/output_next_cursor"),
+        Some(&json!(TOTAL_BYTES))
+    );
+    let inline_bytes = first
+        .pointer("/result/structuredContent/output")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .map(|chunk| chunk.get("text").and_then(Value::as_str).unwrap().len())
+        .sum::<usize>();
+    assert_eq!(inline_bytes, INLINE_BYTES);
+    let content_text = first
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(content_text.len() < 512);
+    assert!(!content_text.contains("xxxxxxxx"));
+    let session_id = first
+        .pointer("/result/structuredContent/status/session_id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
+
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"sandbox_io","arguments":{
+                "session_id":session_id,"cursor":INLINE_BYTES,"max_bytes":1024
+            }}
+        }),
+    );
+    let continuation = read_response(&responses);
+    assert_eq!(
+        continuation.pointer("/result/structuredContent/next_cursor"),
+        Some(&json!(TOTAL_BYTES))
+    );
+    let remaining_bytes = continuation
+        .pointer("/result/structuredContent/output")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .map(|chunk| chunk.get("text").and_then(Value::as_str).unwrap().len())
+        .sum::<usize>();
+    assert_eq!(remaining_bytes, 3);
+
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"sandbox_remove","arguments":{"session_id":session_id}}
+        }),
+    );
+    assert_eq!(
+        read_response(&responses).pointer("/result/structuredContent/removed"),
+        Some(&json!(true))
+    );
+    drop(stdin);
+    assert!(wait_for_child(&mut child).success());
+    reader.join().unwrap();
+    assert!(responses.try_iter().next().is_none());
+}
+
 #[test]
 fn controls_remain_responsive_during_a_waiting_exec() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_morae-mcp"))

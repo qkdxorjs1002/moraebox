@@ -228,7 +228,7 @@ The server exposes execution tools plus persistent Box management:
 | `sandbox_box_delete` / `sandbox_box_reset` | Permanently mutate an idle Box with explicit confirmation |
 | `sandbox_box_clone` | Create a new independent durable Box with explicit confirmation |
 
-Commands remain argv arrays in the MCP schema. Output chunks are exposed as UTF-8 text so agents can read them directly; invalid UTF-8 bytes are replaced with `U+FFFD`. Stdin bytes remain base64-encoded. The server permits up to 32 active runs. Completed asynchronous sessions remain readable for five minutes, or until `sandbox_remove` releases them explicitly; disconnecting the stdio client removes all connection-owned sessions.
+Commands remain argv arrays in the MCP schema. Output chunks are exposed as UTF-8 text so agents can read them directly; invalid UTF-8 bytes are replaced with `U+FFFD`. Stdin bytes remain base64-encoded. A waiting `sandbox_exec` response includes at most 1 MiB of output. When `has_more` is true, pass its `status.session_id` and `continuation_cursor` to `sandbox_io` within five minutes; executions whose output fits inline are removed immediately. The server permits up to 32 active runs. Completed asynchronous sessions remain readable for five minutes, or until `sandbox_remove` releases them explicitly; disconnecting the stdio client removes all connection-owned sessions.
 
 ## How it works
 

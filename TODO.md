@@ -133,7 +133,7 @@
 
 ### MCP protocol와 usability
 
-- [ ] `sandbox_exec(wait=true)`의 inline output에 상한과 continuation cursor를 추가한다.
+- [x] `sandbox_exec(wait=true)`의 inline output에 상한과 continuation cursor를 추가한다.
   - 큰 result를 `content.text`와 `structuredContent`에 두 번 복사하지 않는다.
   - 기본 output 형식은 현재의 lossy UTF-8 `text`를 유지한다.
 
