@@ -33,6 +33,15 @@ fn stdio_has_one_json_response_per_request() {
         stdout.read_line(&mut line).unwrap();
         let response: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(response.get("id"), request.get("id"));
+        if request.get("id") == Some(&json!(1)) {
+            writeln!(
+                stdin,
+                "{}",
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+            )
+            .unwrap();
+            stdin.flush().unwrap();
+        }
         if request.get("id") == Some(&json!(3)) {
             assert_eq!(
                 response.pointer("/result/structuredContent/output/0/text"),
@@ -50,6 +59,117 @@ fn stdio_has_one_json_response_per_request() {
     let mut trailing = String::new();
     stdout.read_to_string(&mut trailing).unwrap();
     assert!(trailing.is_empty(), "unexpected stdout: {trailing}");
+}
+
+#[test]
+fn stateless_direct_tools_reject_a_late_initialize() {
+    let (mut child, mut stdin, responses, reader) = spawn_server();
+    write_request(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+    );
+    assert!(
+        read_response(&responses)
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .is_some()
+    );
+
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":2,"method":"initialize",
+            "params":{"protocolVersion":"2025-11-25"}
+        }),
+    );
+    assert_eq!(
+        read_response(&responses).pointer("/error/code"),
+        Some(&json!(-32600))
+    );
+
+    write_request(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+    );
+    assert!(read_response(&responses).get("result").is_some());
+    drop(stdin);
+    assert!(wait_for_child(&mut child).success());
+    reader.join().unwrap();
+    assert!(responses.try_iter().next().is_none());
+}
+
+#[test]
+fn legacy_initialize_validates_version_and_waits_for_notification() {
+    let (mut child, mut stdin, responses, reader) = spawn_server();
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"unsupported"}
+        }),
+    );
+    assert_eq!(
+        read_response(&responses).pointer("/error/code"),
+        Some(&json!(-32602))
+    );
+
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":2,"method":"initialize",
+            "params":{"protocolVersion":"2025-11-25"}
+        }),
+    );
+    assert_eq!(
+        read_response(&responses).pointer("/result/protocolVersion"),
+        Some(&json!("2025-11-25"))
+    );
+
+    write_request(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+    );
+    assert_eq!(
+        read_response(&responses).pointer("/error/code"),
+        Some(&json!(-32002))
+    );
+
+    write_request(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    );
+    write_request(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}),
+    );
+    assert!(read_response(&responses).get("result").is_some());
+
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":5,"method":"initialize",
+            "params":{"protocolVersion":"2025-11-25"}
+        }),
+    );
+    assert_eq!(
+        read_response(&responses).pointer("/error/code"),
+        Some(&json!(-32600))
+    );
+
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":999}
+        }),
+    );
+    write_request(&mut stdin, &json!({"jsonrpc":"2.0","id":6,"method":"ping"}));
+    assert_eq!(read_response(&responses).get("id"), Some(&json!(6)));
+
+    drop(stdin);
+    assert!(wait_for_child(&mut child).success());
+    reader.join().unwrap();
+    assert!(responses.try_iter().next().is_none());
 }
 
 #[test]
@@ -226,6 +346,10 @@ fn controls_remain_responsive_during_a_waiting_exec() {
         &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}),
     );
     assert_eq!(read_response(&responses).get("id"), Some(&json!(1)));
+    write_request(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    );
 
     write_request(
         &mut stdin,
@@ -571,6 +695,10 @@ fn initialize(stdin: &mut impl Write, responses: &mpsc::Receiver<String>) {
         }),
     );
     assert_eq!(read_response(responses).get("id"), Some(&json!(1)));
+    write_request(
+        stdin,
+        &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    );
 }
 
 fn wait_for_child(child: &mut Child) -> ExitStatus {

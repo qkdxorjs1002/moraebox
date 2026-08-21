@@ -148,7 +148,7 @@
 - [x] `sandbox_wait` 또는 `sandbox_io.wait_ms`와 session list/status/remove 도구를 추가한다.
   - polling interval을 강제하지 않고 bounded long-poll을 제공한다.
 
-- [ ] initialize state와 지원 protocol version을 검증하고 `initialized`/cancel notification을 처리한다.
+- [x] initialize state와 지원 protocol version을 검증하고 `initialized`/cancel notification을 처리한다.
 
 - [ ] 각 tool에 `outputSchema`와 실제 side effect에 맞는 annotations를 추가한다.
   - persistent Box에서 실행하는 `sandbox_exec`와 signal/stop의 mutation을 숨기지 않는다.

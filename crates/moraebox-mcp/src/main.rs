@@ -39,6 +39,7 @@ use tokio::{
 };
 
 const PROTOCOL_VERSION: &str = "2026-07-28";
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = [PROTOCOL_VERSION, "2025-11-25", "2025-06-18"];
 const MAX_CONCURRENT_REQUESTS: usize = 32;
 const RESPONSE_QUEUE_CAPACITY: usize = 128;
 const SANDBOX_EXEC_INLINE_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -146,6 +147,67 @@ struct BoxServices {
     credentials: Option<Credentials>,
     mke2fs_path: PathBuf,
     default_disk_size: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ConnectionState {
+    #[default]
+    Undecided,
+    AwaitingInitialized,
+    LegacyReady,
+    Stateless,
+}
+
+impl ConnectionState {
+    fn accept_request(&mut self, request: &Value) -> Result<(), (i32, String)> {
+        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+        match method {
+            "initialize" => {
+                initialize_protocol_version(request).map_err(|message| (-32602, message))?;
+                if *self != Self::Undecided {
+                    return Err((
+                        -32600,
+                        "initialize is only valid before selecting a protocol mode".into(),
+                    ));
+                }
+                *self = Self::AwaitingInitialized;
+            }
+            "tools/list" | "tools/call" => match self {
+                Self::Undecided => *self = Self::Stateless,
+                Self::AwaitingInitialized => {
+                    return Err((
+                        -32002,
+                        "server initialization is not complete; send notifications/initialized"
+                            .into(),
+                    ));
+                }
+                Self::LegacyReady | Self::Stateless => {}
+            },
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn initialized(&mut self) {
+        if *self == Self::AwaitingInitialized {
+            *self = Self::LegacyReady;
+        }
+    }
+}
+
+fn initialize_protocol_version(request: &Value) -> Result<&str, String> {
+    let version = request
+        .pointer("/params/protocolVersion")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "initialize params.protocolVersion is required".to_owned())?;
+    if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+        Ok(version)
+    } else {
+        Err(format!(
+            "unsupported protocol version {version}; supported versions: {}",
+            SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+        ))
+    }
 }
 
 #[tokio::main]
@@ -297,6 +359,7 @@ async fn serve(server: McpServer) -> Result<(), Box<dyn std::error::Error>> {
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
     let inflight: InflightRequests = Arc::new(StdMutex::new(HashMap::new()));
     let mut requests = JoinSet::new();
+    let mut connection_state = ConnectionState::default();
     let input_error = loop {
         let line = match input.next_line().await {
             Ok(Some(line)) => line,
@@ -322,13 +385,14 @@ async fn serve(server: McpServer) -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
-        if request.get("method").and_then(Value::as_str) == Some("notifications/cancelled") {
-            if let Some(request_id) = request.pointer("/params/requestId") {
-                cancel_request(&inflight, request_id);
-            }
-            continue;
-        }
-        if request.get("id").is_none() {
+        let should_dispatch =
+            match should_dispatch_request(&request, &mut connection_state, &inflight, &responses)
+                .await
+            {
+                Ok(should_dispatch) => should_dispatch,
+                Err(error) => break Some(error),
+            };
+        if !should_dispatch {
             continue;
         }
         if let Err(error) = dispatch_request(
@@ -378,6 +442,36 @@ async fn serve(server: McpServer) -> Result<(), Box<dyn std::error::Error>> {
     }
     writer_result?;
     Ok(())
+}
+
+async fn should_dispatch_request(
+    request: &Value,
+    connection_state: &mut ConnectionState,
+    inflight: &InflightRequests,
+    responses: &mpsc::Sender<Value>,
+) -> io::Result<bool> {
+    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+    if method == "notifications/cancelled" {
+        if let Some(request_id) = request.pointer("/params/requestId") {
+            cancel_request(inflight, request_id);
+        }
+        return Ok(false);
+    }
+    if request.get("id").is_none() {
+        if method == "notifications/initialized" {
+            connection_state.initialized();
+        }
+        return Ok(false);
+    }
+    if let Err((code, message)) = connection_state.accept_request(request) {
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        responses
+            .send(protocol_error(id, code, &message))
+            .await
+            .map_err(|_| response_writer_stopped())?;
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 async fn dispatch_request(
@@ -516,15 +610,18 @@ async fn handle_request_inner(
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     match method {
-        "initialize" => success(
-            id,
-            json!({
-                "protocolVersion": request.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION),
-                "capabilities": { "tools": { "listChanged": false } },
-                "serverInfo": { "name": "moraebox", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": SERVER_INSTRUCTIONS
-            }),
-        ),
+        "initialize" => match initialize_protocol_version(&request) {
+            Ok(version) => success(
+                id,
+                json!({
+                    "protocolVersion": version,
+                    "capabilities": { "tools": { "listChanged": false } },
+                    "serverInfo": { "name": "moraebox", "version": env!("CARGO_PKG_VERSION") },
+                    "instructions": SERVER_INSTRUCTIONS
+                }),
+            ),
+            Err(message) => protocol_error(id, -32602, &message),
+        },
         "ping" => success(id, json!({})),
         "tools/list" => success(id, tools_list()),
         "tools/call" => {
@@ -1640,6 +1737,44 @@ fn parse_disk_size(input: &str) -> Result<u64, String> {
 mod tests {
     use super::*;
     use moraebox_image::Digest;
+
+    #[test]
+    fn connection_state_supports_stateless_and_legacy_modes() {
+        let tools = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+        let initialize = json!({
+            "jsonrpc":"2.0","id":2,"method":"initialize",
+            "params":{"protocolVersion":"2025-11-25"}
+        });
+
+        let mut stateless = ConnectionState::default();
+        stateless.accept_request(&tools).unwrap();
+        assert_eq!(stateless, ConnectionState::Stateless);
+        assert_eq!(stateless.accept_request(&initialize).unwrap_err().0, -32600);
+
+        let mut legacy = ConnectionState::default();
+        legacy.accept_request(&initialize).unwrap();
+        assert_eq!(legacy, ConnectionState::AwaitingInitialized);
+        assert_eq!(legacy.accept_request(&tools).unwrap_err().0, -32002);
+        legacy.initialized();
+        legacy.accept_request(&tools).unwrap();
+        assert_eq!(legacy, ConnectionState::LegacyReady);
+    }
+
+    #[test]
+    fn initialize_protocol_version_is_required_and_bounded() {
+        for version in SUPPORTED_PROTOCOL_VERSIONS {
+            let request = json!({"params":{"protocolVersion":version}});
+            assert_eq!(initialize_protocol_version(&request).unwrap(), version);
+        }
+        assert!(initialize_protocol_version(&json!({"params":{}})).is_err());
+        assert!(
+            initialize_protocol_version(&json!({
+                "params":{"protocolVersion":"2099-01-01"}
+            }))
+            .unwrap_err()
+            .contains("unsupported protocol version")
+        );
+    }
 
     #[tokio::test]
     async fn initialize_list_and_call_work() {
