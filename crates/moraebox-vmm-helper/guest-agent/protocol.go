@@ -104,6 +104,13 @@ func (w *frameWriter) send(payload int, body []byte) error {
 	return writeAll(w.w, frame)
 }
 
+func syncAndSendExit(writer *frameWriter, code int32, signal *int32, syncFilesystems func()) error {
+	// A persistent Box becomes reusable as soon as the host receives Exit. Flush guest writes
+	// first so the host cannot stop the VMM while ext4 still has dirty data in memory.
+	syncFilesystems()
+	return writer.send(payloadExit, encodeExit(code, signal))
+}
+
 func readFrame(r io.Reader) (wireFrame, error) {
 	var header [4]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {

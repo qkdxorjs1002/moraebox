@@ -8,7 +8,7 @@ use fs2::FileExt;
 use moraebox_core::BoxId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tar::{Archive, Builder, Entry, EntryType, Header};
+use tar::{Archive, Builder, Entry, EntryType, GnuExtSparseHeader, Header};
 
 use super::{
     BoxDiskFormat, BoxMetadata, BoxState, BoxStore, BoxStoreError, LOCK_FILE, METADATA_FILE,
@@ -25,6 +25,236 @@ const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
 const MAX_ROOT_DISK_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+
+struct SparseArchiveWriter<'a> {
+    output: &'a mut File,
+    logical_position: u64,
+    hasher: Sha256,
+}
+
+impl<'a> SparseArchiveWriter<'a> {
+    fn new(output: &'a mut File) -> Self {
+        Self {
+            output,
+            logical_position: 0,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> io::Result<(u64, String)> {
+        self.output.set_len(self.logical_position)?;
+        self.output.seek(SeekFrom::Start(self.logical_position))?;
+        Ok((
+            self.logical_position,
+            format!("sha256:{:x}", self.hasher.finalize()),
+        ))
+    }
+}
+
+impl Write for SparseArchiveWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let buffer_len = u64::try_from(buffer.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "archive write is too large")
+        })?;
+        let next_position = self
+            .logical_position
+            .checked_add(buffer_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "archive is too large"))?;
+        if buffer.iter().all(|byte| *byte == 0) {
+            let offset = i64::try_from(buffer.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "archive write is too large")
+            })?;
+            self.output.seek(SeekFrom::Current(offset))?;
+        } else {
+            self.output.write_all(buffer)?;
+        }
+        self.hasher.update(buffer);
+        self.logical_position = next_position;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SparseExtent {
+    offset: u64,
+    length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SparseMap {
+    logical_size: u64,
+    stored_size: u64,
+    extents: Vec<SparseExtent>,
+}
+
+fn append_sparse_file<W: Write>(
+    builder: &mut Builder<W>,
+    source_path: &Path,
+    archive_path: &str,
+) -> Result<bool, BoxStoreError> {
+    let mut source = File::open(source_path)?;
+    let logical_size = source.metadata()?.len();
+    let Some(map) = find_sparse_map(&mut source, logical_size)? else {
+        return Ok(false);
+    };
+    append_sparse_mapped_file(builder, &mut source, archive_path, &map)?;
+    Ok(true)
+}
+
+fn append_sparse_mapped_file<W: Write>(
+    builder: &mut Builder<W>,
+    source: &mut File,
+    archive_path: &str,
+    map: &SparseMap,
+) -> Result<(), BoxStoreError> {
+    let mut header = Header::new_gnu();
+    header.set_path(archive_path)?;
+    header.set_entry_type(EntryType::GNUSparse);
+    header.set_mode(0o600);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_size(map.stored_size);
+    let gnu_header = header
+        .as_gnu_mut()
+        .ok_or_else(|| io::Error::other("GNU sparse entry requires a GNU header"))?;
+    gnu_header.set_real_size(map.logical_size);
+    for (extent, sparse_header) in map.extents.iter().zip(&mut gnu_header.sparse) {
+        sparse_header.set_offset(extent.offset);
+        sparse_header.set_length(extent.length);
+    }
+    let inline_extent_count = gnu_header.sparse.len();
+    gnu_header.set_is_extended(map.extents.len() > inline_extent_count);
+    header.set_cksum();
+
+    let output = builder.get_mut();
+    output.write_all(header.as_bytes())?;
+    let remaining_extents = &map.extents[inline_extent_count.min(map.extents.len())..];
+    let extended_capacity = GnuExtSparseHeader::new().sparse().len();
+    for (index, chunk) in remaining_extents.chunks(extended_capacity).enumerate() {
+        let mut extended = GnuExtSparseHeader::new();
+        for (extent, sparse_header) in chunk.iter().zip(extended.sparse_mut()) {
+            sparse_header.set_offset(extent.offset);
+            sparse_header.set_length(extent.length);
+        }
+        extended.set_is_extended((index + 1) * extended_capacity < remaining_extents.len());
+        output.write_all(extended.as_bytes())?;
+    }
+
+    for extent in map.extents.iter().filter(|extent| extent.length > 0) {
+        source.seek(SeekFrom::Start(extent.offset))?;
+        let copied = io::copy(&mut Read::by_ref(source).take(extent.length), &mut *output)?;
+        if copied != extent.length {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "root disk changed while exporting a sparse extent",
+            )
+            .into());
+        }
+    }
+    let padding = (512 - (map.stored_size % 512)) % 512;
+    if padding > 0 {
+        let padding = usize::try_from(padding)
+            .map_err(|_| io::Error::other("sparse archive padding does not fit in usize"))?;
+        output.write_all(&[0_u8; 512][..padding])?;
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "illumos",
+    target_os = "solaris"
+))]
+fn find_sparse_map(source: &mut File, logical_size: u64) -> io::Result<Option<SparseMap>> {
+    use rustix::{fs::SeekFrom as RustixSeekFrom, io::Errno};
+
+    if logical_size == 0 {
+        return Ok(None);
+    }
+    let mut data_offset = match rustix::fs::seek(&*source, RustixSeekFrom::Data(0)) {
+        Ok(offset) => offset,
+        Err(Errno::NXIO) => {
+            return Ok(Some(SparseMap {
+                logical_size,
+                stored_size: 0,
+                extents: vec![SparseExtent {
+                    offset: logical_size,
+                    length: 0,
+                }],
+            }));
+        }
+        Err(Errno::INVAL | Errno::NOTSUP) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut stored_size = 0_u64;
+    let mut extents = Vec::new();
+    while data_offset < logical_size {
+        let hole_offset = rustix::fs::seek(&*source, RustixSeekFrom::Hole(data_offset))
+            .map_err(io::Error::from)?;
+        if hole_offset <= data_offset || hole_offset > logical_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "root disk sparse extent is outside its logical size",
+            ));
+        }
+        let length = hole_offset - data_offset;
+        extents.push(SparseExtent {
+            offset: data_offset,
+            length,
+        });
+        stored_size = stored_size
+            .checked_add(length)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "root disk is too large"))?;
+        if hole_offset == logical_size {
+            break;
+        }
+        data_offset = match rustix::fs::seek(&*source, RustixSeekFrom::Data(hole_offset)) {
+            Ok(offset) if offset > hole_offset && offset <= logical_size => offset,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "root disk sparse data offset did not advance",
+                ));
+            }
+            Err(Errno::NXIO) => break,
+            Err(error) => return Err(error.into()),
+        };
+    }
+    source.seek(SeekFrom::Start(0))?;
+    if extents.len() == 1 && extents[0].offset == 0 && extents[0].length == logical_size {
+        return Ok(None);
+    }
+    extents.push(SparseExtent {
+        offset: logical_size,
+        length: 0,
+    });
+    Ok(Some(SparseMap {
+        logical_size,
+        stored_size,
+        extents,
+    }))
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "illumos",
+    target_os = "solaris"
+)))]
+fn find_sparse_map(_source: &mut File, _logical_size: u64) -> io::Result<Option<SparseMap>> {
+    Ok(None)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoxBundleReport {
@@ -125,17 +355,22 @@ impl BoxStore {
                 .create_new(true)
                 .open(&temporary)?;
             set_file_permissions(&temporary)?;
-            {
-                let mut builder = Builder::new(&mut output);
-                builder.sparse(true);
-                append_bytes(&mut builder, MANIFEST_FILE, &manifest_bytes)?;
-                append_bytes(&mut builder, METADATA_FILE, &metadata_bytes)?;
-                builder.append_path_with_name(lease.disk_path(), ROOT_DISK_FILE)?;
-                builder.finish()?;
-            }
+            let (size_bytes, sha256) = {
+                let mut sparse_output = SparseArchiveWriter::new(&mut output);
+                {
+                    let mut builder = Builder::new(&mut sparse_output);
+                    builder.sparse(true);
+                    append_bytes(&mut builder, MANIFEST_FILE, &manifest_bytes)?;
+                    append_bytes(&mut builder, METADATA_FILE, &metadata_bytes)?;
+                    if !append_sparse_file(&mut builder, lease.disk_path(), ROOT_DISK_FILE)? {
+                        builder.append_path_with_name(lease.disk_path(), ROOT_DISK_FILE)?;
+                    }
+                    builder.finish()?;
+                }
+                sparse_output.finish()?
+            };
             output.sync_all()?;
             drop(output);
-            let (size_bytes, sha256) = hash_file(&temporary)?;
             match fs::hard_link(&temporary, destination) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -227,8 +462,11 @@ impl BoxStore {
             ));
         }
         let disk_path = staging.join(ROOT_DISK_FILE);
-        let digest =
-            copy_sparse_and_hash(&mut disk_entry, &disk_path, manifest.root_disk_size_bytes)?;
+        let digest = if disk_entry.header().entry_type().is_gnu_sparse() {
+            unpack_gnu_sparse_and_hash(&mut disk_entry, &disk_path, manifest.root_disk_size_bytes)?
+        } else {
+            copy_sparse_and_hash(&mut disk_entry, &disk_path, manifest.root_disk_size_bytes)?
+        };
         if digest != manifest.root_disk_sha256 {
             return Err(BoxStoreError::InvalidBundle(
                 "root disk SHA-256 does not match the manifest".into(),
@@ -260,8 +498,8 @@ impl BoxStore {
     }
 }
 
-fn append_bytes(
-    builder: &mut Builder<&mut File>,
+fn append_bytes<W: Write>(
+    builder: &mut Builder<W>,
     path: &str,
     bytes: &[u8],
 ) -> Result<(), BoxStoreError> {
@@ -363,6 +601,37 @@ fn copy_sparse_and_hash(
     output.set_len(total)?;
     output.sync_all()?;
     Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn unpack_gnu_sparse_and_hash<R: Read>(
+    entry: &mut Entry<'_, R>,
+    destination: &Path,
+    expected_size: u64,
+) -> Result<String, BoxStoreError> {
+    // The tar crate has already validated the GNU sparse map. Its unpack path seeks over each
+    // declared hole, preserving fragmented ext4 image sparsity more accurately than scanning an
+    // expanded zero stream in fixed-size buffers.
+    let _ = entry.unpack(destination)?;
+    set_file_permissions(destination)?;
+    let output = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(destination)?;
+    let actual_size = output.metadata()?.len();
+    if actual_size != expected_size || actual_size > MAX_ROOT_DISK_BYTES {
+        return Err(BoxStoreError::InvalidBundle(format!(
+            "root disk size {actual_size} does not match declared size {expected_size}"
+        )));
+    }
+    output.sync_all()?;
+    drop(output);
+    let (hashed_size, digest) = hash_file(destination)?;
+    if hashed_size != expected_size {
+        return Err(BoxStoreError::InvalidBundle(format!(
+            "root disk size {hashed_size} does not match declared size {expected_size}"
+        )));
+    }
+    Ok(digest)
 }
 
 fn validate_imported_metadata(metadata: &BoxMetadata) -> Result<(), BoxStoreError> {
@@ -559,6 +828,61 @@ mod tests {
     }
 
     #[test]
+    fn extended_gnu_sparse_headers_round_trip() {
+        const BLOCK_BYTES: u64 = 4096;
+        const LOGICAL_BYTES: u64 = 64 * 1024;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("extended-sparse.ext4");
+        let mut source = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(source_path)
+            .unwrap();
+        source.set_len(LOGICAL_BYTES).unwrap();
+        let mut expected = vec![0_u8; usize::try_from(LOGICAL_BYTES).unwrap()];
+        let mut extents = Vec::new();
+        for index in 0_u64..6 {
+            let offset = index * 2 * BLOCK_BYTES;
+            let bytes =
+                vec![u8::try_from(index + 1).unwrap(); usize::try_from(BLOCK_BYTES).unwrap()];
+            source.seek(SeekFrom::Start(offset)).unwrap();
+            source.write_all(&bytes).unwrap();
+            expected
+                [usize::try_from(offset).unwrap()..usize::try_from(offset + BLOCK_BYTES).unwrap()]
+                .copy_from_slice(&bytes);
+            extents.push(SparseExtent {
+                offset,
+                length: BLOCK_BYTES,
+            });
+        }
+        extents.push(SparseExtent {
+            offset: LOGICAL_BYTES,
+            length: 0,
+        });
+        let map = SparseMap {
+            logical_size: LOGICAL_BYTES,
+            stored_size: 6 * BLOCK_BYTES,
+            extents,
+        };
+
+        let mut builder = Builder::new(Vec::new());
+        append_sparse_mapped_file(&mut builder, &mut source, ROOT_DISK_FILE, &map).unwrap();
+        builder.finish().unwrap();
+        let bytes = builder.into_inner().unwrap();
+        let mut archive = Archive::new(io::Cursor::new(bytes));
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().unwrap().unwrap();
+        assert!(entry.header().entry_type().is_gnu_sparse());
+        assert_eq!(entry.size(), LOGICAL_BYTES);
+        let mut actual = Vec::new();
+        entry.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert!(entries.next().is_none());
+    }
+
+    #[test]
     fn bundle_round_trip_preserves_metadata_content_and_sparse_disk() {
         let (temporary, store, disk) = fixture_with_size(SPARSE_DISK_BYTES);
         let created = store
@@ -573,6 +897,17 @@ mod tests {
         let bundle = temporary.path().join("box.tar");
         let report = store.export_bundle(created.box_id, &bundle).unwrap();
         assert_eq!(report.sha256, hash_file(&bundle).unwrap().1);
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "illumos",
+            target_os = "solaris"
+        ))]
+        {
+            assert!(report.size_bytes < SPARSE_DISK_BYTES / 4);
+            assert!(allocated_size_bytes(&bundle).unwrap() < SPARSE_DISK_BYTES / 4);
+        }
 
         store
             .update(

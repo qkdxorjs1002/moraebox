@@ -165,7 +165,7 @@ func serve(connection *os.File, sessionID string) (int, error) {
 }
 
 func sendExitAndWait(writer *frameWriter, code int32, signal *int32) (int, error) {
-	if err := writer.send(payloadExit, encodeExit(code, signal)); err != nil {
+	if err := syncAndSendExit(writer, code, signal, syscall.Sync); err != nil {
 		return 125, err
 	}
 	// The host bridge owns final process termination. Keeping the guest agent alive after

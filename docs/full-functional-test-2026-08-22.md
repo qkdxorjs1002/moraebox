@@ -5,7 +5,8 @@
 The host quality gate, the signed Apple Silicon smoke suite, and the full Rust
 workspace test suite running inside a moraebox microVM passed. The live
 functional suite found one release-blocking persistent Box durability defect
-and one Box bundle sparsity/performance defect candidate.
+and one Box bundle sparsity/performance defect candidate. Both findings were
+fixed and revalidated on `fix/box-durability-sparse-export-20260822`.
 
 ## Environment
 
@@ -92,7 +93,26 @@ overlay.
   when the original guest explicitly flushed the filesystem
 - all three test Boxes were deleted and the isolated test state was empty
 
-## Finding 1 — normal Box exit can lose guest writes
+## Fix verification
+
+- The guest agent now flushes guest filesystems before sending the Exit frame.
+  The README persistence example passed on two fresh real-backend microVMs
+  without an explicit `sync`; the second VM read `fixed-without-explicit-sync`.
+- macOS export now discovers disk extents with `SEEK_DATA`/`SEEK_HOLE` and emits
+  GNU sparse tar headers, including extended headers. A 4 GiB Box produced a
+  1,220,006,400-byte bundle with 1,236,643,840 allocated bytes instead of a
+  roughly 4 GiB bundle. Debug-build export time fell from 404.71 seconds on the
+  regular-tar baseline to 253.62 seconds.
+- Extent-aware import restored the 4 GiB disk with 1,313,243,136 allocated bytes;
+  the earlier zero-buffer import path allocated 3,196,321,792 bytes. The
+  imported Box booted and read the persisted file successfully.
+- Regression coverage checks exit flush ordering, exported bundle logical and
+  allocated size, sparse round-trip content, and GNU extended sparse headers.
+- `cargo fmt --all -- --check`, workspace clippy with warnings denied, all 383
+  Rust tests, Go guest-agent tests, strict JSON doctor, and the signed native
+  egress smoke suite passed after the fixes.
+
+## Finding 1 — normal Box exit can lose guest writes (resolved)
 
 Severity: release blocker candidate.
 
@@ -125,7 +145,11 @@ Recommended regression: on the signed real backend, run the README example
 without `sync` and require the second VM to read the file. The clean-exit path
 should flush the writable filesystem before reporting a Box as reusable.
 
-## Finding 2 — exported Box bundle was not physically sparse
+Resolution: the guest agent calls the Linux filesystem sync operation before
+the Exit frame is written, with a unit test that fails if frame output begins
+before the flush callback.
+
+## Finding 2 — exported Box bundle was not physically sparse (resolved)
 
 Severity: performance and disk-usage defect candidate.
 
@@ -143,6 +167,11 @@ possible.
 An import with a duplicate Box name was safely rejected, but only after the
 large bundle had been verified and extracted. Earlier name-conflict detection
 would avoid that unnecessary work.
+
+Resolution: export uses a platform-independent sparse archive writer as a safe
+fallback and emits compact GNU sparse entries on supported Unix hosts. Import
+uses the validated GNU extent map rather than fixed-size zero detection, so
+fragmented disk holes remain sparse after restoration.
 
 ## Test setup notes, not product failures
 

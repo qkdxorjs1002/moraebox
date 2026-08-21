@@ -7,6 +7,12 @@ import (
 	"testing"
 )
 
+type writeFunc func([]byte) (int, error)
+
+func (write writeFunc) Write(buffer []byte) (int, error) {
+	return write(buffer)
+}
+
 func TestFrameGoldenVector(t *testing.T) {
 	frame := encodeFrame(wireFrame{
 		version:   1,
@@ -77,5 +83,25 @@ func TestCopyOutRequestRoundTrip(t *testing.T) {
 	}
 	if request.transferID != 7 || request.source != "/workspace/result" || request.maxBytes != 4096 {
 		t.Fatalf("unexpected copy-out request: %#v", request)
+	}
+}
+
+func TestExitFlushesFilesystemsBeforeNotifyingHost(t *testing.T) {
+	flushed := false
+	writer := &frameWriter{
+		w: writeFunc(func(buffer []byte) (int, error) {
+			if !flushed {
+				t.Fatal("exit frame was written before filesystems were flushed")
+			}
+			return len(buffer), nil
+		}),
+		sessionID: "session",
+	}
+
+	if err := syncAndSendExit(writer, 0, nil, func() { flushed = true }); err != nil {
+		t.Fatal(err)
+	}
+	if !flushed {
+		t.Fatal("filesystems were not flushed")
 	}
 }
