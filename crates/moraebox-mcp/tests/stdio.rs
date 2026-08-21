@@ -441,6 +441,91 @@ fn explicit_remove_stops_and_forgets_a_session_idempotently() {
     assert!(responses.try_iter().next().is_none());
 }
 
+#[test]
+fn session_list_status_and_bounded_io_wait_are_exposed() {
+    let (mut child, mut stdin, responses, reader) = spawn_server();
+    initialize(&mut stdin, &responses);
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"sandbox_exec","arguments":{
+                "argv":long_running_command(),"wait":false
+            }}
+        }),
+    );
+    let session_id = read_response(&responses)
+        .pointer("/result/structuredContent/status/session_id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
+
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"sandbox_session_list","arguments":{}}
+        }),
+    );
+    let listed = read_response(&responses);
+    assert!(
+        listed
+            .pointer("/result/structuredContent/sessions")
+            .and_then(Value::as_array)
+            .is_some_and(|sessions| sessions.iter().any(|status| {
+                status.get("session_id").and_then(Value::as_str) == Some(session_id.as_str())
+            }))
+    );
+
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"sandbox_session_status","arguments":{"session_id":session_id}}
+        }),
+    );
+    assert_eq!(
+        read_response(&responses)
+            .pointer("/result/structuredContent/status/session_id")
+            .and_then(Value::as_str),
+        Some(session_id.as_str())
+    );
+
+    let started = Instant::now();
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":5,"method":"tools/call",
+            "params":{"name":"sandbox_io","arguments":{
+                "session_id":session_id,"wait_ms":25
+            }}
+        }),
+    );
+    let waited = read_response(&responses);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(
+        waited
+            .pointer("/result/structuredContent/wait_timed_out")
+            .is_some_and(Value::is_boolean)
+    );
+
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":6,"method":"tools/call",
+            "params":{"name":"sandbox_remove","arguments":{"session_id":session_id}}
+        }),
+    );
+    assert_eq!(
+        read_response(&responses).pointer("/result/structuredContent/removed"),
+        Some(&json!(true))
+    );
+    drop(stdin);
+    assert!(wait_for_child(&mut child).success());
+    reader.join().unwrap();
+    assert!(responses.try_iter().next().is_none());
+}
+
 fn write_request(stdin: &mut impl Write, request: &Value) {
     writeln!(stdin, "{request}").unwrap();
     stdin.flush().unwrap();
@@ -551,10 +636,20 @@ fn delayed_command() -> Vec<String> {
 #[cfg(windows)]
 fn long_running_command() -> Vec<String> {
     vec![
-        windows_system_executable("ping.exe"),
-        "-n".into(),
-        "31".into(),
-        "127.0.0.1".into(),
+        std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").expect("Windows must define SystemRoot"),
+        )
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe")
+        .to_string_lossy()
+        .into_owned(),
+        "-NoLogo".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+        "Start-Sleep -Seconds 30".into(),
     ]
 }
 

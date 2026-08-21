@@ -439,6 +439,24 @@ impl SandboxSdk {
         if let Some(signal) = request.signal {
             handle.signal(signal).await?;
         }
+        let wait_timed_out = if let Some(wait_timeout) = request.wait_timeout {
+            handle.read_output(request.cursor, 0).await?;
+            let wait_for_change = async {
+                tokio::select! {
+                    result = handle.wait_for_output(request.cursor) => result.map(|_| ()),
+                    result = handle.wait() => result.map(|_| ()),
+                }
+            };
+            match tokio::time::timeout(wait_timeout, wait_for_change).await {
+                Ok(result) => {
+                    result?;
+                    false
+                }
+                Err(_) => true,
+            }
+        } else {
+            false
+        };
         let output = handle
             .read_output(request.cursor, request.max_bytes)
             .await?;
@@ -453,7 +471,24 @@ impl SandboxSdk {
             output: output.chunks,
             next_cursor: output.next_cursor,
             truncated: output.truncated,
+            wait_timed_out,
         })
+    }
+
+    /// Returns the current status without waiting for the session to finish.
+    pub async fn status(&self, session_id: SessionId) -> Result<SessionStatus, SdkError> {
+        Ok(self.session(session_id).await?.status())
+    }
+
+    /// Lists current connection-owned sessions in stable `SessionId` order.
+    pub async fn list_sessions(&self) -> Vec<SessionStatus> {
+        let sessions = self.sessions.read().await;
+        let mut statuses = sessions
+            .values()
+            .map(|entry| entry.handle.status())
+            .collect::<Vec<_>>();
+        statuses.sort_unstable_by_key(|status| status.session_id.to_string());
+        statuses
     }
 
     pub async fn wait(&self, session_id: SessionId) -> Result<SessionStatus, SdkError> {
@@ -605,6 +640,7 @@ pub struct IoRequest {
     pub close_stdin: bool,
     pub resize: Option<(u16, u16)>,
     pub signal: Option<Signal>,
+    pub wait_timeout: Option<Duration>,
 }
 
 impl Default for IoRequest {
@@ -616,6 +652,7 @@ impl Default for IoRequest {
             close_stdin: false,
             resize: None,
             signal: None,
+            wait_timeout: None,
         }
     }
 }
@@ -626,6 +663,7 @@ pub struct IoResult {
     pub output: Vec<OutputChunk>,
     pub next_cursor: u64,
     pub truncated: bool,
+    pub wait_timed_out: bool,
 }
 
 #[derive(Debug, Error)]
@@ -685,28 +723,72 @@ mod tests {
                 IoRequest {
                     stdin: Some(b"sdk\n".to_vec()),
                     close_stdin: true,
+                    wait_timeout: Some(Duration::from_secs(2)),
                     ..IoRequest::default()
                 },
             )
             .await
             .unwrap();
-        let status = sdk.wait(status.session_id).await.unwrap();
-        let output = sdk
-            .io(
-                status.session_id,
-                IoRequest {
-                    cursor: first.next_cursor,
-                    ..IoRequest::default()
-                },
-            )
-            .await
-            .unwrap();
+        assert!(!first.wait_timed_out);
         assert!(
-            output
+            first
                 .output
                 .iter()
                 .any(|chunk| chunk.data.starts_with(b"sdk"))
         );
+        sdk.wait(status.session_id).await.unwrap();
+        sdk.remove(status.session_id).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn io_long_poll_times_out_without_fixed_interval_polling() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let status = sdk
+            .start(RunSpec::command(long_running_command()))
+            .await
+            .unwrap();
+
+        let result = sdk
+            .io(
+                status.session_id,
+                IoRequest {
+                    wait_timeout: Some(Duration::from_millis(25)),
+                    ..IoRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(result.wait_timed_out);
+        assert!(result.output.is_empty());
+        assert_ne!(result.status.state, SessionState::Dead);
+        sdk.remove(status.session_id).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_status_and_list_are_current_and_stably_ordered() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let first = sdk
+            .start(RunSpec::command(long_running_command()))
+            .await
+            .unwrap();
+        let second = sdk
+            .start(RunSpec::command(long_running_command()))
+            .await
+            .unwrap();
+
+        assert_eq!(sdk.status(first.session_id).await.unwrap(), first);
+        let sessions = sdk.list_sessions().await;
+        let session_ids = sessions
+            .iter()
+            .map(|status| status.session_id.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(session_ids.len(), 2);
+        assert!(session_ids.windows(2).all(|pair| pair[0] < pair[1]));
+
+        sdk.remove(first.session_id).await.unwrap().unwrap();
+        sdk.remove(second.session_id).await.unwrap().unwrap();
+        assert!(sdk.list_sessions().await.is_empty());
     }
 
     #[tokio::test]
@@ -1153,10 +1235,20 @@ mod tests {
     #[cfg(windows)]
     fn long_running_command() -> Vec<String> {
         vec![
-            windows_system_executable("ping.exe"),
-            "-n".into(),
-            "31".into(),
-            "127.0.0.1".into(),
+            std::path::PathBuf::from(
+                std::env::var_os("SystemRoot").expect("Windows must define SystemRoot"),
+            )
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe")
+            .to_string_lossy()
+            .into_owned(),
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            "Start-Sleep -Seconds 30".into(),
         ]
     }
 

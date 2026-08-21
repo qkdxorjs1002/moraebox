@@ -10,6 +10,7 @@ use std::{
     process::ExitCode,
     str::FromStr,
     sync::{Arc, Mutex as StdMutex},
+    time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -43,6 +44,7 @@ const RESPONSE_QUEUE_CAPACITY: usize = 128;
 const SANDBOX_EXEC_INLINE_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_MCP_STDIN_BYTES: usize = 1024 * 1024;
 const MAX_MCP_STDIN_BASE64_CHARS: usize = MAX_MCP_STDIN_BYTES.div_ceil(3) * 4;
+const MAX_MCP_WAIT_MS: u64 = 30_000;
 type InflightRequests = Arc<StdMutex<HashMap<String, Option<oneshot::Sender<()>>>>>;
 const SERVER_INSTRUCTIONS: &str = concat!(
     "Use sandbox_exec when a command benefits from a disposable execution environment, ",
@@ -50,8 +52,9 @@ const SERVER_INSTRUCTIONS: &str = concat!(
     "Linux checks, or long-running sessions. Use wait=true for one-shot commands; its inline ",
     "output is limited to 1 MiB, and has_more output can be read with sandbox_io using the ",
     "returned SessionId and continuation_cursor within five minutes. Use ",
-    "wait=false to start sessions; use sandbox_io for cursor-based I/O and sandbox_stop to ",
-    "terminate and clean up sessions. wait=true sessions belong to their request and are ",
+    "wait=false to start sessions; use sandbox_io for cursor-based I/O and a bounded wait_ms ",
+    "long-poll, sandbox_session_list and sandbox_session_status to inspect sessions, and ",
+    "sandbox_stop to terminate and clean up sessions. wait=true sessions belong to their request and are ",
     "cleaned when that request is cancelled. wait=false sessions belong to this stdio ",
     "connection and remain available until sandbox_remove or client disconnect. Up to 32 ",
     "sessions may run at once; completed async sessions retain status and output for five ",
@@ -561,6 +564,12 @@ async fn call_tool(
         "sandbox_io" => sandbox_io(&server.sdk, arguments)
             .await
             .map(ToolOutput::mirrored),
+        "sandbox_session_list" => sandbox_session_list(&server.sdk, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_session_status" => sandbox_session_status(&server.sdk, arguments)
+            .await
+            .map(ToolOutput::mirrored),
         "sandbox_stop" => sandbox_stop(&server.sdk, arguments)
             .await
             .map(ToolOutput::mirrored),
@@ -980,6 +989,7 @@ async fn sandbox_io(sdk: &SandboxSdk, arguments: Value) -> Result<Value, ToolErr
                 close_stdin: args.close_stdin,
                 resize,
                 signal,
+                wait_timeout: (args.wait_ms > 0).then(|| Duration::from_millis(args.wait_ms)),
             },
         )
         .await?;
@@ -992,6 +1002,11 @@ fn validate_io_args(args: &IoArgs) -> Result<(), ToolError> {
             "max_bytes must be between 1 and {MAX_IO_OUTPUT_READ_BYTES}"
         )));
     }
+    if args.wait_ms > MAX_MCP_WAIT_MS {
+        return Err(ToolError::invalid_arguments(format!(
+            "wait_ms must be between 0 and {MAX_MCP_WAIT_MS}"
+        )));
+    }
     match (args.rows, args.columns) {
         (None, None) => Ok(()),
         (Some(rows), Some(columns)) if rows > 0 && columns > 0 => Ok(()),
@@ -1002,6 +1017,20 @@ fn validate_io_args(args: &IoArgs) -> Result<(), ToolError> {
             "rows and columns must be provided together",
         )),
     }
+}
+
+async fn sandbox_session_list(sdk: &SandboxSdk, arguments: Value) -> Result<Value, ToolError> {
+    let _: EmptyArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    Ok(json!({ "sessions": sdk.list_sessions().await }))
+}
+
+async fn sandbox_session_status(sdk: &SandboxSdk, arguments: Value) -> Result<Value, ToolError> {
+    let args: StopArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    let session_id = SessionId::from_str(&args.session_id)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    Ok(json!({ "status": sdk.status(session_id).await? }))
 }
 
 fn decode_bounded_stdin(input: Option<String>) -> Result<Option<Vec<u8>>, ToolError> {
@@ -1225,7 +1254,8 @@ fn io_json(result: &IoResult) -> Value {
         "status": result.status,
         "output": chunks_json(&result.output),
         "next_cursor": result.next_cursor,
-        "truncated": result.truncated
+        "truncated": result.truncated,
+        "wait_timed_out": result.wait_timed_out
     })
 }
 
@@ -1309,13 +1339,14 @@ fn tools_list() -> Value {
             {
                 "name": "sandbox_io",
                 "title": "Sandbox session I/O",
-                "description": "Write stdin, close it, signal or resize, and read bounded UTF-8 text output from a cursor. Invalid byte sequences are replaced with U+FFFD.",
+                "description": "Write stdin, close it, signal or resize, and read bounded UTF-8 text output from a cursor. Set wait_ms up to 30000 to long-poll until output arrives, the session ends, or the wait expires; wait_timed_out distinguishes expiry. Invalid byte sequences are replaced with U+FFFD.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "session_id": { "type": "string" },
                         "cursor": { "type": "integer", "minimum": 0, "default": 0 },
                         "max_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_IO_OUTPUT_READ_BYTES, "default": 1_048_576 },
+                        "wait_ms": { "type": "integer", "minimum": 0, "maximum": MAX_MCP_WAIT_MS, "default": 0 },
                         "stdin_base64": { "type": "string", "maxLength": MAX_MCP_STDIN_BASE64_CHARS },
                         "close_stdin": { "type": "boolean", "default": false },
                         "rows": { "type": "integer", "minimum": 1, "maximum": 65_535 },
@@ -1326,6 +1357,25 @@ fn tools_list() -> Value {
                     "additionalProperties": false
                 },
                 "annotations": { "destructiveHint": false, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_session_list",
+                "title": "List sandbox sessions",
+                "description": "List current connection-owned sessions in stable SessionId order without waiting or starting a sandbox.",
+                "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_session_status",
+                "title": "Get sandbox session status",
+                "description": "Read the current status of one retained session without waiting for it to finish.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "session_id": { "type": "string", "format": "uuid" } },
+                    "required": ["session_id"],
+                    "additionalProperties": false
+                },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
             },
             {
                 "name": "sandbox_stop",
@@ -1468,6 +1518,7 @@ struct IoArgs {
     session_id: String,
     cursor: u64,
     max_bytes: usize,
+    wait_ms: u64,
     stdin_base64: Option<String>,
     close_stdin: bool,
     rows: Option<u16>,
@@ -1481,6 +1532,7 @@ impl Default for IoArgs {
             session_id: String::new(),
             cursor: 0,
             max_bytes: 1024 * 1024,
+            wait_ms: 0,
             stdin_base64: None,
             close_stdin: false,
             rows: None,
@@ -1694,6 +1746,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_wait_and_query_tools_are_advertised() {
+        let server = test_server(SandboxSdk::new(Arc::new(ProcessBackend)));
+        let list = handle_request(
+            &server,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+
+        assert_eq!(
+            list.pointer("/result/tools/1/inputSchema/properties/wait_ms/maximum"),
+            Some(&json!(MAX_MCP_WAIT_MS))
+        );
+        for expected in ["sandbox_session_list", "sandbox_session_status"] {
+            assert!(
+                list.pointer("/result/tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| tools
+                        .iter()
+                        .any(|tool| tool.get("name") == Some(&json!(expected)))),
+                "missing {expected}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn waiting_exec_exposes_a_real_continuation_without_duplicating_output() {
         let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
         let result =
@@ -1787,6 +1864,11 @@ mod tests {
                 "sandbox_io",
                 json!({ "session_id": SessionId::new(), "max_bytes": 0 }),
                 "max_bytes must be between",
+            ),
+            (
+                "sandbox_io",
+                json!({ "session_id": SessionId::new(), "wait_ms": MAX_MCP_WAIT_MS + 1 }),
+                "wait_ms must be between",
             ),
             (
                 "sandbox_io",

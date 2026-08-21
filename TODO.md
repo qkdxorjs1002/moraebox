@@ -145,7 +145,7 @@
   - `code`, `stage`, `retryable`, `message`, `remediation`을 제공한다.
   - cursor 만료에는 `earliest_cursor`를 포함한다.
 
-- [ ] `sandbox_wait` 또는 `sandbox_io.wait_ms`와 session list/status/remove 도구를 추가한다.
+- [x] `sandbox_wait` 또는 `sandbox_io.wait_ms`와 session list/status/remove 도구를 추가한다.
   - polling interval을 강제하지 않고 bounded long-poll을 제공한다.
 
 - [ ] initialize state와 지원 protocol version을 검증하고 `initialized`/cancel notification을 처리한다.

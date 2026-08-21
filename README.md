@@ -220,7 +220,8 @@ The server exposes execution tools plus persistent Box management:
 | Tool | Purpose |
 | --- | --- |
 | `sandbox_exec` | Run one command or start an asynchronous session; optional `box_id` reuses persistent files |
-| `sandbox_io` | Read bounded output, write or close stdin, resize, or send a signal |
+| `sandbox_io` | Read bounded output, optionally long-poll with `wait_ms`, write or close stdin, resize, or send a signal |
+| `sandbox_session_list` / `sandbox_session_status` | List connection-owned sessions or read one current status without waiting |
 | `sandbox_stop` | Stop a session and wait for cleanup while retaining its record |
 | `sandbox_remove` | Stop if needed and immediately remove retained session status and output |
 | `sandbox_box_create` | Create a persistent Box from an OCI image |
@@ -228,7 +229,7 @@ The server exposes execution tools plus persistent Box management:
 | `sandbox_box_delete` / `sandbox_box_reset` | Permanently mutate an idle Box with explicit confirmation |
 | `sandbox_box_clone` | Create a new independent durable Box with explicit confirmation |
 
-Commands remain argv arrays in the MCP schema. Output chunks are exposed as UTF-8 text so agents can read them directly; invalid UTF-8 bytes are replaced with `U+FFFD`. Stdin bytes remain base64-encoded. A waiting `sandbox_exec` response includes at most 1 MiB of output. When `has_more` is true, pass its `status.session_id` and `continuation_cursor` to `sandbox_io` within five minutes; executions whose output fits inline are removed immediately. The server permits up to 32 active runs. Completed asynchronous sessions remain readable for five minutes, or until `sandbox_remove` releases them explicitly; disconnecting the stdio client removes all connection-owned sessions.
+Commands remain argv arrays in the MCP schema. Output chunks are exposed as UTF-8 text so agents can read them directly; invalid UTF-8 bytes are replaced with `U+FFFD`. Stdin bytes remain base64-encoded. A waiting `sandbox_exec` response includes at most 1 MiB of output. When `has_more` is true, pass its `status.session_id` and `continuation_cursor` to `sandbox_io` within five minutes; executions whose output fits inline are removed immediately. `sandbox_io.wait_ms` can wait up to 30 seconds for output or session completion without a fixed polling interval, and reports `wait_timed_out` when the bound expires. The server permits up to 32 active runs. Completed asynchronous sessions remain readable for five minutes, can be inspected with `sandbox_session_list` and `sandbox_session_status`, or are released explicitly by `sandbox_remove`; disconnecting the stdio client removes all connection-owned sessions.
 
 ## How it works
 
