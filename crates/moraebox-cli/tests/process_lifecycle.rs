@@ -64,6 +64,31 @@ fn process_backend_rejects_a_guest_rootfs() {
 }
 
 #[cfg(unix)]
+#[test]
+fn inherited_environment_is_resolved_once_with_explicit_precedence() {
+    let output = Command::new(env!("CARGO_BIN_EXE_morae"))
+        .env("MORAE_HOST_ONLY", "host")
+        .env("MORAE_OVERRIDE", "host")
+        .args([
+            "run",
+            "--backend",
+            "process",
+            "--inherit-env",
+            "--env",
+            "MORAE_OVERRIDE=explicit",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s|%s' \"$MORAE_HOST_ONLY\" \"$MORAE_OVERRIDE\"",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"host|explicit");
+}
+
+#[cfg(unix)]
 fn output_and_exit_command() -> Vec<String> {
     ["/bin/sh", "-c", "printf stdout; printf stderr >&2; exit 7"]
         .map(String::from)

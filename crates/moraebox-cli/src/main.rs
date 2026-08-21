@@ -582,9 +582,6 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     spec.network = args.network;
     spec.cwd = args.cwd;
     spec.env = args.env.into_iter().collect::<BTreeMap<_, _>>();
-    if spec.inherit_env {
-        spec.env.extend(std::env::vars());
-    }
     if !args.interactive && !io::stdin().is_terminal() {
         io::stdin().read_to_end(&mut spec.stdin)?;
     }

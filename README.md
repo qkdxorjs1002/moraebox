@@ -85,7 +85,7 @@ morae run --image alpine:latest --env MESSAGE=hello \
   -- /bin/sh -c 'printf "%s\n" "$MESSAGE"'
 ```
 
-Use `--env KEY=VALUE` to add individual values. `--inherit-env` forwards the host environment and should be used only when that exposure is intentional.
+Use `--env KEY=VALUE` to add individual values. `--inherit-env` forwards the host environment and should be used only when that exposure is intentional. Explicit `--env` values override inherited values; a non-Unicode host variable name or value rejects the run instead of being silently dropped or altered.
 
 ### Opt into outbound network access
 

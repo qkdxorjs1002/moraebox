@@ -8,7 +8,10 @@ use moraebox_core::{OutputChannel, RunSpec, Signal};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{Backend, BackendController, BackendError, RunBudget, RunStage, SpawnedSandbox};
+use crate::{
+    Backend, BackendController, BackendError, RunBudget, RunStage, SpawnedSandbox,
+    environment::resolve_environment,
+};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProcessBackend;
@@ -41,16 +44,15 @@ impl Backend for ProcessBackend {
             ));
         }
 
+        let environment = resolve_environment(spec)?;
         let mut command = Command::new(&spec.argv[0]);
         command.args(&spec.argv[1..]);
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         command.kill_on_drop(true);
-        if !spec.inherit_env {
-            command.env_clear();
-        }
-        command.envs(&spec.env);
+        command.env_clear();
+        command.envs(environment);
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
         }
@@ -204,6 +206,26 @@ impl BackendController for ProcessController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inherited_environment_keeps_explicit_values_authoritative() {
+        let mut spec = RunSpec::command(["/bin/sh", "-c", "printf '%s' \"$PATH\""]);
+        spec.inherit_env = true;
+        spec.env.insert("PATH".into(), "guest-explicit".into());
+
+        let report = crate::Supervisor::new(ProcessBackend)
+            .run(spec)
+            .await
+            .unwrap();
+        let output = report
+            .output
+            .into_iter()
+            .flat_map(|chunk| chunk.data)
+            .collect::<Vec<_>>();
+
+        assert_eq!(output, b"guest-explicit");
+    }
 
     #[tokio::test]
     async fn rejects_vm_network_opt_in() {

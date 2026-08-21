@@ -123,7 +123,7 @@
 
 - [x] output pump 오류를 성공 결과로 숨기지 않고 typed I/O failure로 보고한다.
 
-- [ ] `RunSpec.inherit_env`의 process/libkrun 동작을 일치시킨다.
+- [x] `RunSpec.inherit_env`의 process/libkrun 동작을 일치시킨다.
   - 기본 empty environment를 유지한다.
   - host environment 해석은 공통 계층에서 명시적으로 수행하고 non-Unicode 값의 정책을 정한다.
 

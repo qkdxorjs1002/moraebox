@@ -8,6 +8,21 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{RunBudget, RunStage, StageError};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvironmentComponent {
+    Name,
+    Value,
+}
+
+impl std::fmt::Display for EnvironmentComponent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Name => "name",
+            Self::Value => "value",
+        })
+    }
+}
+
 pub type BoxedReader = Pin<Box<dyn AsyncRead + Send>>;
 pub type BoxedWriter = Pin<Box<dyn AsyncWrite + Send>>;
 pub type ExitFuture = Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + Send>>;
@@ -82,6 +97,11 @@ pub enum BackendError {
     Control(String),
     #[error("run timed out after {limit:?} during {stage}")]
     Timeout { stage: RunStage, limit: Duration },
+    #[error("host environment {component} for {variable} is not valid Unicode")]
+    NonUnicodeEnvironment {
+        variable: String,
+        component: EnvironmentComponent,
+    },
 }
 
 impl<E: std::fmt::Display> From<StageError<E>> for BackendError {

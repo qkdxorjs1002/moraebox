@@ -20,7 +20,7 @@ use tokio::{
 
 use crate::{
     Backend, BackendController, BackendError, RootMode, RunBudget, RunStage, SpawnedSandbox,
-    StartupMetrics,
+    StartupMetrics, environment::resolve_environment,
 };
 
 const NETWORK_PROXY_START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -183,6 +183,7 @@ impl Backend for LibkrunBackend {
                 "run requested a BoxId but no Box store is configured".into(),
             ));
         }
+        let environment = resolve_environment(spec)?;
 
         let mut startup = StartupMetrics::default();
         let network_proxy = if spec.network {
@@ -241,7 +242,7 @@ impl Backend for LibkrunBackend {
         if let Some(proxy) = &network_proxy {
             command.arg("--network-socket").arg(&proxy.socket_path);
         }
-        for (key, value) in &spec.env {
+        for (key, value) in environment {
             command.arg("--env").arg(format!("{key}={value}"));
         }
         command.arg("--").args(&spec.argv);
@@ -885,6 +886,37 @@ mod tests {
 
         assert_eq!(report.exit_code, Some(0));
         assert!(!network_runtime_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inherited_environment_is_forwarded_to_the_guest_not_the_helper() {
+        let state = tempfile::tempdir().unwrap();
+        let helper = state.path().join("helper");
+        let library = state.path().join("libkrun");
+        let root = state.path().join("root");
+        write_executable(
+            &helper,
+            "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in PATH=*) printf path-forwarded;; esac; done\n",
+        );
+        fs::write(&library, []).unwrap();
+        fs::create_dir(&root).unwrap();
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.inherit_env = true;
+
+        let report = crate::Supervisor::new(LibkrunBackend::new(LibkrunConfig::new(
+            helper, library, root,
+        )))
+        .run(spec)
+        .await
+        .unwrap();
+        let output = report
+            .output
+            .into_iter()
+            .flat_map(|chunk| chunk.data)
+            .collect::<Vec<_>>();
+
+        assert_eq!(output, b"path-forwarded");
     }
 
     #[cfg(unix)]

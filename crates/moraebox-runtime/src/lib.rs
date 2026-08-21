@@ -5,6 +5,7 @@
 mod backend;
 mod budget;
 mod doctor;
+mod environment;
 mod libkrun;
 mod pool;
 mod process;
@@ -13,8 +14,8 @@ mod supervisor;
 mod trace;
 
 pub use backend::{
-    Backend, BackendController, BackendError, BoxedReader, BoxedWriter, RootMode, SpawnedSandbox,
-    StartupMetrics,
+    Backend, BackendController, BackendError, BoxedReader, BoxedWriter, EnvironmentComponent,
+    RootMode, SpawnedSandbox, StartupMetrics,
 };
 pub use budget::{RunBudget, RunBudgetTimeout, RunStage, StageError, StageTiming};
 pub use doctor::{DoctorReport, LibraryProbe, NativeRuntimePaths, ToolProbe};
