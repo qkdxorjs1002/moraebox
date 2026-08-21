@@ -3,8 +3,9 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
+    fs,
     io::{self, IsTerminal, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
     time::Duration,
@@ -16,8 +17,8 @@ use moraebox_box::{
     BaseDiskSpec, BaseDiskStore, BoxMetadata, BoxStore, CreateBox, EphemeralDiskStore,
 };
 use moraebox_core::{
-    BoxId, OutputChannel, OutputReadError, RunSpec, SessionState, Signal, TimeoutPolicy,
-    resolve_cache_dir, resolve_state_dir,
+    BoxId, OutputChannel, OutputReadError, RunSpec, SessionState, Signal, StoragePaths,
+    TimeoutPolicy, resolve_cache_dir, resolve_state_dir,
 };
 use moraebox_image::{
     CacheReconcileReport, CacheUsage, CachedImage, CleanReport, Credentials, ImageCache,
@@ -45,7 +46,7 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Args, Default)]
 struct GlobalOptions {
     /// Cache root. CLI value overrides `MORAE_CACHE_DIR`, then ~/.moraebox/cache is used.
     #[arg(long, global = true, env = "MORAE_CACHE_DIR")]
@@ -405,6 +406,7 @@ where
 
 async fn execute(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
     let Cli { global, command } = cli;
+    warn_project_local_storage(&global, storage_use(&command));
     match command {
         Command::Doctor(args) => doctor(&args, &global),
         Command::Run(args) => run(*args, &global).await,
@@ -456,6 +458,89 @@ async fn execute(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
             Ok(0)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StorageUse {
+    cache: bool,
+    state: bool,
+}
+
+fn storage_use(command: &Command) -> StorageUse {
+    match command {
+        Command::Run(args) if args.backend == "libkrun" => StorageUse {
+            cache: true,
+            state: true,
+        },
+        Command::Image { .. } | Command::Cache { .. } => StorageUse {
+            cache: true,
+            state: false,
+        },
+        Command::Box {
+            command: BoxCommand::Create(_) | BoxCommand::Reset(_),
+        } => StorageUse {
+            cache: true,
+            state: true,
+        },
+        Command::Box { .. } => StorageUse {
+            cache: false,
+            state: true,
+        },
+        Command::Benchmark(args) if args.backend == "libkrun" => StorageUse {
+            cache: true,
+            state: true,
+        },
+        Command::Doctor(_) | Command::Run(_) | Command::Benchmark(_) | Command::Completion(_) => {
+            StorageUse::default()
+        }
+    }
+}
+
+fn warn_project_local_storage(global: &GlobalOptions, usage: StorageUse) {
+    let Ok(current_dir) = std::env::current_dir() else {
+        return;
+    };
+    let Ok(defaults) = StoragePaths::for_current_user() else {
+        return;
+    };
+    if let Some(message) = project_local_storage_warning(global, usage, &current_dir, &defaults) {
+        eprintln!("warning: {message}");
+    }
+}
+
+fn project_local_storage_warning(
+    global: &GlobalOptions,
+    usage: StorageUse,
+    current_dir: &Path,
+    defaults: &StoragePaths,
+) -> Option<String> {
+    let root = current_dir.join(".moraebox");
+    let cache = root.join("cache");
+    let state = root.join("state");
+    let mut overrides = Vec::new();
+
+    if usage.cache
+        && global.cache_dir.is_none()
+        && cache != defaults.cache()
+        && fs::symlink_metadata(&cache).is_ok()
+    {
+        overrides.push(format!("--cache-dir {}", cache.display()));
+    }
+    if usage.state
+        && global.state_dir.is_none()
+        && state != defaults.state()
+        && fs::symlink_metadata(&state).is_ok()
+    {
+        overrides.push(format!("--state-dir {}", state.display()));
+    }
+
+    (!overrides.is_empty()).then(|| {
+        format!(
+            "found project-local data at {}, but it is not selected or moved automatically; use {} to continue using it",
+            root.display(),
+            overrides.join(" and ")
+        )
+    })
 }
 
 fn completion(args: &CompletionArgs) {
@@ -2141,6 +2226,70 @@ mod tests {
         assert_eq!(
             before_subcommand.global.state_dir,
             Some("custom-state".into())
+        );
+    }
+
+    #[test]
+    fn project_local_storage_warning_is_scoped_to_used_default_roots() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join(".moraebox/cache")).unwrap();
+        fs::create_dir_all(project.path().join(".moraebox/state")).unwrap();
+        let defaults = StoragePaths::from_home(project.path().join("home")).unwrap();
+        let usage = StorageUse {
+            cache: true,
+            state: true,
+        };
+
+        let warning = project_local_storage_warning(
+            &GlobalOptions::default(),
+            usage,
+            project.path(),
+            &defaults,
+        )
+        .unwrap();
+        assert!(warning.contains("--cache-dir"));
+        assert!(warning.contains("--state-dir"));
+        assert!(warning.contains("not selected or moved automatically"));
+
+        let explicit_cache = GlobalOptions {
+            cache_dir: Some(project.path().join("explicit-cache")),
+            ..GlobalOptions::default()
+        };
+        let warning =
+            project_local_storage_warning(&explicit_cache, usage, project.path(), &defaults)
+                .unwrap();
+        assert!(!warning.contains("--cache-dir"));
+        assert!(warning.contains("--state-dir"));
+
+        let same_as_default = StoragePaths::from_home(project.path()).unwrap();
+        assert!(
+            project_local_storage_warning(
+                &GlobalOptions::default(),
+                usage,
+                project.path(),
+                &same_as_default,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn storage_warning_skips_commands_that_do_not_use_managed_storage() {
+        let doctor = Cli::try_parse_from(["morae", "doctor"]).unwrap();
+        assert_eq!(storage_use(&doctor.command), StorageUse::default());
+
+        let process =
+            Cli::try_parse_from(["morae", "run", "--backend", "process", "--", "/bin/true"])
+                .unwrap();
+        assert_eq!(storage_use(&process.command), StorageUse::default());
+
+        let image = Cli::try_parse_from(["morae", "image", "list"]).unwrap();
+        assert_eq!(
+            storage_use(&image.command),
+            StorageUse {
+                cache: true,
+                state: false,
+            }
         );
     }
 

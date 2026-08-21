@@ -194,7 +194,7 @@
 
 - [x] 반복되는 storage/json/native path 옵션을 global options와 명확한 config precedence로 정리하고 shell completion을 제공한다.
 
-- [ ] project-local `.moraebox`가 발견되면 자동 이동 없이 기존 데이터 사용 방법만 경고한다.
+- [x] project-local `.moraebox`가 발견되면 자동 이동 없이 기존 데이터 사용 방법만 경고한다.
 
 - [ ] Box list가 손상된 한 entry 때문에 전체 실패하지 않도록 healthy entry와 per-entry error를 함께 반환하고 repair/quarantine 명령을 제공한다.
 

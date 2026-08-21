@@ -195,7 +195,7 @@ morae cache clean --all --dry-run
 morae cache clean --all --yes
 ```
 
-By default, every command uses the user-wide `~/.moraebox/cache` and `~/.moraebox/state` directories, independent of the current working directory. Use `--cache-dir`, `--state-dir`, or their environment variables only when a command should use another location. Existing project-local data is not moved automatically; for example, continue using it with `morae box list --state-dir .moraebox/state`.
+By default, every command uses the user-wide `~/.moraebox/cache` and `~/.moraebox/state` directories, independent of the current working directory. Use `--cache-dir`, `--state-dir`, or their environment variables only when a command should use another location. When a storage-using command finds a matching project-local `.moraebox/cache` or `.moraebox/state`, it prints an explicit-use reminder on stderr. Existing project-local data is never selected or moved automatically; for example, continue using it with `morae box list --state-dir .moraebox/state`.
 
 Cache size output distinguishes logical bytes from filesystem-allocated bytes. Rootfs sizes come from publish-time indexed metadata, so `image list` and `cache info` do not rescan every tree. Use `cache reconcile --dry-run` to detect missing, invalid, stale, or orphan metadata and `cache reconcile --yes` (also available as `cache repair --yes`) to repair it.
 
