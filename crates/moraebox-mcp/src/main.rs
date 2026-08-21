@@ -306,7 +306,7 @@ async fn main() -> ExitCode {
     let args = parse_args_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
     let Args { command, server } = args;
     if let Some(McpCommand::Install(args)) = command {
-        return match registration::install(&args) {
+        return match registration::install(&args).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("morae-mcp: {error}");

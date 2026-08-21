@@ -2,13 +2,24 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
-    process::Command,
+    process::Stdio,
+    time::Duration,
 };
 
 use clap::{Args, ValueEnum};
 use moraebox_core::{resolve_cache_dir, resolve_state_dir};
 use moraebox_image::ImageCache;
-use serde_json::json;
+use moraebox_runtime::NativeRuntimePaths;
+use serde_json::{Value, json};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    process::{Child, Command},
+    task::JoinHandle,
+    time::timeout,
+};
+
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+const PREFLIGHT_CAPTURE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Agent {
@@ -106,6 +117,29 @@ struct CommandPlan {
 type Environment = Vec<(&'static str, OsString)>;
 type ServerConfiguration = (Environment, Vec<OsString>);
 
+#[derive(Debug, Default)]
+struct NativeRegistrationPaths {
+    helper: Option<PathBuf>,
+    libkrun: Option<PathBuf>,
+    gvproxy: Option<PathBuf>,
+    library_search_path: Option<PathBuf>,
+    mke2fs: Option<PathBuf>,
+    e2fsck: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct ServerLaunch {
+    program: PathBuf,
+    environment: Environment,
+    args: Vec<OsString>,
+}
+
+#[derive(Debug)]
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
 impl CommandPlan {
     fn print_json(&self) -> Result<(), String> {
         let value = json!({
@@ -125,9 +159,16 @@ impl CommandPlan {
     }
 }
 
-pub fn install(args: &InstallArgs) -> Result<(), String> {
+pub async fn install(args: &InstallArgs) -> Result<(), String> {
     let server_command = resolve_server_command(args.server_command.as_deref())?;
-    let plan = build_command_plan(args, server_command)?;
+    let native_paths = resolve_native_registration_paths(args, true)?;
+    let (environment, server_args) = server_configuration_with_paths(args, &native_paths)?;
+    let launch = ServerLaunch {
+        program: server_command,
+        environment,
+        args: server_args,
+    };
+    let plan = build_command_plan_from_launch(args, &launch);
 
     if args.backend == RegistrationBackend::Process {
         eprintln!(
@@ -138,9 +179,13 @@ pub fn install(args: &InstallArgs) -> Result<(), String> {
         return plan.print_json();
     }
 
+    preflight_server(&launch).await.map_err(|error| {
+        format!("server preflight failed before agent configuration was changed: {error}")
+    })?;
     let status = Command::new(&plan.program)
         .args(&plan.args)
         .status()
+        .await
         .map_err(|error| {
             format!(
                 "failed to run {}: {error}; install the agent CLI or use --dry-run",
@@ -151,33 +196,48 @@ pub fn install(args: &InstallArgs) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "{} failed with status {status}",
-            plan.program.to_string_lossy()
+            "{} failed with status {status}; agent configuration may have been partially updated. Inspect it, then roll back with: `{}`",
+            plan.program.to_string_lossy(),
+            rollback_command(args.agent, &args.name)
         ))
     }
 }
 
+#[cfg(test)]
 fn build_command_plan(
     install: &InstallArgs,
     server_command: OsString,
 ) -> Result<CommandPlan, String> {
-    let (environment, server_args) = server_configuration(install)?;
+    let native_paths = resolve_native_registration_paths(install, false)?;
+    let (environment, server_args) = server_configuration_with_paths(install, &native_paths)?;
+    Ok(build_command_plan_from_launch(
+        install,
+        &ServerLaunch {
+            program: PathBuf::from(server_command),
+            environment,
+            args: server_args,
+        },
+    ))
+}
+
+fn build_command_plan_from_launch(install: &InstallArgs, launch: &ServerLaunch) -> CommandPlan {
     let mut args = vec![OsString::from("mcp"), OsString::from("add")];
 
     match install.agent {
         Agent::Codex => {
             args.push(install.name.clone().into());
-            for (key, value) in &environment {
+            for (key, value) in &launch.environment {
                 args.push("--env".into());
                 args.push(env_assignment(key, value));
             }
         }
         Agent::ClaudeCode => {
             args.extend(["--scope".into(), "user".into()]);
-            if !environment.is_empty() {
+            if !launch.environment.is_empty() {
                 args.push("--env".into());
                 args.extend(
-                    environment
+                    launch
+                        .environment
                         .iter()
                         .map(|(key, value)| env_assignment(key, value)),
                 );
@@ -191,15 +251,24 @@ fn build_command_plan(
     }
 
     args.push("--".into());
-    args.push(server_command);
-    args.extend(server_args);
-    Ok(CommandPlan {
+    args.push(launch.program.as_os_str().to_owned());
+    args.extend(launch.args.iter().cloned());
+    CommandPlan {
         program: install.agent.executable().into(),
         args,
-    })
+    }
 }
 
+#[cfg(test)]
 fn server_configuration(install: &InstallArgs) -> Result<ServerConfiguration, String> {
+    let native_paths = resolve_native_registration_paths(install, false)?;
+    server_configuration_with_paths(install, &native_paths)
+}
+
+fn server_configuration_with_paths(
+    install: &InstallArgs,
+    native_paths: &NativeRegistrationPaths,
+) -> Result<ServerConfiguration, String> {
     let cache_dir =
         resolve_cache_dir(install.cache_dir.as_deref()).map_err(|error| error.to_string())?;
     let state_dir =
@@ -219,7 +288,7 @@ fn server_configuration(install: &InstallArgs) -> Result<ServerConfiguration, St
     let mut environment = Vec::new();
     let mut server_args = common_server_args(install, cache_dir.clone(), state_dir);
     if let Some(rootfs) = &install.rootfs {
-        environment.push(("MORAE_ROOTFS", rootfs.as_os_str().to_owned()));
+        environment.push(("MORAE_ROOTFS", absolute_path(rootfs)?.into_os_string()));
     } else {
         let reference = match &install.image {
             Some(reference) => reference.clone(),
@@ -230,18 +299,71 @@ fn server_configuration(install: &InstallArgs) -> Result<ServerConfiguration, St
         server_args.extend(["--image".into(), reference.into()]);
     }
     for (name, path) in [
-        ("MORAE_HELPER_PATH", install.helper.as_ref()),
-        ("MORAE_LIBKRUN_PATH", install.libkrun.as_ref()),
-        ("MORAE_GVPROXY_PATH", install.gvproxy.as_ref()),
-        ("MORAE_LIB_DIR", install.lib_dir.as_ref()),
-        ("MORAE_MKE2FS", install.mke2fs.as_ref()),
-        ("MORAE_E2FSCK", install.e2fsck.as_ref()),
+        ("MORAE_HELPER_PATH", native_paths.helper.as_ref()),
+        ("MORAE_LIBKRUN_PATH", native_paths.libkrun.as_ref()),
+        ("MORAE_GVPROXY_PATH", native_paths.gvproxy.as_ref()),
+        ("MORAE_MKE2FS", native_paths.mke2fs.as_ref()),
+        ("MORAE_E2FSCK", native_paths.e2fsck.as_ref()),
     ] {
         if let Some(path) = path {
-            environment.push((name, path.as_os_str().to_owned()));
+            environment.push((name, absolute_path(path)?.into_os_string()));
         }
     }
+    if let Some(path) = &native_paths.library_search_path {
+        environment.push(("MORAE_LIB_DIR", absolute_search_path(path)?));
+    }
     Ok((environment, server_args))
+}
+
+fn resolve_native_registration_paths(
+    install: &InstallArgs,
+    discover: bool,
+) -> Result<NativeRegistrationPaths, String> {
+    if install.backend == RegistrationBackend::Process {
+        return Ok(NativeRegistrationPaths::default());
+    }
+    let discovered = discover.then(|| {
+        NativeRuntimePaths::discover_with_gvproxy(
+            install.helper.clone(),
+            install.libkrun.clone(),
+            install.lib_dir.clone(),
+            install.gvproxy.clone(),
+        )
+    });
+    let helper = discovered
+        .as_ref()
+        .and_then(|paths| paths.helper.clone())
+        .or_else(|| install.helper.clone());
+    let libkrun = discovered
+        .as_ref()
+        .and_then(|paths| paths.libkrun.clone())
+        .or_else(|| install.libkrun.clone());
+    let gvproxy = discovered
+        .as_ref()
+        .and_then(|paths| paths.gvproxy.clone())
+        .or_else(|| install.gvproxy.clone());
+    let library_search_path = discovered
+        .as_ref()
+        .and_then(|paths| paths.library_search_path.clone())
+        .or_else(|| install.lib_dir.clone());
+    let mke2fs = if discover {
+        resolve_tool_path(install.mke2fs.as_deref(), &super::default_mke2fs())?
+    } else {
+        install.mke2fs.as_deref().map(absolute_path).transpose()?
+    };
+    let e2fsck = if discover {
+        resolve_tool_path(install.e2fsck.as_deref(), &super::default_e2fsck())?
+    } else {
+        install.e2fsck.as_deref().map(absolute_path).transpose()?
+    };
+    Ok(NativeRegistrationPaths {
+        helper,
+        libkrun,
+        gvproxy,
+        library_search_path,
+        mke2fs,
+        e2fsck,
+    })
 }
 
 fn common_server_args(
@@ -279,6 +401,24 @@ fn absolute_path(path: &Path) -> Result<PathBuf, String> {
         .map_err(|error| format!("failed to resolve cache path: {error}"))
 }
 
+fn absolute_search_path(path: &Path) -> Result<OsString, String> {
+    let paths = env::split_paths(path)
+        .map(|component| absolute_path(&component))
+        .collect::<Result<Vec<_>, _>>()?;
+    env::join_paths(paths)
+        .map_err(|error| format!("failed to resolve library search path: {error}"))
+}
+
+fn resolve_tool_path(explicit: Option<&Path>, fallback: &Path) -> Result<Option<PathBuf>, String> {
+    if let Some(explicit) = explicit {
+        return absolute_path(explicit).map(Some);
+    }
+    if fallback.components().count() > 1 {
+        return absolute_path(fallback).map(Some);
+    }
+    Ok(find_in_path(fallback.as_os_str()))
+}
+
 fn env_assignment(key: &str, value: &OsStr) -> OsString {
     let mut assignment = OsString::from(key);
     assignment.push("=");
@@ -286,43 +426,261 @@ fn env_assignment(key: &str, value: &OsStr) -> OsString {
     assignment
 }
 
-fn resolve_server_command(explicit: Option<&OsStr>) -> Result<OsString, String> {
+fn resolve_server_command(explicit: Option<&OsStr>) -> Result<PathBuf, String> {
     if let Some(explicit) = explicit {
-        return Ok(explicit.to_owned());
+        let path = resolve_executable_path(explicit)?;
+        validate_server_executable(&path)?;
+        return Ok(path);
     }
 
     let invoked_as = env::args_os()
         .next()
         .unwrap_or_else(|| OsString::from("morae-mcp"));
-    let invoked_path = Path::new(&invoked_as);
-    if invoked_path.components().count() > 1 {
-        if invoked_path.is_absolute() {
-            return Ok(invoked_as);
+    let path = resolve_executable_path(&invoked_as).or_else(|_| {
+        env::current_exe()
+            .map_err(|error| format!("failed to resolve morae-mcp executable: {error}"))
+    })?;
+    validate_server_executable(&path)?;
+    Ok(path)
+}
+
+fn resolve_executable_path(program: &OsStr) -> Result<PathBuf, String> {
+    let path = Path::new(program);
+    if path.components().count() > 1 {
+        return absolute_path(path);
+    }
+    find_in_path(program).ok_or_else(|| {
+        format!(
+            "server executable {} was not found on PATH",
+            program.to_string_lossy()
+        )
+    })
+}
+
+fn find_in_path(program: &OsStr) -> Option<PathBuf> {
+    let search_path = env::var_os("PATH")?;
+    for directory in env::split_paths(&search_path) {
+        let candidate = directory.join(program);
+        if candidate.is_file() {
+            return absolute_path(&candidate).ok();
         }
-        return env::current_dir()
-            .map(|directory| directory.join(invoked_path).into_os_string())
-            .map_err(|error| format!("failed to resolve morae-mcp path: {error}"));
+        #[cfg(windows)]
+        if candidate.extension().is_none() {
+            let executable = candidate.with_extension("exe");
+            if executable.is_file() {
+                return absolute_path(&executable).ok();
+            }
+        }
+    }
+    None
+}
+
+fn validate_server_executable(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        format!(
+            "cannot inspect server executable {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "server executable is not a regular file: {}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(format!(
+                "server executable does not have an execute permission bit: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn preflight_server(launch: &ServerLaunch) -> Result<(), String> {
+    validate_server_executable(&launch.program)?;
+    let mut command = Command::new(&launch.program);
+    command
+        .args(&launch.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    for (key, value) in &launch.environment {
+        command.env(key, value);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to launch {}: {error}", launch.program.display()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "server stdout was not captured".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "server stderr was not captured".to_owned())?;
+    let stdout_task = tokio::spawn(capture_bounded(stdout));
+    let stderr_task = tokio::spawn(capture_bounded(stderr));
+    let request = format!(
+        "{}\n{}\n",
+        json!({
+            "jsonrpc": "2.0",
+            "id": "moraebox-install-preflight",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": super::PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "moraebox-installer", "version": env!("CARGO_PKG_VERSION") }
+            }
+        }),
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+    );
+    let write_result = async {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "server stdin was not captured".to_owned())?;
+        stdin
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|error| format!("failed to write initialize request: {error}"))?;
+        stdin
+            .shutdown()
+            .await
+            .map_err(|error| format!("failed to close server stdin: {error}"))
+    }
+    .await;
+    if let Err(error) = write_result {
+        terminate_child(&mut child).await;
+        let _ = collect_capture(stdout_task, "stdout").await;
+        let _ = collect_capture(stderr_task, "stderr").await;
+        return Err(error);
     }
 
-    if let Some(path) = env::var_os("PATH") {
-        for directory in env::split_paths(&path) {
-            let candidate = directory.join(&invoked_as);
-            if candidate.is_file() {
-                return Ok(candidate.into_os_string());
-            }
-            #[cfg(windows)]
-            if candidate.extension().is_none() {
-                let executable = candidate.with_extension("exe");
-                if executable.is_file() {
-                    return Ok(executable.into_os_string());
-                }
-            }
+    let status = match timeout(PREFLIGHT_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            terminate_child(&mut child).await;
+            let _ = collect_capture(stdout_task, "stdout").await;
+            let _ = collect_capture(stderr_task, "stderr").await;
+            return Err(format!(
+                "failed while waiting for initialize response: {error}"
+            ));
         }
+        Err(_) => {
+            terminate_child(&mut child).await;
+            let _ = collect_capture(stdout_task, "stdout").await;
+            let stderr = collect_capture(stderr_task, "stderr").await?;
+            return Err(format!(
+                "initialize handshake exceeded {PREFLIGHT_TIMEOUT:?}; stderr: {}",
+                render_capture(&stderr)
+            ));
+        }
+    };
+    let stdout = collect_capture(stdout_task, "stdout").await?;
+    let stderr = collect_capture(stderr_task, "stderr").await?;
+    if !status.success() {
+        return Err(format!(
+            "server exited with {status}; stderr: {}",
+            render_capture(&stderr)
+        ));
     }
+    validate_initialize_response(&stdout)
+}
 
-    env::current_exe()
-        .map(PathBuf::into_os_string)
-        .map_err(|error| format!("failed to resolve morae-mcp executable: {error}"))
+async fn capture_bounded<R>(mut reader: R) -> std::io::Result<CapturedOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        let remaining = PREFLIGHT_CAPTURE_BYTES.saturating_sub(bytes.len());
+        let retained = remaining.min(count);
+        bytes.extend_from_slice(&chunk[..retained]);
+        truncated |= retained < count;
+    }
+    Ok(CapturedOutput { bytes, truncated })
+}
+
+async fn collect_capture(
+    task: JoinHandle<std::io::Result<CapturedOutput>>,
+    stream: &str,
+) -> Result<CapturedOutput, String> {
+    task.await
+        .map_err(|error| format!("server {stream} capture task failed: {error}"))?
+        .map_err(|error| format!("failed to read server {stream}: {error}"))
+}
+
+async fn terminate_child(child: &mut Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+fn validate_initialize_response(output: &CapturedOutput) -> Result<(), String> {
+    if output.truncated {
+        return Err(format!(
+            "initialize response exceeded {PREFLIGHT_CAPTURE_BYTES} bytes"
+        ));
+    }
+    let text = std::str::from_utf8(&output.bytes)
+        .map_err(|error| format!("initialize response was not UTF-8: {error}"))?;
+    let lines = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    if lines.len() != 1 {
+        return Err(format!(
+            "expected one initialize response on stdout, received {} lines",
+            lines.len()
+        ));
+    }
+    let response: Value = serde_json::from_str(lines[0])
+        .map_err(|error| format!("initialize response was not valid JSON: {error}"))?;
+    if let Some(error) = response.get("error") {
+        return Err(format!("initialize returned a protocol error: {error}"));
+    }
+    if response.get("jsonrpc") != Some(&json!("2.0"))
+        || response.get("id") != Some(&json!("moraebox-install-preflight"))
+    {
+        return Err("initialize response did not match the JSON-RPC request id".into());
+    }
+    if response.pointer("/result/protocolVersion") != Some(&json!(super::PROTOCOL_VERSION)) {
+        return Err(format!(
+            "initialize response did not confirm protocol version {}",
+            super::PROTOCOL_VERSION
+        ));
+    }
+    Ok(())
+}
+
+fn render_capture(output: &CapturedOutput) -> String {
+    let mut rendered = String::from_utf8_lossy(&output.bytes).trim().to_owned();
+    if output.truncated {
+        rendered.push_str(" …[truncated]");
+    }
+    if rendered.is_empty() {
+        "<empty>".into()
+    } else {
+        rendered
+    }
+}
+
+fn rollback_command(agent: Agent, name: &str) -> String {
+    match agent {
+        Agent::Codex => format!("codex mcp remove {name}"),
+        Agent::ClaudeCode => format!("claude mcp remove --scope user {name}"),
+    }
 }
 
 fn parse_server_name(input: &str) -> Result<String, String> {
@@ -527,6 +885,50 @@ mod tests {
 
         assert!(rendered.contains(&current.join("custom-cache").to_string_lossy().into_owned()));
         assert!(rendered.contains(&current.join("custom-state").to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn persistent_runtime_paths_are_registered_as_absolute_paths() {
+        let mut install = install_args(Agent::Codex);
+        install.rootfs = Some("guest-root".into());
+        install.helper = Some("tools/helper".into());
+        install.libkrun = Some("lib/libkrun.dylib".into());
+        install.gvproxy = Some("tools/gvproxy".into());
+        install.lib_dir = Some("lib".into());
+        install.mke2fs = Some("tools/mke2fs".into());
+        install.e2fsck = Some("tools/e2fsck".into());
+
+        let (environment, _) = server_configuration(&install).unwrap();
+
+        for (name, value) in environment {
+            if name == "MORAE_LIB_DIR" {
+                assert!(env::split_paths(&value).all(|path| path.is_absolute()));
+            } else {
+                assert!(Path::new(&value).is_absolute(), "{name} was not absolute");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_command_must_be_a_regular_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let server = temporary.path().join("morae-mcp");
+        fs::write(&server, b"stub").unwrap();
+        fs::set_permissions(&server, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            resolve_server_command(Some(server.as_os_str()))
+                .unwrap_err()
+                .contains("execute permission")
+        );
+
+        fs::set_permissions(&server, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            resolve_server_command(Some(server.as_os_str())).unwrap(),
+            server
+        );
     }
 
     #[test]

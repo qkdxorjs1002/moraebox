@@ -156,7 +156,7 @@
 - [x] MCP server 시작 시 default image를 eager pull하지 않고 protocol handshake를 먼저 받을 수 있게 한다.
   - 최초 실행의 lazy preparation 상태와 오류를 tool result로 보고한다.
 
-- [ ] MCP install 경로를 견고하게 만든다.
+- [x] MCP install 경로를 견고하게 만든다.
   - helper, libkrun, gvproxy, rootfs 등 지속되는 경로를 절대경로로 등록한다.
   - server executable permission과 initialize handshake를 사전 점검한다.
   - 실패 시 agent 설정을 남기지 않거나 명확한 rollback 안내를 제공한다.

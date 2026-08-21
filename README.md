@@ -213,7 +213,14 @@ Preview the exact command and argv without changing agent configuration:
 morae-mcp install codex --dry-run
 ```
 
-The installer uses the agent's official CLI and does not edit configuration files directly. It registers the resolved user-wide cache and state paths by default. Use `--image`, `--cache-dir`, `--state-dir`, `--disk-size`, `--cpus`, `--memory-mib`, or `--gvproxy` to customize the registration. For lifecycle testing without isolation, opt in with `--backend process`.
+The installer uses the agent's official CLI and does not edit configuration files directly. It records the server executable, storage, rootfs, and discovered native dependency paths as absolute paths so the registration does not depend on the agent's working directory or `PATH`. Before invoking the agent CLI, it verifies that the server is executable and completes a bounded MCP `initialize` handshake with the exact registered argv and environment. A preflight failure leaves agent configuration untouched. If the agent CLI itself fails, follow the printed inspection and rollback guidance; the installer does not blindly remove a possibly pre-existing registration.
+
+Use `--image`, `--cache-dir`, `--state-dir`, `--disk-size`, `--cpus`, `--memory-mib`, `--gvproxy`, or `--server-command` to customize the registration. For lifecycle testing without isolation, opt in with `--backend process`. Manual rollback commands are:
+
+```sh
+codex mcp remove moraebox
+claude mcp remove --scope user moraebox
+```
 
 The server exposes execution tools plus persistent Box management:
 

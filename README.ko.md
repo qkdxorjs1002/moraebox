@@ -213,7 +213,14 @@ morae-mcp install claude-code
 morae-mcp install codex --dry-run
 ```
 
-설치기는 에이전트의 공식 CLI를 사용하며 설정 파일을 직접 편집하지 않습니다. 기본 등록에는 해석된 사용자 전역 cache·state 경로를 사용합니다. `--image`, `--cache-dir`, `--state-dir`, `--disk-size`, `--cpus`, `--memory-mib`, `--gvproxy`로 등록 내용을 조정할 수 있습니다. 격리 없는 수명주기 테스트가 필요하면 `--backend process`를 명시합니다.
+설치기는 에이전트의 공식 CLI를 사용하며 설정 파일을 직접 편집하지 않습니다. 서버 실행 파일, 저장소, rootfs, 발견한 native dependency 경로를 절대경로로 기록하므로 에이전트의 작업 디렉터리나 `PATH`에 의존하지 않습니다. agent CLI를 호출하기 전에 서버 실행 권한을 확인하고, 실제 등록 argv·환경으로 제한 시간 내 MCP `initialize` handshake를 수행합니다. 사전 점검이 실패하면 agent 설정은 변경되지 않습니다. agent CLI 자체가 실패하면 출력된 확인·rollback 안내를 따르며, 기존 동명 등록을 지울 수 있으므로 설치기가 임의로 remove하지 않습니다.
+
+`--image`, `--cache-dir`, `--state-dir`, `--disk-size`, `--cpus`, `--memory-mib`, `--gvproxy`, `--server-command`로 등록 내용을 조정할 수 있습니다. 격리 없는 수명주기 테스트가 필요하면 `--backend process`를 명시합니다. 수동 rollback 명령은 다음과 같습니다.
+
+```sh
+codex mcp remove moraebox
+claude mcp remove --scope user moraebox
+```
 
 서버는 실행 도구와 persistent Box 관리 도구를 제공합니다.
 
