@@ -7,7 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sha2::{Digest as _, Sha256};
@@ -100,6 +100,7 @@ impl WorkspaceSnapshot {
     where
         F: FnMut(WorkspaceStage),
     {
+        let deadline = WorkspaceDeadline::new(stage_timeout);
         let source = source.canonicalize()?;
         if !source.is_dir() {
             return Err(WorkspaceError::NotDirectory(source));
@@ -107,53 +108,63 @@ impl WorkspaceSnapshot {
         let cache_root = resolve_for_overlap(cache_root)?;
         ensure_disjoint(&source, &cache_root)?;
 
+        let scan_timeout = deadline.remaining(WorkspaceStage::ScanSource)?;
         progress(WorkspaceStage::ScanSource);
         let digest_source = source.clone();
-        let (source_digest, content_bytes) = run_blocking_stage(
-            WorkspaceStage::ScanSource,
-            stage_timeout,
-            move |cancelled| digest_tree_with_size_cancel(&digest_source, &cancelled),
-        )
-        .await?;
+        let (source_digest, content_bytes) =
+            run_blocking_stage(WorkspaceStage::ScanSource, scan_timeout, move |cancelled| {
+                digest_tree_with_size_cancel(&digest_source, &cancelled)
+            })
+            .await
+            .map_err(|error| deadline.normalize_timeout(error))?;
 
         let directory = cache_root.join("workspaces/sha256");
         let image_path = directory.join(format!("{}.ext4", source_digest.hex()));
         if !image_path.exists() {
+            let create_timeout = deadline.remaining(WorkspaceStage::CreateImage)?;
             progress(WorkspaceStage::CreateImage);
             let staging_directory = directory.clone();
             let staging_digest = source_digest.clone();
             let staging = run_blocking_stage(
                 WorkspaceStage::CreateImage,
-                stage_timeout,
+                create_timeout,
                 move |cancelled| {
                     check_cancelled(Some(&cancelled))?;
                     fs::create_dir_all(&staging_directory)?;
                     StagingImage::create(&staging_directory, &staging_digest, content_bytes)
                 },
             )
-            .await?;
+            .await
+            .map_err(|error| deadline.normalize_timeout(error))?;
+            let populate_timeout = deadline.remaining(WorkspaceStage::PopulateFilesystem)?;
             progress(WorkspaceStage::PopulateFilesystem);
-            populate_ext4(mke2fs, &source, staging.path(), stage_timeout).await?;
+            populate_ext4(mke2fs, &source, staging.path(), populate_timeout)
+                .await
+                .map_err(|error| deadline.normalize_timeout(error))?;
             set_read_only(staging.path())?;
             staging.publish(&image_path)?;
         }
 
+        let hash_timeout = deadline.remaining(WorkspaceStage::HashImage)?;
         progress(WorkspaceStage::HashImage);
         let digest_image_path = image_path.clone();
         let image_digest =
-            run_blocking_stage(WorkspaceStage::HashImage, stage_timeout, move |cancelled| {
+            run_blocking_stage(WorkspaceStage::HashImage, hash_timeout, move |cancelled| {
                 digest_file_cancel(&digest_image_path, &cancelled)
             })
-            .await?;
+            .await
+            .map_err(|error| deadline.normalize_timeout(error))?;
 
+        let verify_timeout = deadline.remaining(WorkspaceStage::VerifySource)?;
         progress(WorkspaceStage::VerifySource);
         let verify_source = source.clone();
         let actual = run_blocking_stage(
             WorkspaceStage::VerifySource,
-            stage_timeout,
+            verify_timeout,
             move |cancelled| digest_tree_cancel(&verify_source, &cancelled),
         )
-        .await?;
+        .await
+        .map_err(|error| deadline.normalize_timeout(error))?;
         if actual != source_digest {
             return Err(WorkspaceError::SourceChanged {
                 expected: source_digest,
@@ -178,6 +189,44 @@ impl WorkspaceSnapshot {
                 expected: self.source_digest.clone(),
                 actual,
             })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceDeadline {
+    deadline: Option<Instant>,
+    limit: Option<Duration>,
+}
+
+impl WorkspaceDeadline {
+    fn new(limit: Option<Duration>) -> Self {
+        Self {
+            deadline: limit.map(|duration| Instant::now() + duration),
+            limit,
+        }
+    }
+
+    fn remaining(&self, stage: WorkspaceStage) -> Result<Option<Duration>, WorkspaceError> {
+        let Some(deadline) = self.deadline else {
+            return Ok(None);
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(WorkspaceError::TimedOut {
+                stage,
+                timeout: self.limit.expect("limited deadline must have a timeout"),
+            });
+        }
+        Ok(Some(deadline - now))
+    }
+
+    fn normalize_timeout(&self, error: WorkspaceError) -> WorkspaceError {
+        match (error, self.limit) {
+            (WorkspaceError::TimedOut { stage, .. }, Some(timeout)) => {
+                WorkspaceError::TimedOut { stage, timeout }
+            }
+            (error, _) => error,
         }
     }
 }
@@ -688,6 +737,31 @@ pub enum WorkspaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_stages_share_one_absolute_deadline() {
+        let limit = Duration::from_millis(50);
+        let deadline = WorkspaceDeadline::new(Some(limit));
+        let first = deadline
+            .remaining(WorkspaceStage::ScanSource)
+            .unwrap()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        let second = deadline
+            .remaining(WorkspaceStage::CreateImage)
+            .unwrap()
+            .unwrap();
+        assert!(second < first);
+
+        std::thread::sleep(second + Duration::from_millis(2));
+        assert!(matches!(
+            deadline.remaining(WorkspaceStage::PopulateFilesystem),
+            Err(WorkspaceError::TimedOut {
+                stage: WorkspaceStage::PopulateFilesystem,
+                timeout,
+            }) if timeout == limit
+        ));
+    }
 
     #[cfg(unix)]
     fn executable_script(root: &Path, contents: &str) -> PathBuf {

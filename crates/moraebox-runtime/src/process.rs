@@ -8,7 +8,7 @@ use moraebox_core::{OutputChannel, RunSpec, Signal};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{Backend, BackendController, BackendError, SpawnedSandbox};
+use crate::{Backend, BackendController, BackendError, RunBudget, RunStage, SpawnedSandbox};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProcessBackend;
@@ -19,7 +19,11 @@ impl Backend for ProcessBackend {
         "process"
     }
 
-    async fn spawn(&self, spec: &RunSpec) -> Result<SpawnedSandbox, BackendError> {
+    async fn spawn(
+        &self,
+        spec: &RunSpec,
+        budget: &RunBudget,
+    ) -> Result<SpawnedSandbox, BackendError> {
         spec.validate().map_err(BackendError::InvalidSpec)?;
         if spec.box_id.is_some() {
             return Err(BackendError::Unsupported(
@@ -57,7 +61,9 @@ impl Backend for ProcessBackend {
             command.as_std_mut().process_group(0);
         }
 
-        let mut child = command.spawn()?;
+        let mut child = budget
+            .run_sync(RunStage::ProcessSpawn, || command.spawn())
+            .map_err(BackendError::from)?;
         let pid = child.id().ok_or(BackendError::MissingProcessId)?;
         let stdin = child.stdin.take().map(|writer| Box::pin(writer) as _);
         let stdout = child
@@ -205,7 +211,9 @@ mod tests {
         spec.network = true;
 
         assert!(matches!(
-            ProcessBackend.spawn(&spec).await,
+            ProcessBackend
+                .spawn(&spec, &RunBudget::new(spec.timeout))
+                .await,
             Err(BackendError::Unsupported(_))
         ));
     }
@@ -216,7 +224,9 @@ mod tests {
         spec.box_id = Some(moraebox_core::BoxId::new());
 
         assert!(matches!(
-            ProcessBackend.spawn(&spec).await,
+            ProcessBackend
+                .spawn(&spec, &RunBudget::new(spec.timeout))
+                .await,
             Err(BackendError::Unsupported(message)) if message.contains("Box persistence")
         ));
     }

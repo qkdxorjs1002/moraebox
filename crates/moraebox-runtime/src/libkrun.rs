@@ -18,7 +18,10 @@ use tokio::{
     time::{Instant, sleep},
 };
 
-use crate::{Backend, BackendController, BackendError, RootMode, SpawnedSandbox, StartupMetrics};
+use crate::{
+    Backend, BackendController, BackendError, RootMode, RunBudget, RunStage, SpawnedSandbox,
+    StartupMetrics,
+};
 
 const NETWORK_PROXY_START_TIMEOUT: Duration = Duration::from_secs(5);
 const NETWORK_PROXY_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -168,7 +171,11 @@ impl Backend for LibkrunBackend {
         "libkrun"
     }
 
-    async fn spawn(&self, spec: &RunSpec) -> Result<SpawnedSandbox, BackendError> {
+    async fn spawn(
+        &self,
+        spec: &RunSpec,
+        budget: &RunBudget,
+    ) -> Result<SpawnedSandbox, BackendError> {
         spec.validate().map_err(BackendError::InvalidSpec)?;
         self.config.validate(self.box_runtime.is_some())?;
         if spec.box_id.is_some() && self.box_runtime.is_none() {
@@ -180,14 +187,29 @@ impl Backend for LibkrunBackend {
         let mut startup = StartupMetrics::default();
         let network_proxy = if spec.network {
             let started = Instant::now();
-            let proxy = NetworkProxy::start(&self.config).await?;
+            let proxy = budget
+                .run(RunStage::NetworkSetup, NetworkProxy::start(&self.config))
+                .await
+                .map_err(BackendError::from)?;
             startup.network_setup_micros = Some(elapsed_micros(started));
             Some(proxy)
         } else {
             None
         };
         let root_started = Instant::now();
-        let (prepared_root, root_startup) = self.prepare_root(spec).await?;
+        let (prepared_root, root_startup) = match budget
+            .run(RunStage::RootPrepare, self.prepare_root(spec, budget))
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(crate::StageError::Timeout(error)) => {
+                return Err(BackendError::Timeout {
+                    stage: error.stage,
+                    limit: error.limit,
+                });
+            }
+            Err(crate::StageError::Failed { source, .. }) => return Err(source),
+        };
         startup.root_prepare_micros = Some(elapsed_micros(root_started));
         startup.root_mode = root_startup.root_mode;
         startup.cache_lookup_micros = root_startup.cache_lookup_micros;
@@ -239,11 +261,15 @@ impl Backend for LibkrunBackend {
         }
 
         let helper_started = Instant::now();
-        let mut spawned = if spec.tty {
-            spawn_pty(command, spec, network_proxy, prepared_root.into_lease())?
-        } else {
-            spawn_piped(command, network_proxy, prepared_root.into_lease())?
-        };
+        let mut spawned = budget
+            .run_sync(RunStage::HelperSpawn, || {
+                if spec.tty {
+                    spawn_pty(command, spec, network_proxy, prepared_root.into_lease())
+                } else {
+                    spawn_piped(command, network_proxy, prepared_root.into_lease())
+                }
+            })
+            .map_err(BackendError::from)?;
         startup.helper_spawn_micros = Some(elapsed_micros(helper_started));
         spawned.startup = startup;
         Ok(spawned)
@@ -254,6 +280,7 @@ impl LibkrunBackend {
     async fn prepare_root(
         &self,
         spec: &RunSpec,
+        budget: &RunBudget,
     ) -> Result<(PreparedRoot, StartupMetrics), BackendError> {
         let Some(runtime) = &self.box_runtime else {
             return Ok(self.config.root_disk.as_ref().map_or_else(
@@ -279,20 +306,20 @@ impl LibkrunBackend {
         };
 
         if let Some(box_id) = spec.box_id {
-            return Self::prepare_persistent_root(runtime, box_id).await;
+            return Self::prepare_persistent_root(runtime, box_id, budget).await;
         }
-        Self::prepare_ephemeral_root(runtime, spec).await
+        Self::prepare_ephemeral_root(runtime, spec, budget).await
     }
 
     async fn prepare_persistent_root(
         runtime: &BoxRuntimeConfig,
         box_id: moraebox_core::BoxId,
+        budget: &RunBudget,
     ) -> Result<(PreparedRoot, StartupMetrics), BackendError> {
         let lock_started = Instant::now();
-        let mut lease = runtime
-            .boxes
-            .try_acquire(box_id)
-            .map_err(box_backend_error)?;
+        let mut lease = budget
+            .run_sync(RunStage::BoxLock, || runtime.boxes.try_acquire(box_id))
+            .map_err(BackendError::from)?;
         let mut startup = StartupMetrics {
             root_mode: Some(RootMode::Persistent),
             box_lock_micros: Some(elapsed_micros(lock_started)),
@@ -300,7 +327,13 @@ impl LibkrunBackend {
         };
         if lease.metadata().state == BoxState::Dirty {
             let repair_started = Instant::now();
-            repair_dirty_box(&runtime.boxes, &mut lease, &runtime.e2fsck_path).await?;
+            budget
+                .run(
+                    RunStage::BoxRepair,
+                    repair_dirty_box(&runtime.boxes, &mut lease, &runtime.e2fsck_path),
+                )
+                .await
+                .map_err(BackendError::from)?;
             startup.repair_micros = Some(elapsed_micros(repair_started));
         }
         runtime
@@ -319,6 +352,7 @@ impl LibkrunBackend {
     async fn prepare_ephemeral_root(
         runtime: &BoxRuntimeConfig,
         spec: &RunSpec,
+        budget: &RunBudget,
     ) -> Result<(PreparedRoot, StartupMetrics), BackendError> {
         let source = runtime.source.clone().ok_or_else(|| {
             BackendError::Control(
@@ -334,10 +368,17 @@ impl LibkrunBackend {
         let lookup_store = base_store.clone();
         let lookup_spec = base_spec.clone();
         let lookup_started = Instant::now();
-        let cached = tokio::task::spawn_blocking(move || lookup_store.get(&lookup_spec))
+        let cached = budget
+            .run(RunStage::CacheLookup, async move {
+                tokio::task::spawn_blocking(move || lookup_store.get(&lookup_spec))
+                    .await
+                    .map_err(|error| {
+                        BackendError::Control(format!("base disk task failed: {error}"))
+                    })?
+                    .map_err(box_backend_error)
+            })
             .await
-            .map_err(|error| BackendError::Control(format!("base disk task failed: {error}")))?
-            .map_err(box_backend_error)?;
+            .map_err(BackendError::from)?;
         let mut startup = StartupMetrics {
             root_mode: Some(RootMode::Ephemeral),
             cache_lookup_micros: Some(elapsed_micros(lookup_started)),
@@ -349,24 +390,36 @@ impl LibkrunBackend {
             let rootfs = source.rootfs_path;
             let mke2fs = source.mke2fs_path;
             let prepare_started = Instant::now();
-            let base = tokio::task::spawn_blocking(move || {
-                base_store.prepare(&base_spec, &rootfs, &mke2fs)
-            })
-            .await
-            .map_err(|error| BackendError::Control(format!("base disk task failed: {error}")))?
-            .map_err(box_backend_error)?;
+            let base = budget
+                .run(RunStage::BaseDiskPrepare, async move {
+                    tokio::task::spawn_blocking(move || {
+                        base_store.prepare(&base_spec, &rootfs, &mke2fs)
+                    })
+                    .await
+                    .map_err(|error| {
+                        BackendError::Control(format!("base disk task failed: {error}"))
+                    })?
+                    .map_err(box_backend_error)
+                })
+                .await
+                .map_err(BackendError::from)?;
             startup.base_prepare_micros = Some(elapsed_micros(prepare_started));
             base
         };
         let ephemeral_store = runtime.ephemeral_disks.clone();
         let session_id = spec.session_id;
         let clone_started = Instant::now();
-        let disk = tokio::task::spawn_blocking(move || {
-            ephemeral_store.clone_for_session(&base, session_id)
-        })
-        .await
-        .map_err(|error| BackendError::Control(format!("CoW clone task failed: {error}")))?
-        .map_err(box_backend_error)?;
+        let disk = budget
+            .run(RunStage::EphemeralDiskClone, async move {
+                tokio::task::spawn_blocking(move || {
+                    ephemeral_store.clone_for_session(&base, session_id)
+                })
+                .await
+                .map_err(|error| BackendError::Control(format!("CoW clone task failed: {error}")))?
+                .map_err(box_backend_error)
+            })
+            .await
+            .map_err(BackendError::from)?;
         startup.disk_clone_micros = Some(elapsed_micros(clone_started));
         Ok((
             PreparedRoot::Managed(ManagedRootLease::Ephemeral(disk)),
@@ -431,12 +484,13 @@ async fn repair_dirty_box(
             e2fsck.display()
         )));
     }
-    let output = Command::new(e2fsck)
+    let mut command = Command::new(e2fsck);
+    command
         .arg("-p")
         .arg(lease.disk_path())
         .env_clear()
-        .output()
-        .await?;
+        .kill_on_drop(true);
+    let output = command.output().await?;
     if matches!(output.status.code(), Some(0 | 1)) {
         store
             .set_state(lease, BoxState::Ready)
@@ -802,7 +856,9 @@ mod tests {
         let mut spec = RunSpec::command(["true"]);
         spec.network = true;
 
-        let error = LibkrunBackend::new(config).spawn(&spec).await;
+        let error = LibkrunBackend::new(config)
+            .spawn(&spec, &RunBudget::new(spec.timeout))
+            .await;
         assert!(
             matches!(error, Err(BackendError::Control(message)) if message.contains("gvproxy"))
         );
@@ -895,10 +951,15 @@ mod tests {
         let mut spec = RunSpec::command(["/usr/bin/true"]);
         spec.box_id = Some(box_id);
 
-        let running = backend.spawn(&spec).await.unwrap();
+        let running = backend
+            .spawn(&spec, &RunBudget::new(spec.timeout))
+            .await
+            .unwrap();
         assert_eq!(fixture.boxes.get(box_id).unwrap().state, BoxState::Dirty);
         assert!(matches!(
-            backend.spawn(&spec).await,
+            backend
+                .spawn(&spec, &RunBudget::new(spec.timeout))
+                .await,
             Err(BackendError::Control(message)) if message.contains("already in use")
         ));
         drop(running);
@@ -917,7 +978,7 @@ mod tests {
         let backend = fixture.backend(None);
         let mut spec = RunSpec::command(["/usr/bin/true"]);
         spec.box_id = Some(box_id);
-        spec.timeout = moraebox_core::TimeoutPolicy::Limited(20);
+        spec.timeout = moraebox_core::TimeoutPolicy::Limited(200);
         spec.kill_grace = Duration::from_millis(20);
 
         let report = crate::Supervisor::new(backend).run(spec).await.unwrap();
@@ -972,13 +1033,42 @@ mod tests {
         spec.box_id = Some(box_id);
 
         assert!(matches!(
-            backend.spawn(&spec).await,
+            backend
+                .spawn(&spec, &RunBudget::new(spec.timeout))
+                .await,
             Err(BackendError::Control(message)) if message.contains("could not repair")
         ));
         assert_eq!(
             fixture.boxes.get(box_id).unwrap().state,
             BoxState::NeedsRepair
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repair_timeout_preserves_the_exact_failure_stage() {
+        let fixture = ManagedFixture::new(
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nwhile :; do /bin/sleep 1; done\n",
+        );
+        let (box_id, _) = fixture.create_box();
+        fixture.set_box_state(box_id, BoxState::Dirty);
+        let backend = fixture.backend(None);
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.box_id = Some(box_id);
+        spec.timeout = moraebox_core::TimeoutPolicy::Limited(20);
+        let budget = RunBudget::new(spec.timeout);
+
+        assert!(matches!(
+            backend.spawn(&spec, &budget).await,
+            Err(BackendError::Timeout {
+                stage: RunStage::BoxRepair,
+                ..
+            })
+        ));
+        assert_eq!(budget.failure_stage(), Some(RunStage::BoxRepair));
+        assert_eq!(fixture.boxes.get(box_id).unwrap().state, BoxState::Dirty);
+        assert!(fixture.boxes.try_acquire(box_id).is_ok());
     }
 
     #[cfg(unix)]
@@ -1038,7 +1128,7 @@ mod tests {
         write_executable(&helper, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
         write_executable(
             &gvproxy,
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nsocket=${2#unixgram://}\n: > \"$socket\"\nwhile :; do :; done\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nsocket=${2#unixgram://}\n: > \"$socket\"\nwhile :; do /bin/sleep 1; done\n",
         );
         fs::write(&library, []).unwrap();
         fs::create_dir(&root).unwrap();
@@ -1082,10 +1172,10 @@ mod tests {
         let library = state.path().join("libkrun");
         let root = state.path().join("root");
         let network_runtime_dir = state.path().join(".moraebox/network");
-        write_executable(&helper, "#!/bin/sh\nwhile :; do :; done\n");
+        write_executable(&helper, "#!/bin/sh\nwhile :; do /bin/sleep 1; done\n");
         write_executable(
             &gvproxy,
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nsocket=${2#unixgram://}\n: > \"$socket\"\nwhile :; do :; done\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nsocket=${2#unixgram://}\n: > \"$socket\"\nwhile :; do /bin/sleep 1; done\n",
         );
         fs::write(&library, []).unwrap();
         fs::create_dir(&root).unwrap();
@@ -1095,7 +1185,7 @@ mod tests {
         config.network_runtime_dir = network_runtime_dir.clone();
         let mut spec = RunSpec::command(["/usr/bin/true"]);
         spec.network = true;
-        spec.timeout = moraebox_core::TimeoutPolicy::Limited(20);
+        spec.timeout = moraebox_core::TimeoutPolicy::Limited(5_000);
         spec.kill_grace = Duration::from_millis(20);
 
         let report = crate::Supervisor::new(LibkrunBackend::new(config))
@@ -1125,10 +1215,10 @@ mod tests {
         let library = state.path().join("libkrun");
         let root = state.path().join("root");
         let network_runtime_dir = state.path().join(".moraebox/network");
-        write_executable(&helper, "#!/bin/sh\nwhile :; do :; done\n");
+        write_executable(&helper, "#!/bin/sh\nwhile :; do /bin/sleep 1; done\n");
         write_executable(
             &gvproxy,
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nsocket=${2#unixgram://}\n: > \"$socket\"\nwhile :; do :; done\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nsocket=${2#unixgram://}\n: > \"$socket\"\nwhile :; do /bin/sleep 1; done\n",
         );
         fs::write(&library, []).unwrap();
         fs::create_dir(&root).unwrap();
@@ -1140,7 +1230,10 @@ mod tests {
         let mut spec = RunSpec::command(["/usr/bin/true"]);
         spec.network = true;
 
-        let spawned = backend.spawn(&spec).await.unwrap();
+        let spawned = backend
+            .spawn(&spec, &RunBudget::new(spec.timeout))
+            .await
+            .unwrap();
         let pid = fs::read_to_string(proxy_pid)
             .unwrap()
             .trim()
@@ -1165,7 +1258,7 @@ mod tests {
         use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
 
         let fixture = ManagedFixture::new(
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nwhile :; do :; done\n",
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nwhile :; do /bin/sleep 1; done\n",
             "#!/bin/sh\nexit 0\n",
         );
         let rootfs = fixture.state.path().join("rootfs");
@@ -1185,7 +1278,7 @@ mod tests {
         let gvproxy = fixture.state.path().join("gvproxy");
         write_executable(
             &gvproxy,
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nsocket=${2#unixgram://}\n: > \"$socket\"\nwhile :; do :; done\n",
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nsocket=${2#unixgram://}\n: > \"$socket\"\nwhile :; do /bin/sleep 1; done\n",
         );
         let mut backend = fixture.backend(Some((source, runtime_root.clone())));
         backend.config.gvproxy_path = Some(gvproxy.clone());

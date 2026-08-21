@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    Backend, BackendError, SessionError, StartupMetrics, TraceEvent, session::start_session,
+    Backend, BackendError, RunBudget, RunStage, SessionError, StageTiming, StartupMetrics,
+    TraceEvent, session::start_session,
 };
 
 pub struct Supervisor<B> {
@@ -27,7 +28,16 @@ where
     }
 
     pub async fn run(&self, spec: RunSpec) -> Result<RunReport, SupervisorError> {
-        let session = start_session(Arc::clone(&self.backend), spec)
+        let budget = RunBudget::new(spec.timeout);
+        self.run_with_budget(spec, budget).await
+    }
+
+    pub async fn run_with_budget(
+        &self,
+        spec: RunSpec,
+        budget: RunBudget,
+    ) -> Result<RunReport, SupervisorError> {
+        let session = start_session(Arc::clone(&self.backend), spec, budget)
             .await
             .map_err(map_session_start)?;
         let _ = session.close_stdin().await;
@@ -61,6 +71,8 @@ where
             elapsed_micros: status.elapsed_micros,
             startup: session.startup(),
             trace: session.trace(),
+            stages: session.stage_timings(),
+            failure_stage: session.failure_stage(),
         })
     }
 }
@@ -89,6 +101,10 @@ pub struct RunReport {
     pub elapsed_micros: u64,
     pub startup: StartupMetrics,
     pub trace: Vec<TraceEvent>,
+    #[serde(default)]
+    pub stages: Vec<StageTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_stage: Option<RunStage>,
 }
 
 #[derive(Debug, Error)]
@@ -142,6 +158,22 @@ mod tests {
         assert!(report.output.iter().any(|chunk| {
             chunk.channel == OutputChannel::Stderr && chunk.data.starts_with(b"err")
         }));
+        assert!(
+            report
+                .stages
+                .iter()
+                .any(|timing| timing.stage == RunStage::ProcessSpawn)
+        );
+        assert!(
+            report
+                .stages
+                .iter()
+                .any(|timing| timing.stage == RunStage::CommandRun)
+        );
+        assert_eq!(report.failure_stage, None);
+        assert!(report.trace.iter().any(|event| {
+            event.kind == TraceKind::StageCompleted && event.stage == Some(RunStage::ProcessSpawn)
+        }));
         let trace_kinds = report
             .trace
             .iter()
@@ -180,7 +212,11 @@ mod tests {
         assert_eq!(report.signal, status.signal);
         assert_eq!(report.timed_out, status.timed_out);
         for trace in [report.trace, session.trace()] {
-            let kinds = trace.iter().map(|event| event.kind).collect::<Vec<_>>();
+            let kinds = trace
+                .iter()
+                .filter(|event| event.stage.is_none())
+                .map(|event| event.kind)
+                .collect::<Vec<_>>();
             assert_eq!(
                 &kinds[..4],
                 &[
@@ -205,6 +241,10 @@ mod tests {
         let report = supervisor.run(spec).await.unwrap();
         assert!(report.timed_out);
         assert_eq!(report.termination_reason, Some(TerminationReason::TimedOut));
+        assert_eq!(report.failure_stage, Some(RunStage::CommandRun));
+        assert!(report.trace.iter().any(|event| {
+            event.kind == TraceKind::StageFailed && event.stage == Some(RunStage::CommandRun)
+        }));
     }
 
     #[tokio::test]
@@ -294,7 +334,11 @@ mod tests {
             "failing-teardown"
         }
 
-        async fn spawn(&self, _spec: &RunSpec) -> Result<crate::SpawnedSandbox, BackendError> {
+        async fn spawn(
+            &self,
+            _spec: &RunSpec,
+            _budget: &RunBudget,
+        ) -> Result<crate::SpawnedSandbox, BackendError> {
             let exit_state = Arc::clone(&self.state);
             let exit = Box::pin(async move {
                 exit_state.forced.notified().await;
@@ -342,7 +386,11 @@ mod tests {
             "output-failure"
         }
 
-        async fn spawn(&self, _spec: &RunSpec) -> Result<crate::SpawnedSandbox, BackendError> {
+        async fn spawn(
+            &self,
+            _spec: &RunSpec,
+            _budget: &RunBudget,
+        ) -> Result<crate::SpawnedSandbox, BackendError> {
             Ok(crate::SpawnedSandbox {
                 stdin: None,
                 stdout: Box::pin(FailingReader),

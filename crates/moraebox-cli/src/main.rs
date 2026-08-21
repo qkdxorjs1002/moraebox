@@ -24,8 +24,8 @@ use moraebox_image::{
 };
 use moraebox_runtime::{
     Backend, BoxRootSource, BoxRuntimeConfig, DoctorReport, LibkrunBackend, LibkrunConfig,
-    NativeRuntimePaths, ProcessBackend, SessionError, SessionHandle, SessionManager, SessionStatus,
-    Supervisor,
+    NativeRuntimePaths, ProcessBackend, RunBudget, RunStage, SessionError, SessionHandle,
+    SessionManager, SessionStatus, Supervisor,
 };
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
@@ -601,6 +601,7 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
         return Err("--box cannot be combined with --rootfs, --image, or --workspace".into());
     }
     validate_network_option(&args.backend, spec.network)?;
+    let budget = RunBudget::new(spec.timeout);
     let cache_dir = (args.backend == "libkrun")
         .then(|| resolve_cache_dir(args.cache_dir.as_deref()))
         .transpose()?;
@@ -623,13 +624,18 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
             .as_deref()
             .ok_or("libkrun image selection requires a cache directory")?;
         Some(
-            resolve_or_pull(
-                reference,
-                cache_dir,
-                &platform,
-                credentials(args.registry_username, args.registry_password),
-            )
-            .await?,
+            budget
+                .run(
+                    RunStage::ImagePull,
+                    resolve_or_pull(
+                        reference,
+                        cache_dir,
+                        &platform,
+                        credentials(args.registry_username, args.registry_password),
+                    ),
+                )
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?,
         )
     } else {
         None
@@ -646,15 +652,20 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
         let cache_dir = cache_dir
             .as_deref()
             .ok_or("--workspace requires a cache directory")?;
+        let workspace_timeout = budget.remaining(RunStage::WorkspacePrepare)?;
         Some(
-            WorkspaceSnapshot::create_async(
-                source,
-                cache_dir,
-                &mke2fs,
-                spec.timeout.duration(),
-                report_workspace_stage,
-            )
-            .await?,
+            budget
+                .observe(
+                    RunStage::WorkspacePrepare,
+                    WorkspaceSnapshot::create_async(
+                        source,
+                        cache_dir,
+                        &mke2fs,
+                        workspace_timeout,
+                        report_workspace_stage,
+                    ),
+                )
+                .await?,
         )
     } else {
         None
@@ -663,9 +674,11 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let report = match args.backend.as_str() {
         "process" => {
             if args.interactive {
-                return run_interactive(ProcessBackend, spec).await;
+                return run_interactive(ProcessBackend, spec, budget).await;
             }
-            Supervisor::new(ProcessBackend).run(spec).await?
+            Supervisor::new(ProcessBackend)
+                .run_with_budget(spec, budget)
+                .await?
         }
         "libkrun" => {
             let cache_dir = cache_dir
@@ -726,9 +739,11 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
                 eprintln!("morae: workspace: attaching read-only image");
             }
             if args.interactive {
-                return run_interactive(backend, spec).await;
+                return run_interactive(backend, spec, budget).await;
             }
-            Supervisor::new(backend).run(spec).await?
+            Supervisor::new(backend)
+                .run_with_budget(spec, budget)
+                .await?
         }
         _ => unreachable!("clap validates backend values"),
     };
@@ -766,14 +781,20 @@ fn report_workspace_stage(stage: WorkspaceStage) {
 
 const INTERACTIVE_READ_BYTES: usize = 64 * 1024;
 
-async fn run_interactive<B>(backend: B, spec: RunSpec) -> Result<i32, Box<dyn std::error::Error>>
+async fn run_interactive<B>(
+    backend: B,
+    spec: RunSpec,
+    budget: RunBudget,
+) -> Result<i32, Box<dyn std::error::Error>>
 where
     B: Backend + 'static,
 {
     let _terminal = RawTerminalGuard::enter(spec.tty && io::stdin().is_terminal())?;
     let mut input = InteractiveInput::new()?;
     let mut signals = HostSignals::new()?;
-    let session = SessionManager::new(Arc::new(backend)).start(spec).await?;
+    let session = SessionManager::new(Arc::new(backend))
+        .start_with_budget(spec, budget)
+        .await?;
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
     let mut cursor = 0_u64;

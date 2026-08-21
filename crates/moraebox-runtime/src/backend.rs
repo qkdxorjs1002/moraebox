@@ -1,10 +1,12 @@
-use std::{future::Future, io, pin::Pin, process::ExitStatus};
+use std::{future::Future, io, pin::Pin, process::ExitStatus, time::Duration};
 
 use async_trait::async_trait;
 use moraebox_core::{OutputChannel, RunSpec, Signal};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::{RunBudget, RunStage, StageError};
 
 pub type BoxedReader = Pin<Box<dyn AsyncRead + Send>>;
 pub type BoxedWriter = Pin<Box<dyn AsyncWrite + Send>>;
@@ -46,7 +48,11 @@ pub struct StartupMetrics {
 pub trait Backend: Send + Sync {
     fn name(&self) -> &'static str;
 
-    async fn spawn(&self, spec: &RunSpec) -> Result<SpawnedSandbox, BackendError>;
+    async fn spawn(
+        &self,
+        spec: &RunSpec,
+        budget: &RunBudget,
+    ) -> Result<SpawnedSandbox, BackendError>;
 }
 
 #[async_trait]
@@ -74,4 +80,20 @@ pub enum BackendError {
     Io(#[from] io::Error),
     #[error("backend control failed: {0}")]
     Control(String),
+    #[error("run timed out after {limit:?} during {stage}")]
+    Timeout { stage: RunStage, limit: Duration },
+}
+
+impl<E: std::fmt::Display> From<StageError<E>> for BackendError {
+    fn from(error: StageError<E>) -> Self {
+        match error {
+            StageError::Timeout(error) => Self::Timeout {
+                stage: error.stage,
+                limit: error.limit,
+            },
+            StageError::Failed { stage, source } => {
+                Self::Control(format!("{stage} failed: {source}"))
+            }
+        }
+    }
 }

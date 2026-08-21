@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+mod budget;
 mod doctor;
 mod libkrun;
 mod pool;
@@ -15,6 +16,7 @@ pub use backend::{
     Backend, BackendController, BackendError, BoxedReader, BoxedWriter, RootMode, SpawnedSandbox,
     StartupMetrics,
 };
+pub use budget::{RunBudget, RunBudgetTimeout, RunStage, StageError, StageTiming};
 pub use doctor::{DoctorReport, LibraryProbe, NativeRuntimePaths, ToolProbe};
 pub use libkrun::{BoxRootSource, BoxRuntimeConfig, LibkrunBackend, LibkrunConfig};
 pub use pool::{PoolConfig, PoolError, PoolStats, PreparedKey, PreparedLease, PreparedPool};

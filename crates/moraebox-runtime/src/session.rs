@@ -17,7 +17,9 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+use crate::budget::StageEventKind;
 use crate::{Backend, BackendError, StartupMetrics, TraceEvent, TraceKind};
+use crate::{RunBudget, RunStage, StageTiming};
 
 const STDIN_QUEUE_ITEMS: usize = 32;
 const STDIN_QUEUE_BYTES: usize = 1024 * 1024;
@@ -33,23 +35,33 @@ impl SessionManager {
     }
 
     pub async fn start(&self, spec: RunSpec) -> Result<SessionHandle, SessionError> {
-        start_session(Arc::clone(&self.backend), spec).await
+        let budget = RunBudget::new(spec.timeout);
+        self.start_with_budget(spec, budget).await
+    }
+
+    pub async fn start_with_budget(
+        &self,
+        spec: RunSpec,
+        budget: RunBudget,
+    ) -> Result<SessionHandle, SessionError> {
+        start_session(Arc::clone(&self.backend), spec, budget).await
     }
 }
 
 pub(crate) async fn start_session<B: Backend + ?Sized>(
     backend: Arc<B>,
     mut spec: RunSpec,
+    budget: RunBudget,
 ) -> Result<SessionHandle, SessionError> {
     spec.validate().map_err(BackendError::InvalidSpec)?;
-    let started = Instant::now();
+    let started = budget.started();
     let trace = Arc::new(StdMutex::new(TraceRecorder::new(started)));
     let mut lifecycle = Lifecycle::default();
     lifecycle.apply(LifecycleEvent::Prepare)?;
-    record_trace(&trace, TraceKind::PrepareStarted);
+    record_trace_at(&trace, TraceKind::PrepareStarted, 0);
     lifecycle.apply(LifecycleEvent::Start)?;
     record_trace(&trace, TraceKind::BackendSpawnStarted);
-    let spawned = match backend.spawn(&spec).await {
+    let spawned = match backend.spawn(&spec, &budget).await {
         Ok(spawned) => spawned,
         Err(error) => {
             lifecycle.apply(LifecycleEvent::Fail)?;
@@ -62,6 +74,7 @@ pub(crate) async fn start_session<B: Backend + ?Sized>(
     lifecycle.apply(LifecycleEvent::CommandStarted)?;
     record_trace(&trace, TraceKind::CommandStarted);
     let startup = spawned.startup.clone();
+    let (command_stage_started, command_timeout) = begin_command_stage(&budget);
     let initial = SessionStatus {
         session_id: spec.session_id,
         backend: backend.name().into(),
@@ -121,6 +134,9 @@ pub(crate) async fn start_session<B: Backend + ?Sized>(
         stderr_task,
         Arc::clone(&trace),
         Arc::clone(&terminal_errors),
+        budget.clone(),
+        command_stage_started,
+        command_timeout,
     ));
     Ok(SessionHandle {
         session_id,
@@ -133,7 +149,15 @@ pub(crate) async fn start_session<B: Backend + ?Sized>(
         startup,
         trace,
         terminal_errors,
+        budget,
     })
+}
+
+fn begin_command_stage(budget: &RunBudget) -> (Instant, Option<Duration>) {
+    let timeout = budget
+        .remaining(RunStage::CommandRun)
+        .unwrap_or(Some(Duration::ZERO));
+    (budget.begin_stage(RunStage::CommandRun), timeout)
 }
 
 #[derive(Clone)]
@@ -148,6 +172,7 @@ pub struct SessionHandle {
     startup: StartupMetrics,
     trace: Arc<StdMutex<TraceRecorder>>,
     terminal_errors: Arc<StdMutex<Vec<String>>>,
+    budget: RunBudget,
 }
 
 impl SessionHandle {
@@ -269,11 +294,27 @@ impl SessionHandle {
     }
 
     pub(crate) fn trace(&self) -> Vec<TraceEvent> {
-        self.trace
+        let mut events = self
+            .trace
             .lock()
             .expect("session trace lock must not be poisoned")
             .events
-            .clone()
+            .clone();
+        events.extend(self.budget.events().into_iter().map(|event| TraceEvent {
+            sequence: 0,
+            elapsed_micros: event.elapsed_micros,
+            kind: match event.kind {
+                StageEventKind::Started => TraceKind::StageStarted,
+                StageEventKind::Completed => TraceKind::StageCompleted,
+                StageEventKind::Failed => TraceKind::StageFailed,
+            },
+            stage: Some(event.stage),
+        }));
+        events.sort_by_key(|event| event.elapsed_micros);
+        for (sequence, event) in events.iter_mut().enumerate() {
+            event.sequence = sequence as u64;
+        }
+        events
     }
 
     pub(crate) fn terminal_error(&self) -> Option<String> {
@@ -292,6 +333,14 @@ impl SessionHandle {
             .read(earliest, usize::MAX)
             .expect("earliest retained output cursor must be readable");
         (retained, earliest, next)
+    }
+
+    pub(crate) fn stage_timings(&self) -> Vec<StageTiming> {
+        self.budget.timings()
+    }
+
+    pub(crate) fn failure_stage(&self) -> Option<RunStage> {
+        self.budget.failure_stage()
     }
 
     async fn request(
@@ -349,12 +398,12 @@ async fn drive_session(
     stderr_task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     trace: Arc<StdMutex<TraceRecorder>>,
     terminal_errors: Arc<StdMutex<Vec<String>>>,
+    budget: RunBudget,
+    command_stage_started: Instant,
+    command_timeout: Option<Duration>,
 ) {
     let mut controller = Some(controller);
-    let mut deadline = spec
-        .timeout
-        .duration()
-        .map(|duration| Box::pin(sleep(duration)));
+    let mut deadline = command_timeout.map(|duration| Box::pin(sleep(duration)));
     let mut kill_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut cleanup_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut timed_out = false;
@@ -649,6 +698,11 @@ async fn drive_session(
     drop(controller.take());
     if !errors.is_empty() {
         mark_failed(&mut lifecycle, &status_sender, &spec, started, timed_out);
+    }
+    if timed_out || !errors.is_empty() {
+        budget.fail_stage(RunStage::CommandRun, command_stage_started);
+    } else {
+        budget.complete_stage(RunStage::CommandRun, command_stage_started);
     }
     *terminal_errors
         .lock()
@@ -967,6 +1021,16 @@ impl TraceRecorder {
             sequence: self.events.len() as u64,
             elapsed_micros: duration_micros(self.started.elapsed()),
             kind,
+            stage: None,
+        });
+    }
+
+    fn push_at(&mut self, kind: TraceKind, elapsed_micros: u64) {
+        self.events.push(TraceEvent {
+            sequence: self.events.len() as u64,
+            elapsed_micros,
+            kind,
+            stage: None,
         });
     }
 }
@@ -976,6 +1040,13 @@ fn record_trace(trace: &Arc<StdMutex<TraceRecorder>>, kind: TraceKind) {
         .lock()
         .expect("session trace lock must not be poisoned")
         .push(kind);
+}
+
+fn record_trace_at(trace: &Arc<StdMutex<TraceRecorder>>, kind: TraceKind, elapsed_micros: u64) {
+    trace
+        .lock()
+        .expect("session trace lock must not be poisoned")
+        .push_at(kind, elapsed_micros);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1046,6 +1117,7 @@ mod tests {
         let trace = session
             .trace()
             .into_iter()
+            .filter(|event| event.stage.is_none())
             .map(|event| event.kind)
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1317,7 +1389,11 @@ mod tests {
             "session-test"
         }
 
-        async fn spawn(&self, _spec: &RunSpec) -> Result<crate::SpawnedSandbox, BackendError> {
+        async fn spawn(
+            &self,
+            _spec: &RunSpec,
+            _budget: &RunBudget,
+        ) -> Result<crate::SpawnedSandbox, BackendError> {
             let exit_state = Arc::clone(&self.state);
             let exit: crate::backend::ExitFuture = match self.mode {
                 SessionBackendMode::ControlFailure | SessionBackendMode::GracefulThenForce => {

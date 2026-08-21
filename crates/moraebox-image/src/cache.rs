@@ -306,7 +306,14 @@ impl ImageCache {
             .pull(reference, platform, &cas)
             .await?;
         let rootfs = self.rootfs_path(&image.manifest_digest);
-        image.materialize_rootfs(&cas, &rootfs)?;
+        let materialize_image = image.clone();
+        let materialize_cas = cas.clone();
+        let materialize_rootfs = rootfs.clone();
+        tokio::task::spawn_blocking(move || {
+            materialize_image.materialize_rootfs(&materialize_cas, &materialize_rootfs)
+        })
+        .await
+        .map_err(|error| ImageCacheError::Task(error.to_string()))??;
         self.record_pulled_image(
             lock,
             &image.reference.to_string(),
@@ -1019,6 +1026,8 @@ pub enum ImageCacheError {
     Json(#[from] serde_json::Error),
     #[error("image cache I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("image cache background task failed: {0}")]
+    Task(String),
     #[error(transparent)]
     Registry(#[from] RegistryError),
 }
