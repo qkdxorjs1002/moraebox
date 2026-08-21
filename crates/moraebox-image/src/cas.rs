@@ -1,5 +1,7 @@
 use std::{
     fmt,
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
@@ -8,7 +10,7 @@ use std::{
 use futures_util::{Stream, StreamExt};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use crate::lock::AdvisoryLock;
 
@@ -245,39 +247,18 @@ impl Cas {
 
     pub(crate) async fn verify(&self, digest: &Digest) -> Result<u64, CasError> {
         let path = self.blob_path(digest);
-        let mut file = tokio::fs::File::open(path).await?;
-        let mut buffer = vec![0_u8; VERIFY_BUFFER_SIZE];
-        let mut hasher = Sha256::new();
-        let mut size = 0_u64;
-        loop {
-            let read = file.read(&mut buffer).await?;
-            if read == 0 {
-                break;
-            }
-            size = size.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-            hasher.update(&buffer[..read]);
-        }
-        let actual = Digest::from_sha256(hasher.finalize().into());
-        if actual != *digest {
-            return Err(CasError::DigestMismatch {
-                expected: digest.clone(),
-                actual,
-            });
-        }
-        Ok(size)
+        let expected = digest.clone();
+        tokio::task::spawn_blocking(move || verify_file(&path, &expected))
+            .await
+            .map_err(|error| CasError::Task(error.to_string()))?
     }
 
     pub async fn read(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
         let path = self.blob_path(digest);
-        let bytes = tokio::fs::read(path).await?;
-        let actual = Digest::from_bytes(&bytes);
-        if actual != *digest {
-            return Err(CasError::DigestMismatch {
-                expected: digest.clone(),
-                actual,
-            });
-        }
-        Ok(bytes)
+        let expected = digest.clone();
+        tokio::task::spawn_blocking(move || read_verified_file(&path, &expected))
+            .await
+            .map_err(|error| CasError::Task(error.to_string()))?
     }
 
     pub fn root(&self) -> &Path {
@@ -288,6 +269,40 @@ impl Cas {
         self.root
             .join("locks/sha256")
             .join(format!("{}.lock", digest.hex()))
+    }
+}
+
+fn verify_file(path: &Path, expected: &Digest) -> Result<u64, CasError> {
+    let mut file = File::open(path)?;
+    let mut buffer = vec![0_u8; VERIFY_BUFFER_SIZE];
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        size = size.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        hasher.update(&buffer[..read]);
+    }
+    verify_digest(expected, Digest::from_sha256(hasher.finalize().into()))?;
+    Ok(size)
+}
+
+fn read_verified_file(path: &Path, expected: &Digest) -> Result<Vec<u8>, CasError> {
+    let bytes = std::fs::read(path)?;
+    verify_digest(expected, Digest::from_bytes(&bytes))?;
+    Ok(bytes)
+}
+
+fn verify_digest(expected: &Digest, actual: Digest) -> Result<(), CasError> {
+    if actual == *expected {
+        Ok(())
+    } else {
+        Err(CasError::DigestMismatch {
+            expected: expected.clone(),
+            actual,
+        })
     }
 }
 
@@ -344,6 +359,8 @@ pub enum CasError {
     DigestMismatch { expected: Digest, actual: Digest },
     #[error("CAS I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("CAS blocking task failed: {0}")]
+    Task(String),
 }
 
 #[cfg(test)]

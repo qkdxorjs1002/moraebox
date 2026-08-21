@@ -171,7 +171,7 @@
   - layer download는 bounded concurrency를 허용하되 적용 순서는 유지한다.
   - HTTP client/token을 재사용하고 connect/read/overall timeout, bounded retry, `Retry-After`를 적용한다.
 
-- [ ] layer extraction과 filesystem hashing을 `spawn_blocking`으로 분리해 async runtime을 막지 않는다.
+- [x] layer extraction과 filesystem hashing을 `spawn_blocking`으로 분리해 async runtime을 막지 않는다.
 
 - [ ] CAS와 materialized image publish를 crash-safe하게 만든다.
   - unique `create_new` temp file/dir를 사용한다.
