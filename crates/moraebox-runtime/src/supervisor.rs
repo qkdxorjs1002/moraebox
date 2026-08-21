@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    Backend, BackendError, RunBudget, RunStage, SessionError, StageTiming, StartupMetrics,
-    TraceEvent, session::start_session,
+    Backend, BackendError, RunBudget, RunStage, SessionError, SessionIoFailure, StageTiming,
+    StartupMetrics, TraceEvent, session::start_session,
 };
 
 pub struct Supervisor<B> {
@@ -43,6 +43,7 @@ where
         let _ = session.close_stdin().await;
         let status = match session.wait().await {
             Ok(status) => status,
+            Err(SessionError::Io(failure)) => return Err(SupervisorError::SessionIo(failure)),
             Err(error) => {
                 if let Some(details) = session.terminal_error() {
                     return Err(SupervisorError::Cleanup(details));
@@ -115,6 +116,8 @@ pub enum SupervisorError {
     Lifecycle(#[from] moraebox_core::LifecycleError),
     #[error("supervisor I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    SessionIo(#[from] SessionIoFailure),
     #[error(transparent)]
     Session(#[from] SessionError),
     #[error("backend cleanup failed: {0}")]
@@ -309,11 +312,15 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("stdout pump failed: injected read failure")
-        );
+        assert!(matches!(
+            error,
+            SupervisorError::SessionIo(SessionIoFailure {
+                stream: crate::SessionIoStream::Stdout,
+                kind: crate::SessionIoFailureKind::Operation,
+                io_kind: Some(io::ErrorKind::Other),
+                ref message,
+            }) if message == "injected read failure"
+        ));
     }
 
     #[derive(Default)]

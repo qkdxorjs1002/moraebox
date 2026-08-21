@@ -121,7 +121,7 @@
 - [x] image pull, workspace 준비, base/ephemeral disk 준비, helper spawn을 전체 timeout budget에 포함한다.
   - 각 단계별 elapsed time과 실패 stage를 trace/report에 남긴다.
 
-- [ ] output pump 오류를 성공 결과로 숨기지 않고 typed I/O failure로 보고한다.
+- [x] output pump 오류를 성공 결과로 숨기지 않고 typed I/O failure로 보고한다.
 
 - [ ] `RunSpec.inherit_env`의 process/libkrun 동작을 일치시킨다.
   - 기본 empty environment를 유지한다.

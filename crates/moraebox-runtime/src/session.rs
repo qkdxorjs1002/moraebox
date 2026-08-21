@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     future::Future,
     process::ExitStatus,
     sync::{Arc, Mutex as StdMutex},
@@ -92,7 +93,7 @@ pub(crate) async fn start_session<B: Backend + ?Sized>(
     let (stdin_sender, stdin_receiver) = mpsc::channel(STDIN_QUEUE_ITEMS);
     let stdin_bytes = Arc::new(Semaphore::new(STDIN_QUEUE_BYTES));
     let (stdin_shutdown_sender, stdin_shutdown_receiver) = watch::channel(false);
-    let terminal_errors = Arc::new(StdMutex::new(Vec::new()));
+    let terminal_errors = Arc::new(StdMutex::new(TerminalDiagnostics::default()));
     let initial_stdin = std::mem::take(&mut spec.stdin);
     let stdin_task = tokio::spawn(pump_stdin(
         spawned.stdin,
@@ -160,6 +161,12 @@ fn begin_command_stage(budget: &RunBudget) -> (Instant, Option<Duration>) {
     (budget.begin_stage(RunStage::CommandRun), timeout)
 }
 
+#[derive(Debug, Default)]
+struct TerminalDiagnostics {
+    messages: Vec<String>,
+    io_failures: Vec<SessionIoFailure>,
+}
+
 #[derive(Clone)]
 pub struct SessionHandle {
     session_id: SessionId,
@@ -171,7 +178,7 @@ pub struct SessionHandle {
     stdin_bytes: Arc<Semaphore>,
     startup: StartupMetrics,
     trace: Arc<StdMutex<TraceRecorder>>,
-    terminal_errors: Arc<StdMutex<Vec<String>>>,
+    terminal_errors: Arc<StdMutex<TerminalDiagnostics>>,
     budget: RunBudget,
 }
 
@@ -189,10 +196,20 @@ impl SessionHandle {
         &self,
     ) -> impl Future<Output = Result<SessionStatus, SessionError>> + Send + 'static {
         let mut receiver = self.status.clone();
+        let terminal_errors = Arc::clone(&self.terminal_errors);
         async move {
             loop {
                 let current = receiver.borrow().clone();
                 if current.state == SessionState::Dead {
+                    if let Some(failure) = terminal_errors
+                        .lock()
+                        .expect("session error lock must not be poisoned")
+                        .io_failures
+                        .first()
+                        .cloned()
+                    {
+                        return Err(SessionError::Io(failure));
+                    }
                     return Ok(current);
                 }
                 receiver
@@ -322,7 +339,7 @@ impl SessionHandle {
             .terminal_errors
             .lock()
             .expect("session error lock must not be poisoned");
-        (!errors.is_empty()).then(|| errors.join("; "))
+        (!errors.messages.is_empty()).then(|| errors.messages.join("; "))
     }
 
     pub(crate) async fn retained_output(&self) -> (OutputRead, u64, u64) {
@@ -397,7 +414,7 @@ async fn drive_session(
     stdout_task: tokio::task::JoinHandle<std::io::Result<()>>,
     stderr_task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     trace: Arc<StdMutex<TraceRecorder>>,
-    terminal_errors: Arc<StdMutex<Vec<String>>>,
+    terminal_errors: Arc<StdMutex<TerminalDiagnostics>>,
     budget: RunBudget,
     command_stage_started: Instant,
     command_timeout: Option<Duration>,
@@ -408,6 +425,7 @@ async fn drive_session(
     let mut cleanup_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut timed_out = false;
     let mut errors = Vec::new();
+    let mut io_failures = Vec::new();
     let mut commands_open = true;
     let mut shutdown_started = false;
     let mut stdin_open = true;
@@ -690,11 +708,17 @@ async fn drive_session(
     };
     stdin_shutdown.send_replace(true);
     if stdin_open {
-        if let Err(error) = finish_session_io_task("stdin", stdin_task, spec.kill_grace).await {
-            errors.push(error);
+        if let Err(error) =
+            finish_session_io_task(SessionIoStream::Stdin, stdin_task, spec.kill_grace).await
+        {
+            errors.push(error.to_string());
+            io_failures.push(error);
         }
     }
-    errors.extend(finish_session_output_tasks(stdout_task, stderr_task, spec.kill_grace).await);
+    let output_failures =
+        finish_session_output_tasks(stdout_task, stderr_task, spec.kill_grace).await;
+    errors.extend(output_failures.iter().map(ToString::to_string));
+    io_failures.extend(output_failures);
     drop(controller.take());
     if !errors.is_empty() {
         mark_failed(&mut lifecycle, &status_sender, &spec, started, timed_out);
@@ -706,7 +730,10 @@ async fn drive_session(
     }
     *terminal_errors
         .lock()
-        .expect("session error lock must not be poisoned") = errors;
+        .expect("session error lock must not be poisoned") = TerminalDiagnostics {
+        messages: errors,
+        io_failures,
+    };
     if let Some(status) = exit_status {
         let (exit_code, signal) = decode_exit_status(status);
         apply_lifecycle(&mut lifecycle, LifecycleEvent::CleanupComplete);
@@ -758,11 +785,11 @@ async fn finish_session_output_tasks(
     stdout: tokio::task::JoinHandle<std::io::Result<()>>,
     stderr: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     deadline: Duration,
-) -> Vec<String> {
-    let stdout = finish_session_io_task("stdout", stdout, deadline);
+) -> Vec<SessionIoFailure> {
+    let stdout = finish_session_io_task(SessionIoStream::Stdout, stdout, deadline);
     let stderr = async {
         match stderr {
-            Some(task) => finish_session_io_task("stderr", task, deadline).await,
+            Some(task) => finish_session_io_task(SessionIoStream::Stderr, task, deadline).await,
             None => Ok(()),
         }
     };
@@ -774,29 +801,27 @@ async fn finish_session_output_tasks(
 }
 
 async fn finish_session_io_task(
-    name: &'static str,
+    stream: SessionIoStream,
     mut task: tokio::task::JoinHandle<std::io::Result<()>>,
     deadline: Duration,
-) -> Result<(), String> {
+) -> Result<(), SessionIoFailure> {
     if let Ok(result) = timeout(deadline, &mut task).await {
-        flatten_session_io_task(name, result)
+        flatten_session_io_task(stream, result)
     } else {
         task.abort();
         let _ = task.await;
-        Err(format!(
-            "{name} pump did not stop within the {deadline:?} cleanup deadline"
-        ))
+        Err(SessionIoFailure::cleanup_timeout(stream, deadline))
     }
 }
 
 fn flatten_session_io_task(
-    name: &'static str,
+    stream: SessionIoStream,
     result: Result<std::io::Result<()>, tokio::task::JoinError>,
-) -> Result<(), String> {
+) -> Result<(), SessionIoFailure> {
     match result {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(format!("{name} pump failed: {error}")),
-        Err(error) => Err(format!("{name} pump task failed: {error}")),
+        Ok(Err(error)) => Err(SessionIoFailure::operation(stream, &error)),
+        Err(error) => Err(SessionIoFailure::task(stream, &error)),
     }
 }
 
@@ -1061,10 +1086,84 @@ pub struct SessionStatus {
     pub elapsed_micros: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionIoStream {
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
+impl fmt::Display for SessionIoStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Stdin => "stdin",
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionIoFailureKind {
+    Operation,
+    Task,
+    CleanupTimeout,
+}
+
+impl fmt::Display for SessionIoFailureKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Operation => "I/O failed",
+            Self::Task => "task failed",
+            Self::CleanupTimeout => "cleanup timed out",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{stream} pump {kind}: {message}")]
+pub struct SessionIoFailure {
+    pub stream: SessionIoStream,
+    pub kind: SessionIoFailureKind,
+    pub io_kind: Option<std::io::ErrorKind>,
+    pub message: String,
+}
+
+impl SessionIoFailure {
+    fn operation(stream: SessionIoStream, error: &std::io::Error) -> Self {
+        Self {
+            stream,
+            kind: SessionIoFailureKind::Operation,
+            io_kind: Some(error.kind()),
+            message: error.to_string(),
+        }
+    }
+
+    fn task(stream: SessionIoStream, error: &tokio::task::JoinError) -> Self {
+        Self {
+            stream,
+            kind: SessionIoFailureKind::Task,
+            io_kind: None,
+            message: error.to_string(),
+        }
+    }
+
+    fn cleanup_timeout(stream: SessionIoStream, deadline: Duration) -> Self {
+        Self {
+            stream,
+            kind: SessionIoFailureKind::CleanupTimeout,
+            io_kind: None,
+            message: format!("did not stop within the {deadline:?} cleanup deadline"),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error(transparent)]
     Backend(#[from] BackendError),
+    #[error(transparent)]
+    Io(#[from] SessionIoFailure),
     #[error(transparent)]
     Output(#[from] OutputReadError),
     #[error(transparent)]
@@ -1274,10 +1373,20 @@ mod tests {
         }));
 
         let session = manager.start(RunSpec::command(["fake"])).await.unwrap();
-        let status = session.wait().await.unwrap();
+        let error = session.wait().await.unwrap_err();
+        let status = session.status();
 
         assert_eq!(status.state, SessionState::Dead);
         assert_eq!(status.termination_reason, Some(TerminationReason::Failed));
+        assert!(matches!(
+            error,
+            SessionError::Io(SessionIoFailure {
+                stream: SessionIoStream::Stdout,
+                kind: SessionIoFailureKind::Operation,
+                io_kind: Some(io::ErrorKind::Other),
+                ref message,
+            }) if message == "injected read failure"
+        ));
         assert!(
             session
                 .terminal_error()
@@ -1301,6 +1410,48 @@ mod tests {
         drop(state.output_writer.lock().unwrap().take());
 
         assert_eq!(session.wait().await.unwrap().state, SessionState::Dead);
+    }
+
+    #[tokio::test]
+    async fn output_cleanup_timeout_is_a_typed_io_failure() {
+        let manager = SessionManager::new(Arc::new(SessionTestBackend {
+            mode: SessionBackendMode::OutputGate,
+            state: Arc::new(SessionBackendState::default()),
+        }));
+        let mut spec = RunSpec::command(["fake"]);
+        spec.kill_grace = Duration::from_millis(10);
+        let session = manager.start(spec).await.unwrap();
+
+        assert!(matches!(
+            session.wait().await,
+            Err(SessionError::Io(SessionIoFailure {
+                stream: SessionIoStream::Stdout,
+                kind: SessionIoFailureKind::CleanupTimeout,
+                io_kind: None,
+                ..
+            }))
+        ));
+        assert_eq!(session.status().state, SessionState::Dead);
+    }
+
+    #[tokio::test]
+    async fn output_task_panic_is_a_typed_io_failure() {
+        let manager = SessionManager::new(Arc::new(SessionTestBackend {
+            mode: SessionBackendMode::OutputPanic,
+            state: Arc::new(SessionBackendState::default()),
+        }));
+        let session = manager.start(RunSpec::command(["fake"])).await.unwrap();
+
+        assert!(matches!(
+            session.wait().await,
+            Err(SessionError::Io(SessionIoFailure {
+                stream: SessionIoStream::Stdout,
+                kind: SessionIoFailureKind::Task,
+                io_kind: None,
+                ..
+            }))
+        ));
+        assert_eq!(session.status().state, SessionState::Dead);
     }
 
     #[tokio::test]
@@ -1367,6 +1518,7 @@ mod tests {
         GracefulThenForce,
         OutputFailure,
         OutputGate,
+        OutputPanic,
     }
 
     #[derive(Default)]
@@ -1404,12 +1556,13 @@ mod tests {
                     })
                 }
                 SessionBackendMode::ExitHangs => Box::pin(std::future::pending()),
-                SessionBackendMode::OutputFailure | SessionBackendMode::OutputGate => {
-                    Box::pin(async { Ok(success_status()) })
-                }
+                SessionBackendMode::OutputFailure
+                | SessionBackendMode::OutputGate
+                | SessionBackendMode::OutputPanic => Box::pin(async { Ok(success_status()) }),
             };
             let stdout: crate::BoxedReader = match self.mode {
                 SessionBackendMode::OutputFailure => Box::pin(SessionFailingReader),
+                SessionBackendMode::OutputPanic => Box::pin(SessionPanickingReader),
                 SessionBackendMode::OutputGate => {
                     let (writer, reader) = tokio::io::duplex(8);
                     *self.state.output_writer.lock().unwrap() = Some(writer);
@@ -1475,6 +1628,18 @@ mod tests {
             _buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
             Poll::Ready(Err(io::Error::other("injected read failure")))
+        }
+    }
+
+    struct SessionPanickingReader;
+
+    impl AsyncRead for SessionPanickingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            panic!("injected output task panic")
         }
     }
 

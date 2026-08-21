@@ -21,6 +21,9 @@ pub use doctor::{DoctorReport, LibraryProbe, NativeRuntimePaths, ToolProbe};
 pub use libkrun::{BoxRootSource, BoxRuntimeConfig, LibkrunBackend, LibkrunConfig};
 pub use pool::{PoolConfig, PoolError, PoolStats, PreparedKey, PreparedLease, PreparedPool};
 pub use process::ProcessBackend;
-pub use session::{SessionError, SessionHandle, SessionManager, SessionStatus};
+pub use session::{
+    SessionError, SessionHandle, SessionIoFailure, SessionIoFailureKind, SessionIoStream,
+    SessionManager, SessionStatus,
+};
 pub use supervisor::{RunReport, Supervisor, SupervisorError};
 pub use trace::{TraceEvent, TraceKind};

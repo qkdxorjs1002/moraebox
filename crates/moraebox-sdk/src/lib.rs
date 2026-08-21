@@ -318,7 +318,9 @@ impl SandboxSdk {
             .await?;
         let status = handle.status();
         if status.state == SessionState::Dead {
+            let completion = handle.wait().await;
             self.release_active_slot(session_id).await;
+            completion?;
         }
         Ok(IoResult {
             status,
@@ -329,16 +331,21 @@ impl SandboxSdk {
     }
 
     pub async fn wait(&self, session_id: SessionId) -> Result<SessionStatus, SdkError> {
-        let status = self.session(session_id).await?.wait().await?;
-        self.release_active_slot(session_id).await;
-        Ok(status)
+        let handle = self.session(session_id).await?;
+        let result = handle.wait().await;
+        if handle.status().state == SessionState::Dead {
+            self.release_active_slot(session_id).await;
+        }
+        result.map_err(Into::into)
     }
 
     pub async fn stop(&self, session_id: SessionId) -> Result<SessionStatus, SdkError> {
         let handle = self.session(session_id).await?;
-        let status = Self::stop_handle(&handle).await?;
-        self.release_active_slot(session_id).await;
-        Ok(status)
+        let result = Self::stop_handle(&handle).await;
+        if handle.status().state == SessionState::Dead {
+            self.release_active_slot(session_id).await;
+        }
+        result
     }
 
     /// Stops a running session and removes its retained status and output immediately.
@@ -347,7 +354,7 @@ impl SandboxSdk {
             return Ok(None);
         };
         if entry.handle.status().state == SessionState::Dead {
-            Ok(Some(entry.handle.status()))
+            entry.handle.wait().await.map(Some).map_err(Into::into)
         } else {
             Self::stop_handle(&entry.handle).await.map(Some)
         }
@@ -508,9 +515,21 @@ pub enum SdkError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        io,
+        pin::Pin,
+        process::ExitStatus,
+        task::{Context, Poll},
+        time::Duration,
+    };
 
-    use moraebox_runtime::ProcessBackend;
+    use async_trait::async_trait;
+    use moraebox_core::{OutputChannel, Signal};
+    use moraebox_runtime::{
+        BackendController, BackendError, ProcessBackend, RunBudget, SessionIoFailure,
+        SessionIoFailureKind, SessionIoStream, SpawnedSandbox, StartupMetrics,
+    };
+    use tokio::io::{AsyncRead, ReadBuf};
 
     use super::*;
 
@@ -749,6 +768,88 @@ mod tests {
 
         let replacement = sdk.start(spec).await.unwrap();
         sdk.remove(replacement.session_id).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_output_failure_releases_the_active_session_slot() {
+        let sdk = SandboxSdk::new(Arc::new(OutputFailureBackend)).with_session_registry(
+            SessionRegistryConfig::new(NonZeroUsize::new(1).unwrap(), Duration::from_secs(1)),
+        );
+        let first = sdk.start(RunSpec::command(["fake"])).await.unwrap();
+
+        assert!(matches!(
+            sdk.wait(first.session_id).await,
+            Err(SdkError::Session(SessionError::Io(SessionIoFailure {
+                stream: SessionIoStream::Stdout,
+                kind: SessionIoFailureKind::Operation,
+                io_kind: Some(io::ErrorKind::Other),
+                ..
+            })))
+        ));
+
+        let replacement = sdk.start(RunSpec::command(["fake"])).await.unwrap();
+        assert!(matches!(
+            sdk.wait(replacement.session_id).await,
+            Err(SdkError::Session(SessionError::Io(_)))
+        ));
+    }
+
+    struct OutputFailureBackend;
+
+    #[async_trait]
+    impl Backend for OutputFailureBackend {
+        fn name(&self) -> &'static str {
+            "output-failure"
+        }
+
+        async fn spawn(
+            &self,
+            _spec: &RunSpec,
+            _budget: &RunBudget,
+        ) -> Result<SpawnedSandbox, BackendError> {
+            Ok(SpawnedSandbox {
+                stdin: None,
+                stdout: Box::pin(FailingReader),
+                stdout_channel: OutputChannel::Stdout,
+                stderr: None,
+                exit: Box::pin(async { Ok(success_status()) }),
+                controller: Box::new(NoopController),
+                startup: StartupMetrics::default(),
+            })
+        }
+    }
+
+    struct NoopController;
+
+    #[async_trait]
+    impl BackendController for NoopController {
+        async fn signal(&self, _signal: Signal) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    struct FailingReader;
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("injected SDK read failure")))
+        }
+    }
+
+    #[cfg(unix)]
+    fn success_status() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn success_status() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
     }
 
     #[cfg(unix)]
