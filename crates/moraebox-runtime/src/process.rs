@@ -9,17 +9,31 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    Backend, BackendController, BackendError, RunBudget, RunStage, SpawnedSandbox,
-    environment::resolve_environment,
+    Backend, BackendCapabilities, BackendController, BackendError, CapabilitySupport,
+    IsolationLevel, RunBudget, RunStage, SpawnedSandbox, environment::resolve_environment,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProcessBackend;
 
+impl ProcessBackend {
+    pub const CAPABILITIES: BackendCapabilities = BackendCapabilities {
+        isolation: IsolationLevel::HostProcess,
+        tty: CapabilitySupport::Unsupported,
+        network: CapabilitySupport::Unsupported,
+        box_persistence: CapabilitySupport::Unsupported,
+        workspace: CapabilitySupport::Unsupported,
+    };
+}
+
 #[async_trait]
 impl Backend for ProcessBackend {
     fn name(&self) -> &'static str {
         "process"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        Self::CAPABILITIES
     }
 
     async fn spawn(

@@ -27,6 +27,10 @@ where
         self.backend.name()
     }
 
+    pub fn backend_capabilities(&self) -> crate::BackendCapabilities {
+        self.backend.capabilities()
+    }
+
     pub async fn run(&self, spec: RunSpec) -> Result<RunReport, SupervisorError> {
         let budget = RunBudget::new(spec.timeout);
         self.run_with_budget(spec, budget).await
@@ -341,6 +345,10 @@ mod tests {
             "failing-teardown"
         }
 
+        fn capabilities(&self) -> crate::BackendCapabilities {
+            ProcessBackend::CAPABILITIES
+        }
+
         async fn spawn(
             &self,
             _spec: &RunSpec,
@@ -391,6 +399,10 @@ mod tests {
     impl Backend for OutputFailureBackend {
         fn name(&self) -> &'static str {
             "output-failure"
+        }
+
+        fn capabilities(&self) -> crate::BackendCapabilities {
+            ProcessBackend::CAPABILITIES
         }
 
         async fn spawn(

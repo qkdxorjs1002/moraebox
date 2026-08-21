@@ -43,6 +43,17 @@ fn process_backend_rejects_the_vm_network_option() {
 }
 
 #[test]
+fn process_backend_rejects_tty_from_typed_capabilities() {
+    let output = Command::new(env!("CARGO_BIN_EXE_morae"))
+        .args(["run", "--backend", "process", "--tty", "--", "not-executed"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("TTY support"));
+}
+
+#[test]
 fn process_backend_rejects_a_guest_rootfs() {
     let output = Command::new(env!("CARGO_BIN_EXE_morae"))
         .args([

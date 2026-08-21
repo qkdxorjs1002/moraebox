@@ -127,7 +127,7 @@
   - 기본 empty environment를 유지한다.
   - host environment 해석은 공통 계층에서 명시적으로 수행하고 non-Unicode 값의 정책을 정한다.
 
-- [ ] backend 이름 문자열 검사 대신 격리, TTY, network, Box, workspace 지원을 표현하는 typed capabilities를 도입한다.
+- [x] backend 이름 문자열 검사 대신 격리, TTY, network, Box, workspace 지원을 표현하는 typed capabilities를 도입한다.
 
 - [ ] output buffer가 대용량 read 중 pump를 막지 않도록 lock 범위와 복사를 줄이고 API별 최대 read 크기를 강제한다.
 

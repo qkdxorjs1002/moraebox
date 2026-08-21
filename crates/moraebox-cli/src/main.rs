@@ -23,9 +23,9 @@ use moraebox_image::{
     PruneReport, RemoveReport, WorkspaceSnapshot, WorkspaceStage, digest_tree,
 };
 use moraebox_runtime::{
-    Backend, BoxRootSource, BoxRuntimeConfig, DoctorReport, LibkrunBackend, LibkrunConfig,
-    NativeRuntimePaths, ProcessBackend, RunBudget, RunStage, SessionError, SessionHandle,
-    SessionManager, SessionStatus, Supervisor,
+    Backend, BackendCapabilities, BoxRootSource, BoxRuntimeConfig, DoctorReport, IsolationLevel,
+    LibkrunBackend, LibkrunConfig, NativeRuntimePaths, ProcessBackend, RunBudget, RunStage,
+    SessionError, SessionHandle, SessionManager, SessionStatus, Supervisor,
 };
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
@@ -582,6 +582,7 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     spec.network = args.network;
     spec.cwd = args.cwd;
     spec.env = args.env.into_iter().collect::<BTreeMap<_, _>>();
+    let capabilities = selected_backend_capabilities(&args.backend);
     if !args.interactive && !io::stdin().is_terminal() {
         io::stdin().read_to_end(&mut spec.stdin)?;
     }
@@ -589,7 +590,7 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     if args.rootfs.is_some() && args.image.is_some() {
         return Err("--rootfs and --image are mutually exclusive".into());
     }
-    if spec.box_id.is_some() && args.backend != "libkrun" {
+    if spec.box_id.is_some() && !capabilities.box_persistence.is_supported() {
         return Err("--box requires --backend libkrun".into());
     }
     if spec.box_id.is_some()
@@ -597,7 +598,8 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     {
         return Err("--box cannot be combined with --rootfs, --image, or --workspace".into());
     }
-    validate_network_option(&args.backend, spec.network)?;
+    validate_network_option(capabilities, spec.network)?;
+    validate_tty_option(capabilities, spec.tty)?;
     let budget = RunBudget::new(spec.timeout);
     let cache_dir = (args.backend == "libkrun")
         .then(|| resolve_cache_dir(args.cache_dir.as_deref()))
@@ -640,7 +642,7 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let mke2fs = args.mke2fs.unwrap_or_else(default_mke2fs);
 
     let workspace = if let Some(source) = args.workspace.as_deref() {
-        if args.backend != "libkrun" {
+        if !capabilities.workspace.is_supported() {
             return Err("--workspace requires --backend libkrun".into());
         }
         if spec.cwd.is_some() {
@@ -1655,7 +1657,7 @@ async fn run_benchmark<B: Backend>(
     let backend = supervisor.backend_name();
     Ok(BenchmarkReport {
         backend: backend.into(),
-        mode: benchmark_mode(backend).into(),
+        mode: benchmark_mode(supervisor.backend_capabilities()).into(),
         iterations,
         failures,
         min_micros: samples[0],
@@ -1673,11 +1675,10 @@ async fn run_benchmark<B: Backend>(
     })
 }
 
-fn benchmark_mode(backend: &str) -> &'static str {
-    if backend == "libkrun" {
-        "cached-one-shot"
-    } else {
-        "host-process"
+fn benchmark_mode(capabilities: BackendCapabilities) -> &'static str {
+    match capabilities.isolation {
+        IsolationLevel::MicroVm => "cached-one-shot",
+        IsolationLevel::HostProcess => "host-process",
     }
 }
 
@@ -1845,9 +1846,27 @@ fn parse_timeout(input: &str) -> Result<TimeoutPolicy, Box<dyn std::error::Error
     Ok(TimeoutPolicy::Limited(milliseconds))
 }
 
-fn validate_network_option(backend: &str, network: bool) -> Result<(), &'static str> {
-    if network && backend != "libkrun" {
+fn selected_backend_capabilities(backend: &str) -> BackendCapabilities {
+    match backend {
+        "process" => ProcessBackend::CAPABILITIES,
+        "libkrun" => LibkrunBackend::CAPABILITIES,
+        _ => unreachable!("clap validates backend values"),
+    }
+}
+
+fn validate_network_option(
+    capabilities: BackendCapabilities,
+    network: bool,
+) -> Result<(), &'static str> {
+    if network && !capabilities.network.is_supported() {
         return Err("--network requires --backend libkrun");
+    }
+    Ok(())
+}
+
+fn validate_tty_option(capabilities: BackendCapabilities, tty: bool) -> Result<(), &'static str> {
+    if tty && !capabilities.tty.is_supported() {
+        return Err("--tty requires a backend with TTY support");
     }
     Ok(())
 }
@@ -2175,7 +2194,10 @@ mod tests {
 
     #[test]
     fn benchmark_modes_distinguish_microvms_from_host_processes() {
-        assert_eq!(benchmark_mode("libkrun"), "cached-one-shot");
-        assert_eq!(benchmark_mode("process"), "host-process");
+        assert_eq!(
+            benchmark_mode(LibkrunBackend::CAPABILITIES),
+            "cached-one-shot"
+        );
+        assert_eq!(benchmark_mode(ProcessBackend::CAPABILITIES), "host-process");
     }
 }

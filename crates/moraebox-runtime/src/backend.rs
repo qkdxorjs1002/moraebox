@@ -27,6 +27,35 @@ pub type BoxedReader = Pin<Box<dyn AsyncRead + Send>>;
 pub type BoxedWriter = Pin<Box<dyn AsyncWrite + Send>>;
 pub type ExitFuture = Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + Send>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationLevel {
+    HostProcess,
+    MicroVm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendCapabilities {
+    pub isolation: IsolationLevel,
+    pub tty: CapabilitySupport,
+    pub network: CapabilitySupport,
+    pub box_persistence: CapabilitySupport,
+    pub workspace: CapabilitySupport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySupport {
+    Unsupported,
+    Supported,
+}
+
+impl CapabilitySupport {
+    pub const fn is_supported(self) -> bool {
+        matches!(self, Self::Supported)
+    }
+}
+
 pub struct SpawnedSandbox {
     pub stdin: Option<BoxedWriter>,
     pub stdout: BoxedReader,
@@ -62,6 +91,8 @@ pub struct StartupMetrics {
 #[async_trait]
 pub trait Backend: Send + Sync {
     fn name(&self) -> &'static str;
+
+    fn capabilities(&self) -> BackendCapabilities;
 
     async fn spawn(
         &self,

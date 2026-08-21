@@ -1541,6 +1541,10 @@ mod tests {
             "session-test"
         }
 
+        fn capabilities(&self) -> crate::BackendCapabilities {
+            ProcessBackend::CAPABILITIES
+        }
+
         async fn spawn(
             &self,
             _spec: &RunSpec,

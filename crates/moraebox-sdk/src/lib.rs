@@ -802,6 +802,10 @@ mod tests {
             "output-failure"
         }
 
+        fn capabilities(&self) -> moraebox_runtime::BackendCapabilities {
+            ProcessBackend::CAPABILITIES
+        }
+
         async fn spawn(
             &self,
             _spec: &RunSpec,

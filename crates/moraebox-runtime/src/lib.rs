@@ -14,8 +14,9 @@ mod supervisor;
 mod trace;
 
 pub use backend::{
-    Backend, BackendController, BackendError, BoxedReader, BoxedWriter, EnvironmentComponent,
-    RootMode, SpawnedSandbox, StartupMetrics,
+    Backend, BackendCapabilities, BackendController, BackendError, BoxedReader, BoxedWriter,
+    CapabilitySupport, EnvironmentComponent, IsolationLevel, RootMode, SpawnedSandbox,
+    StartupMetrics,
 };
 pub use budget::{RunBudget, RunBudgetTimeout, RunStage, StageError, StageTiming};
 pub use doctor::{DoctorReport, LibraryProbe, NativeRuntimePaths, ToolProbe};

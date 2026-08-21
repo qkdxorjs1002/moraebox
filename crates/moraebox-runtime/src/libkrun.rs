@@ -19,8 +19,9 @@ use tokio::{
 };
 
 use crate::{
-    Backend, BackendController, BackendError, RootMode, RunBudget, RunStage, SpawnedSandbox,
-    StartupMetrics, environment::resolve_environment,
+    Backend, BackendCapabilities, BackendController, BackendError, CapabilitySupport,
+    IsolationLevel, RootMode, RunBudget, RunStage, SpawnedSandbox, StartupMetrics,
+    environment::resolve_environment,
 };
 
 const NETWORK_PROXY_START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -151,6 +152,16 @@ pub struct LibkrunBackend {
 }
 
 impl LibkrunBackend {
+    pub const CAPABILITIES: BackendCapabilities = BackendCapabilities {
+        isolation: IsolationLevel::MicroVm,
+        tty: CapabilitySupport::Supported,
+        network: CapabilitySupport::Supported,
+        box_persistence: CapabilitySupport::Supported,
+        workspace: CapabilitySupport::Supported,
+    };
+}
+
+impl LibkrunBackend {
     pub fn new(config: LibkrunConfig) -> Self {
         Self {
             config,
@@ -169,6 +180,10 @@ impl LibkrunBackend {
 impl Backend for LibkrunBackend {
     fn name(&self) -> &'static str {
         "libkrun"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        Self::CAPABILITIES
     }
 
     async fn spawn(
