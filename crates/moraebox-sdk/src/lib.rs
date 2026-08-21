@@ -13,9 +13,12 @@ use std::{
 
 use moraebox_box::{BoxMetadata, BoxStore, BoxStoreError, CreateBox};
 use moraebox_core::{
-    BoxId, OutputChunk, OutputReadError, RunSpec, SessionId, SessionState, Signal,
+    BoxId, OutputChunk, OutputRead, OutputReadError, RunSpec, SessionId, SessionState, Signal,
 };
-use moraebox_runtime::{Backend, SessionError, SessionHandle, SessionManager, SessionStatus};
+use moraebox_runtime::{
+    Backend, MAX_SESSION_OUTPUT_READ_BYTES, SessionError, SessionHandle, SessionManager,
+    SessionStatus,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -25,6 +28,7 @@ use tokio::{
 
 pub const DEFAULT_MAX_ACTIVE_SESSIONS: usize = 32;
 pub const DEFAULT_COMPLETED_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
+pub const MAX_IO_OUTPUT_READ_BYTES: usize = MAX_SESSION_OUTPUT_READ_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionRegistryConfig {
@@ -161,19 +165,45 @@ impl SandboxSdk {
             return Err(error.into());
         }
         let status = handle.wait().await?;
-        let output = match handle.read_output(0, usize::MAX).await {
-            Ok(output) => output,
-            Err(SessionError::Output(OutputReadError::CursorExpired { earliest, .. })) => {
-                handle.read_output(earliest, usize::MAX).await?
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let output = Self::collect_retained_output(handle, MAX_SESSION_OUTPUT_READ_BYTES).await?;
         Ok(ExecutionResult {
             status,
             output: output.chunks,
             next_cursor: output.next_cursor,
             truncated: output.truncated,
         })
+    }
+
+    async fn collect_retained_output(
+        handle: &SessionHandle,
+        page_bytes: usize,
+    ) -> Result<OutputRead, SdkError> {
+        assert!(page_bytes > 0, "output page size must be non-zero");
+        let mut chunks = Vec::new();
+        let mut cursor = 0;
+        let mut truncated = false;
+        loop {
+            let page = match handle.read_output(cursor, page_bytes).await {
+                Ok(page) => page,
+                Err(SessionError::Output(OutputReadError::CursorExpired { earliest, .. }))
+                    if chunks.is_empty() =>
+                {
+                    cursor = earliest;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            truncated |= page.truncated;
+            chunks.extend(page.chunks);
+            if page.next_cursor == cursor {
+                return Ok(OutputRead {
+                    chunks,
+                    next_cursor: cursor,
+                    truncated,
+                });
+            }
+            cursor = page.next_cursor;
+        }
     }
 
     async fn start_handle_cancellable(
@@ -300,6 +330,12 @@ impl SandboxSdk {
         session_id: SessionId,
         request: IoRequest,
     ) -> Result<IoResult, SdkError> {
+        if request.max_bytes > MAX_IO_OUTPUT_READ_BYTES {
+            return Err(SdkError::OutputReadTooLarge {
+                requested: request.max_bytes,
+                maximum: MAX_IO_OUTPUT_READ_BYTES,
+            });
+        }
         let handle = self.session(session_id).await?;
         if let Some(input) = request.stdin {
             handle.write(input).await?;
@@ -501,6 +537,8 @@ pub enum SdkError {
     UnknownSession(SessionId),
     #[error("active sandbox session limit reached (maximum {maximum})")]
     SessionLimitExceeded { maximum: usize },
+    #[error("output read is {requested} bytes, exceeding the {maximum}-byte SDK limit")]
+    OutputReadTooLarge { requested: usize, maximum: usize },
     #[error("sandbox request was cancelled")]
     RequestCancelled,
     #[error("session cleanup task failed: {0}")]
@@ -643,6 +681,60 @@ mod tests {
                 .iter()
                 .any(|chunk| chunk.channel == moraebox_core::OutputChannel::Stderr)
         );
+    }
+
+    #[tokio::test]
+    async fn retained_output_collection_uses_bounded_pages() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let handle = sdk
+            .manager
+            .start(RunSpec::command(mixed_output_command()))
+            .await
+            .unwrap();
+        handle.close_stdin().await.unwrap();
+        handle.wait().await.unwrap();
+
+        let output = SandboxSdk::collect_retained_output(&handle, 3)
+            .await
+            .unwrap();
+
+        assert_eq!(output.next_cursor, 12);
+        assert_eq!(
+            output
+                .chunks
+                .iter()
+                .map(|chunk| chunk.data.len())
+                .sum::<usize>(),
+            12
+        );
+        let mut cursor = 0;
+        for chunk in output.chunks {
+            assert_eq!(chunk.cursor, cursor);
+            assert!(chunk.data.len() <= 3);
+            cursor += chunk.data.len() as u64;
+        }
+    }
+
+    #[tokio::test]
+    async fn io_rejects_reads_above_the_api_limit() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let result = sdk
+            .io(
+                SessionId::new(),
+                IoRequest {
+                    max_bytes: MAX_IO_OUTPUT_READ_BYTES + 1,
+                    ..IoRequest::default()
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SdkError::OutputReadTooLarge {
+                requested,
+                maximum: MAX_IO_OUTPUT_READ_BYTES,
+            }) if requested == MAX_IO_OUTPUT_READ_BYTES + 1
+        ));
     }
 
     #[tokio::test]

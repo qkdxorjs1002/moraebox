@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, ops::Range, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -18,17 +18,63 @@ pub struct OutputChunk {
     pub data: Vec<u8>,
 }
 
-impl OutputChunk {
-    fn end_cursor(&self) -> u64 {
-        self.cursor + self.data.len() as u64
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputRead {
     pub chunks: Vec<OutputChunk>,
     pub next_cursor: u64,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutputReadSnapshot {
+    chunks: Vec<SharedOutputChunk>,
+    next_cursor: u64,
+    truncated: bool,
+}
+
+impl OutputReadSnapshot {
+    #[must_use]
+    pub fn materialize(self) -> OutputRead {
+        OutputRead {
+            chunks: self
+                .chunks
+                .into_iter()
+                .map(|chunk| OutputChunk {
+                    cursor: chunk.cursor,
+                    channel: chunk.channel,
+                    data: chunk.data[chunk.range].to_vec(),
+                })
+                .collect(),
+            next_cursor: self.next_cursor,
+            truncated: self.truncated,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SharedOutputChunk {
+    cursor: u64,
+    channel: OutputChannel,
+    data: Arc<[u8]>,
+    range: Range<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct StoredOutputChunk {
+    cursor: u64,
+    channel: OutputChannel,
+    data: Arc<[u8]>,
+    start: usize,
+}
+
+impl StoredOutputChunk {
+    fn len(&self) -> usize {
+        self.data.len() - self.start
+    }
+
+    fn end_cursor(&self) -> u64 {
+        self.cursor + self.len() as u64
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -38,7 +84,7 @@ pub struct OutputBuffer {
     earliest_cursor: u64,
     next_cursor: u64,
     truncated: bool,
-    chunks: VecDeque<OutputChunk>,
+    chunks: VecDeque<StoredOutputChunk>,
 }
 
 impl OutputBuffer {
@@ -62,10 +108,11 @@ impl OutputBuffer {
             return cursor;
         }
         self.retained_bytes += data.len();
-        self.chunks.push_back(OutputChunk {
+        self.chunks.push_back(StoredOutputChunk {
             cursor,
             channel,
-            data: data.to_vec(),
+            data: Arc::from(data),
+            start: 0,
         });
         self.trim();
         cursor
@@ -80,6 +127,14 @@ impl OutputBuffer {
     }
 
     pub fn read(&self, cursor: u64, max_bytes: usize) -> Result<OutputRead, OutputReadError> {
+        Ok(self.snapshot(cursor, max_bytes)?.materialize())
+    }
+
+    pub fn snapshot(
+        &self,
+        cursor: u64,
+        max_bytes: usize,
+    ) -> Result<OutputReadSnapshot, OutputReadError> {
         if cursor < self.earliest_cursor {
             return Err(OutputReadError::CursorExpired {
                 requested: cursor,
@@ -96,21 +151,26 @@ impl OutputBuffer {
         let mut chunks = Vec::new();
         let mut next = cursor;
         for chunk in &self.chunks {
-            if chunk.end_cursor() <= cursor || remaining == 0 {
+            if remaining == 0 {
+                break;
+            }
+            if chunk.end_cursor() <= cursor {
                 continue;
             }
             let offset = usize::try_from(cursor.saturating_sub(chunk.cursor))
                 .expect("cursor offset cannot exceed the in-memory chunk length");
-            let take = remaining.min(chunk.data.len() - offset);
-            chunks.push(OutputChunk {
+            let start = chunk.start + offset;
+            let take = remaining.min(chunk.data.len() - start);
+            chunks.push(SharedOutputChunk {
                 cursor: chunk.cursor + offset as u64,
                 channel: chunk.channel,
-                data: chunk.data[offset..offset + take].to_vec(),
+                data: Arc::clone(&chunk.data),
+                range: start..start + take,
             });
             next = chunk.cursor + (offset + take) as u64;
             remaining -= take;
         }
-        Ok(OutputRead {
+        Ok(OutputReadSnapshot {
             chunks,
             next_cursor: next,
             truncated: self.truncated,
@@ -123,12 +183,12 @@ impl OutputBuffer {
             let Some(front) = self.chunks.front_mut() else {
                 break;
             };
-            if excess >= front.data.len() {
+            if excess >= front.len() {
                 let removed = self.chunks.pop_front().expect("front exists");
-                self.retained_bytes -= removed.data.len();
+                self.retained_bytes -= removed.len();
                 self.earliest_cursor = removed.end_cursor();
             } else {
-                front.data.drain(..excess);
+                front.start += excess;
                 front.cursor += excess as u64;
                 self.retained_bytes -= excess;
                 self.earliest_cursor = front.cursor;
@@ -173,5 +233,20 @@ mod tests {
         let read = output.read(2, 4).unwrap();
         assert_eq!(read.chunks[0].data, b"cdef");
         assert!(read.truncated);
+    }
+
+    #[test]
+    fn snapshot_remains_readable_after_the_buffer_evicts_its_chunks() {
+        let mut output = OutputBuffer::new(6);
+        output.push(OutputChannel::Stdout, b"abcdef");
+        let snapshot = output.snapshot(0, 6).unwrap();
+
+        output.push(OutputChannel::Stderr, b"ghijkl");
+
+        let read = snapshot.materialize();
+        assert_eq!(read.chunks[0].data, b"abcdef");
+        assert_eq!(read.next_cursor, 6);
+        assert!(!read.truncated);
+        assert_eq!(output.earliest_cursor(), 6);
     }
 }

@@ -24,8 +24,8 @@ pub use libkrun::{BoxRootSource, BoxRuntimeConfig, LibkrunBackend, LibkrunConfig
 pub use pool::{PoolConfig, PoolError, PoolStats, PreparedKey, PreparedLease, PreparedPool};
 pub use process::ProcessBackend;
 pub use session::{
-    SessionError, SessionHandle, SessionIoFailure, SessionIoFailureKind, SessionIoStream,
-    SessionManager, SessionStatus,
+    MAX_SESSION_OUTPUT_READ_BYTES, SessionError, SessionHandle, SessionIoFailure,
+    SessionIoFailureKind, SessionIoStream, SessionManager, SessionStatus,
 };
 pub use supervisor::{RunReport, Supervisor, SupervisorError};
 pub use trace::{TraceEvent, TraceKind};

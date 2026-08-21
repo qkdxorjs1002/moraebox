@@ -24,6 +24,7 @@ use crate::{RunBudget, RunStage, StageTiming};
 
 const STDIN_QUEUE_ITEMS: usize = 32;
 const STDIN_QUEUE_BYTES: usize = 1024 * 1024;
+pub const MAX_SESSION_OUTPUT_READ_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct SessionManager {
@@ -225,7 +226,14 @@ impl SessionHandle {
         cursor: u64,
         max_bytes: usize,
     ) -> Result<OutputRead, SessionError> {
-        Ok(self.output.lock().await.read(cursor, max_bytes)?)
+        if max_bytes > MAX_SESSION_OUTPUT_READ_BYTES {
+            return Err(SessionError::OutputReadTooLarge {
+                requested: max_bytes,
+                maximum: MAX_SESSION_OUTPUT_READ_BYTES,
+            });
+        }
+        let snapshot = self.output.lock().await.snapshot(cursor, max_bytes)?;
+        Ok(snapshot.materialize())
     }
 
     pub async fn wait_for_output(&self, cursor: u64) -> Result<u64, SessionError> {
@@ -343,12 +351,16 @@ impl SessionHandle {
     }
 
     pub(crate) async fn retained_output(&self) -> (OutputRead, u64, u64) {
-        let output = self.output.lock().await;
-        let earliest = output.earliest_cursor();
-        let next = output.next_cursor();
-        let retained = output
-            .read(earliest, usize::MAX)
-            .expect("earliest retained output cursor must be readable");
+        let (snapshot, earliest, next) = {
+            let output = self.output.lock().await;
+            let earliest = output.earliest_cursor();
+            let next = output.next_cursor();
+            let snapshot = output
+                .snapshot(earliest, usize::MAX)
+                .expect("earliest retained output cursor must be readable");
+            (snapshot, earliest, next)
+        };
+        let retained = snapshot.materialize();
         (retained, earliest, next)
     }
 
@@ -1174,6 +1186,8 @@ pub enum SessionError {
     Control(String),
     #[error("stdin write is {requested} bytes, exceeding the {maximum}-byte queue limit")]
     StdinWriteTooLarge { requested: usize, maximum: usize },
+    #[error("output read is {requested} bytes, exceeding the {maximum}-byte request limit")]
+    OutputReadTooLarge { requested: usize, maximum: usize },
 }
 
 #[cfg(test)]
@@ -1316,6 +1330,30 @@ mod tests {
                 requested,
                 maximum: STDIN_QUEUE_BYTES,
             } if requested == STDIN_QUEUE_BYTES + 1
+        ));
+        session.stop().await.unwrap();
+        session.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_a_single_output_read_larger_than_the_api_limit() {
+        let manager = SessionManager::new(Arc::new(ProcessBackend));
+        let session = manager
+            .start(RunSpec::command(long_running_command()))
+            .await
+            .unwrap();
+
+        let error = session
+            .read_output(0, MAX_SESSION_OUTPUT_READ_BYTES + 1)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionError::OutputReadTooLarge {
+                requested,
+                maximum: MAX_SESSION_OUTPUT_READ_BYTES,
+            } if requested == MAX_SESSION_OUTPUT_READ_BYTES + 1
         ));
         session.stop().await.unwrap();
         session.wait().await.unwrap();

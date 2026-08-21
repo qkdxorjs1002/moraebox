@@ -24,7 +24,9 @@ use moraebox_runtime::{
     Backend, BoxRootSource, BoxRuntimeConfig, LibkrunBackend, LibkrunConfig, NativeRuntimePaths,
     ProcessBackend,
 };
-use moraebox_sdk::{ExecutionResult, IoRequest, IoResult, SandboxSdk, SdkError};
+use moraebox_sdk::{
+    ExecutionResult, IoRequest, IoResult, MAX_IO_OUTPUT_READ_BYTES, SandboxSdk, SdkError,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
@@ -906,7 +908,7 @@ fn tools_list() -> Value {
                     "properties": {
                         "session_id": { "type": "string" },
                         "cursor": { "type": "integer", "minimum": 0, "default": 0 },
-                        "max_bytes": { "type": "integer", "minimum": 1, "maximum": 8_388_608, "default": 1_048_576 },
+                        "max_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_IO_OUTPUT_READ_BYTES, "default": 1_048_576 },
                         "stdin_base64": { "type": "string" },
                         "close_stdin": { "type": "boolean", "default": false },
                         "rows": { "type": "integer", "minimum": 1 },

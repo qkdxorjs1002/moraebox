@@ -7,7 +7,9 @@ mod spec;
 mod state;
 mod storage;
 
-pub use output::{OutputBuffer, OutputChannel, OutputChunk, OutputRead, OutputReadError};
+pub use output::{
+    OutputBuffer, OutputChannel, OutputChunk, OutputRead, OutputReadError, OutputReadSnapshot,
+};
 pub use spec::{
     BoxId, DEFAULT_KILL_GRACE, DEFAULT_OUTPUT_LIMIT, DEFAULT_TIMEOUT, RunSpec, SessionId, Signal,
     TimeoutPolicy,
