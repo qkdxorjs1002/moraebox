@@ -11,7 +11,7 @@ flate2.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
 httpdate.workspace = true
-moraebox-core = { path = "../moraebox-core" }
+moraebox-core = { path = "../moraebox-core", version = "0.1.0" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

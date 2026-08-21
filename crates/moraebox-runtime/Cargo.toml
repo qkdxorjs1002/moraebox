@@ -9,8 +9,8 @@ rust-version.workspace = true
 [dependencies]
 async-trait.workspace = true
 fs2.workspace = true
-moraebox-box = { path = "../moraebox-box" }
-moraebox-core = { path = "../moraebox-core" }
+moraebox-box = { path = "../moraebox-box", version = "0.1.0" }
+moraebox-core = { path = "../moraebox-core", version = "0.1.0" }
 serde.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true

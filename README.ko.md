@@ -354,9 +354,10 @@ CLI와 MCP의 네이티브 실행은 `moraebox-sdk` 구성 계층을 공유합�
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+cargo deny --all-features --locked check
 ```
 
-CI는 macOS, Linux, Windows에서 잠긴 이식 가능 품질 게이트를 실행합니다. 별도 Ubuntu job은 선언된 Rust 1.85 MSRV로 잠긴 workspace를 compile·test합니다. Apple Silicon macOS job은 고정된 native 의존성을 설치하고 서명된 실제 백엔드 suite를 실행합니다. runner에 필수 native capability가 없으면 정확한 누락 capability와 dependency setup 결과를 GitHub Step Summary에 남깁니다. capability가 준비된 뒤 발생한 build, image 준비, doctor, smoke 실패는 skip으로 숨기지 않고 job을 실패시킵니다.
+CI는 macOS, Linux, Windows에서 잠긴 이식 가능 품질 게이트를 실행합니다. 별도 Ubuntu job은 선언된 Rust 1.85 MSRV로 잠긴 workspace를 compile·test합니다. dependency-policy job은 cargo-deny로 advisory, 허용되지 않은 라이선스, wildcard 의존성, 알 수 없는 package source를 거부하며 중복된 전이 버전은 경고로 계속 표시합니다. 모든 외부 GitHub Action은 변경 불가능한 commit SHA로 고정하고 관리자가 원래 release tag를 알 수 있도록 주석을 유지합니다. Apple Silicon macOS job은 고정된 native 의존성을 설치하고 서명된 실제 백엔드 suite를 실행합니다. runner에 필수 native capability가 없으면 정확한 누락 capability와 dependency setup 결과를 GitHub Step Summary에 남깁니다. capability가 준비된 뒤 발생한 build, image 준비, doctor, smoke 실패는 skip으로 숨기지 않고 job을 실패시킵니다.
 
 네이티브 macOS 변경에는 `morae doctor --json`과, 서명된 helper 및 네이티브 의존성을 사용할 수 있을 때 실제 백엔드 smoke suite도 필요합니다.
 

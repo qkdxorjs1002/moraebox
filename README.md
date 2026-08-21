@@ -385,9 +385,10 @@ CLI and MCP native execution share the `moraebox-sdk` configuration layer. It re
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+cargo deny --all-features --locked check
 ```
 
-CI runs the locked portable quality gate on macOS, Linux, and Windows. A separate Ubuntu job compiles and tests the locked workspace with the declared Rust 1.85 MSRV. The Apple Silicon macOS job installs the pinned native dependencies and runs the signed real-backend suite; if the runner lacks a required native capability, the job records the exact missing capability and dependency-setup outcome in the GitHub Step Summary. Once the capabilities are present, build, image preparation, doctor, or smoke failures fail the job instead of being reported as skips.
+CI runs the locked portable quality gate on macOS, Linux, and Windows. A separate Ubuntu job compiles and tests the locked workspace with the declared Rust 1.85 MSRV. The dependency-policy job uses cargo-deny to reject advisories, unapproved licenses, wildcard dependencies, and unknown package sources; duplicate transitive versions remain visible as warnings. Every external GitHub Action is pinned to an immutable commit SHA and retains its release tag in a comment for maintainers. The Apple Silicon macOS job installs the pinned native dependencies and runs the signed real-backend suite; if the runner lacks a required native capability, the job records the exact missing capability and dependency-setup outcome in the GitHub Step Summary. Once the capabilities are present, build, image preparation, doctor, or smoke failures fail the job instead of being reported as skips.
 
 Native macOS changes also require `morae doctor --json` and the real-backend smoke suite when the signed helper and native dependencies are available.
 

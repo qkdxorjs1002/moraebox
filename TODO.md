@@ -240,7 +240,7 @@
 
 - [x] CI에 Rust 1.85 MSRV와 `--locked` job을 추가하고 native signed smoke의 실행/skip 이유를 명시한다.
 
-- [ ] dependency/license/advisory 검사와 GitHub Actions commit SHA pinning을 추가한다.
+- [x] dependency/license/advisory 검사와 GitHub Actions commit SHA pinning을 추가한다.
 
 ## P2 — 의도된 기능 확장
 

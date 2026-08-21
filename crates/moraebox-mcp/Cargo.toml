@@ -14,11 +14,11 @@ path = "src/main.rs"
 async-trait.workspace = true
 base64.workspace = true
 clap = { workspace = true, features = ["env"] }
-moraebox-core = { path = "../moraebox-core" }
-moraebox-box = { path = "../moraebox-box" }
-moraebox-image = { path = "../moraebox-image" }
-moraebox-runtime = { path = "../moraebox-runtime" }
-moraebox-sdk = { path = "../moraebox-sdk" }
+moraebox-core = { path = "../moraebox-core", version = "0.1.0" }
+moraebox-box = { path = "../moraebox-box", version = "0.1.0" }
+moraebox-image = { path = "../moraebox-image", version = "0.1.0" }
+moraebox-runtime = { path = "../moraebox-runtime", version = "0.1.0" }
+moraebox-sdk = { path = "../moraebox-sdk", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

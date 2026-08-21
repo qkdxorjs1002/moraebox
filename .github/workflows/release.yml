@@ -21,11 +21,12 @@ jobs:
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Validate release tag
@@ -61,6 +62,7 @@ jobs:
           python3 - <<'PY'
           import os
           from pathlib import Path
+          import re
 
           manifest = Path("Cargo.toml")
           release_version = os.environ["RELEASE_VERSION"]
@@ -83,6 +85,27 @@ jobs:
                   f"expected one [workspace.package] version, replaced {replacements}"
               )
           manifest.write_text("".join(lines), encoding="utf-8")
+
+          path_dependency_replacements = 0
+          version_pattern = re.compile(r'(version\s*=\s*")[^"]+(".*)')
+          for crate_manifest in sorted(Path("crates").glob("*/Cargo.toml")):
+              lines = crate_manifest.read_text(encoding="utf-8").splitlines(keepends=True)
+              for index, line in enumerate(lines):
+                  if 'path = "../moraebox-' not in line:
+                      continue
+                  updated, count = version_pattern.subn(
+                      rf'\g<1>{release_version}\2', line, count=1
+                  )
+                  if count != 1:
+                      raise SystemExit(
+                          f"missing version on internal path dependency in {crate_manifest}: {line.strip()}"
+                      )
+                  lines[index] = updated
+                  path_dependency_replacements += 1
+              crate_manifest.write_text("".join(lines), encoding="utf-8")
+
+          if path_dependency_replacements == 0:
+              raise SystemExit("expected at least one internal path dependency version")
           PY
 
           workspace_version="$(
@@ -131,6 +154,9 @@ jobs:
           # the validated release version and its refreshed lockfile in the source
           # archive consumed by Homebrew.
           install -m 0644 Cargo.toml Cargo.lock "${bundle}/"
+          while IFS= read -r crate_manifest; do
+            install -m 0644 "${crate_manifest}" "${bundle}/${crate_manifest}"
+          done < <(find crates -mindepth 2 -maxdepth 2 -name Cargo.toml -print)
 
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
             python3 - "${bundle}" "release-dist/${ARCHIVE_NAME}" <<'PY'
@@ -240,7 +266,7 @@ jobs:
           fi
 
       - name: Checkout Homebrew tap
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: qkdxorjs1002/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
