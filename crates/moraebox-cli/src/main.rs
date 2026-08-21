@@ -19,9 +19,9 @@ use moraebox_core::{
     resolve_cache_dir, resolve_state_dir,
 };
 use moraebox_image::{
-    CacheReconcileReport, CacheUsage, CachedImage, CleanReport, Credentials, ImageCache, Platform,
-    PreparedImage, PruneReport, RemoveReport, RootfsMetadataIssueKind, WorkspaceSnapshot,
-    WorkspaceStage, digest_tree,
+    CacheReconcileReport, CacheUsage, CachedImage, CleanReport, Credentials, ImageCache,
+    ImageProgressStage, Platform, PreparedImage, PruneReport, RemoveReport,
+    RootfsMetadataIssueKind, WorkspaceSnapshot, WorkspaceStage, digest_tree,
 };
 use moraebox_runtime::{
     Backend, BackendCapabilities, BoxRootSource, BoxRuntimeConfig, DoctorReport, IsolationLevel,
@@ -622,7 +622,10 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     }
     validate_network_option(capabilities, spec.network)?;
     validate_tty_option(capabilities, spec.tty)?;
-    let budget = RunBudget::new(spec.timeout);
+    let progress = CliProgress::new(args.json);
+    let budget = RunBudget::new(spec.timeout).with_progress(move |stage| {
+        progress.runtime(stage);
+    });
     let cache_dir = (args.backend == "libkrun")
         .then(|| resolve_cache_dir(args.cache_dir.as_deref()))
         .transpose()?;
@@ -672,6 +675,7 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
                         cache_dir,
                         &platform,
                         credentials(args.registry_username, args.registry_password),
+                        progress,
                     ),
                 )
                 .await
@@ -700,7 +704,7 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
                         std::slice::from_ref(state_dir),
                         &mke2fs,
                         workspace_timeout,
-                        report_workspace_stage,
+                        move |stage| progress.workspace(stage),
                     ),
                 )
                 .await?,
@@ -774,7 +778,7 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
             };
             let backend = LibkrunBackend::new(config).with_box_runtime(runtime);
             if workspace.is_some() {
-                eprintln!("morae: workspace: attaching read-only image");
+                progress.workspace_message("attaching read-only image");
             }
             if args.interactive {
                 return run_interactive(backend, spec, budget).await;
@@ -813,8 +817,56 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     }
 }
 
-fn report_workspace_stage(stage: WorkspaceStage) {
-    eprintln!("morae: workspace: {stage}");
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CliProgress {
+    enabled: bool,
+}
+
+impl CliProgress {
+    fn new(json: bool) -> Self {
+        Self::for_output(json, io::stderr().is_terminal())
+    }
+
+    const fn for_output(json: bool, stderr_is_terminal: bool) -> Self {
+        Self {
+            enabled: !json && stderr_is_terminal,
+        }
+    }
+
+    fn image(self, stage: ImageProgressStage) {
+        if self.enabled {
+            eprintln!("morae: image: {stage}");
+        }
+    }
+
+    fn workspace(self, stage: WorkspaceStage) {
+        if self.enabled {
+            eprintln!("morae: workspace: {stage}");
+        }
+    }
+
+    fn workspace_message(self, message: &str) {
+        if self.enabled {
+            eprintln!("morae: workspace: {message}");
+        }
+    }
+
+    fn runtime(self, stage: RunStage) {
+        if self.enabled
+            && let Some(message) = run_stage_progress_message(stage)
+        {
+            eprintln!("morae: runtime: {message}");
+        }
+    }
+}
+
+fn run_stage_progress_message(stage: RunStage) -> Option<&'static str> {
+    match stage {
+        RunStage::BaseDiskPrepare => Some("preparing the immutable base disk"),
+        RunStage::EphemeralDiskClone => Some("cloning the ephemeral root disk"),
+        RunStage::HelperSpawn => Some("spawning the microVM helper"),
+        _ => None,
+    }
 }
 
 const INTERACTIVE_READ_BYTES: usize = 64 * 1024;
@@ -1173,9 +1225,12 @@ async fn resolve_or_pull(
     cache_dir: &std::path::Path,
     platform: &Platform,
     credentials: Option<Credentials>,
+    progress: CliProgress,
 ) -> Result<PreparedImage, Box<dyn std::error::Error>> {
     ImageCache::new(cache_dir)
-        .resolve_or_pull(reference, platform, credentials)
+        .resolve_or_pull_with_progress(reference, platform, credentials, move |stage| {
+            progress.image(stage);
+        })
         .await
         .map_err(Into::into)
 }
@@ -1189,11 +1244,13 @@ async fn box_create(args: BoxCreateArgs) -> Result<i32, Box<dyn std::error::Erro
         None => cache.default_reference()?,
     };
     let platform = Platform::host_linux();
+    let progress = CliProgress::new(args.json);
     let prepared = cache
-        .resolve_or_pull(
+        .resolve_or_pull_with_progress(
             &reference,
             &platform,
             credentials(args.registry_username, args.registry_password),
+            move |stage| progress.image(stage),
         )
         .await?;
     let spec = BaseDiskSpec::new(
@@ -1201,6 +1258,7 @@ async fn box_create(args: BoxCreateArgs) -> Result<i32, Box<dyn std::error::Erro
         platform_name(&platform),
         args.disk_size,
     );
+    progress.runtime(RunStage::BaseDiskPrepare);
     let base = BaseDiskStore::new(&cache_dir).prepare(
         &spec,
         &prepared.rootfs,
@@ -1321,11 +1379,13 @@ async fn image_pull(args: ImagePullArgs) -> Result<i32, Box<dyn std::error::Erro
             .unwrap_or_else(|| Platform::host_linux().architecture),
         variant: None,
     };
+    let progress = CliProgress::new(args.json);
     let prepared = pull_and_materialize(
         &args.reference,
         &cache_dir,
         &platform,
         credentials(args.registry_username, args.registry_password),
+        progress,
     )
     .await?;
     if args.json {
@@ -1343,9 +1403,12 @@ async fn pull_and_materialize(
     cache_dir: &std::path::Path,
     platform: &Platform,
     credentials: Option<Credentials>,
+    progress: CliProgress,
 ) -> Result<PreparedImage, Box<dyn std::error::Error>> {
     ImageCache::new(cache_dir)
-        .pull(reference, platform, credentials)
+        .pull_with_progress(reference, platform, credentials, move |stage| {
+            progress.image(stage);
+        })
         .await
         .map_err(Into::into)
 }
@@ -2149,6 +2212,40 @@ mod tests {
     fn formats_cache_sizes_for_humans() {
         assert_eq!(format_bytes(42), "42 B");
         assert_eq!(format_bytes(1536), "1.5 KiB");
+    }
+
+    #[test]
+    fn reports_only_user_visible_runtime_preparation_stages() {
+        assert_eq!(
+            run_stage_progress_message(RunStage::BaseDiskPrepare),
+            Some("preparing the immutable base disk")
+        );
+        assert_eq!(
+            run_stage_progress_message(RunStage::EphemeralDiskClone),
+            Some("cloning the ephemeral root disk")
+        );
+        assert_eq!(
+            run_stage_progress_message(RunStage::HelperSpawn),
+            Some("spawning the microVM helper")
+        );
+        assert_eq!(run_stage_progress_message(RunStage::CacheLookup), None);
+        assert_eq!(run_stage_progress_message(RunStage::CommandRun), None);
+    }
+
+    #[test]
+    fn progress_is_quiet_for_json_and_non_terminal_stderr() {
+        assert_eq!(
+            CliProgress::for_output(false, true),
+            CliProgress { enabled: true }
+        );
+        assert_eq!(
+            CliProgress::for_output(true, true),
+            CliProgress { enabled: false }
+        );
+        assert_eq!(
+            CliProgress::for_output(false, false),
+            CliProgress { enabled: false }
+        );
     }
 
     #[test]

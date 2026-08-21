@@ -23,6 +23,23 @@ const LEGACY_COMPLETE_MARKER: &str = ".fastmvm-rootfs-complete";
 pub const BUILTIN_DEFAULT_IMAGE: &str = "docker.io/library/python:3.12";
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageProgressStage {
+    CheckCache,
+    PullImage,
+    MaterializeRootfs,
+}
+
+impl std::fmt::Display for ImageProgressStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CheckCache => "checking the local image cache",
+            Self::PullImage => "pulling OCI image content",
+            Self::MaterializeRootfs => "materializing the root filesystem",
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ImageCache {
     root: PathBuf,
@@ -359,7 +376,22 @@ impl ImageCache {
         platform: &Platform,
         credentials: Option<Credentials>,
     ) -> Result<PreparedImage, ImageCacheError> {
+        self.resolve_or_pull_with_progress(reference, platform, credentials, |_| {})
+            .await
+    }
+
+    pub async fn resolve_or_pull_with_progress<F>(
+        &self,
+        reference: &str,
+        platform: &Platform,
+        credentials: Option<Credentials>,
+        mut progress: F,
+    ) -> Result<PreparedImage, ImageCacheError>
+    where
+        F: FnMut(ImageProgressStage),
+    {
         let canonical = canonical_reference(reference)?;
+        progress(ImageProgressStage::CheckCache);
         if let Some(image) = self.resolve_reference(&canonical, platform)? {
             return Ok(prepared_image(image));
         }
@@ -369,7 +401,8 @@ impl ImageCache {
         if let Some(image) = self.resolve_reference(&canonical, platform)? {
             return Ok(prepared_image(image));
         }
-        self.pull_unlocked(&canonical, platform, credentials).await
+        self.pull_unlocked(&canonical, platform, credentials, &mut progress)
+            .await
     }
 
     pub async fn pull(
@@ -378,11 +411,26 @@ impl ImageCache {
         platform: &Platform,
         credentials: Option<Credentials>,
     ) -> Result<PreparedImage, ImageCacheError> {
+        self.pull_with_progress(reference, platform, credentials, |_| {})
+            .await
+    }
+
+    pub async fn pull_with_progress<F>(
+        &self,
+        reference: &str,
+        platform: &Platform,
+        credentials: Option<Credentials>,
+        mut progress: F,
+    ) -> Result<PreparedImage, ImageCacheError>
+    where
+        F: FnMut(ImageProgressStage),
+    {
         let canonical = canonical_reference(reference)?;
         let _activity = self.lock_activity(false)?;
         let _reference =
             AdvisoryLock::acquire(&self.reference_lock_path(&canonical, platform)).await?;
-        self.pull_unlocked(&canonical, platform, credentials).await
+        self.pull_unlocked(&canonical, platform, credentials, &mut progress)
+            .await
     }
 
     fn resolve_reference_unlocked(
@@ -433,21 +481,27 @@ impl ImageCache {
         }))
     }
 
-    async fn pull_unlocked(
+    async fn pull_unlocked<F>(
         &self,
         reference: &str,
         platform: &Platform,
         credentials: Option<Credentials>,
-    ) -> Result<PreparedImage, ImageCacheError> {
+        progress: &mut F,
+    ) -> Result<PreparedImage, ImageCacheError>
+    where
+        F: FnMut(ImageProgressStage),
+    {
         let parsed = ImageReference::from_str(reference)
             .map_err(|error| ImageCacheError::InvalidTarget(error.to_string()))?;
         let ImageReference::Registry(reference) = parsed else {
             return Err(ImageCacheError::InvalidTarget(reference.into()));
         };
         let cas = Cas::new(self.root.join("oci"));
+        progress(ImageProgressStage::PullImage);
         let image = RegistryClient::new(credentials)?
             .pull(reference, platform, &cas)
             .await?;
+        progress(ImageProgressStage::MaterializeRootfs);
         let staging = StagedRootfs::new(&self.root, &image.manifest_digest);
         let materialize_image = image.clone();
         let materialize_cas = cas.clone();
@@ -1741,6 +1795,23 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_progress_stops_after_cache_hit() {
+        let fixture = Fixture::new();
+        fixture.add_image(Some("python:3.12"));
+        let mut stages = Vec::new();
+
+        fixture
+            .cache
+            .resolve_or_pull_with_progress("python:3.12", &Fixture::platform(), None, |stage| {
+                stages.push(stage);
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(stages, vec![ImageProgressStage::CheckCache]);
     }
 
     #[test]

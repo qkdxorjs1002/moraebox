@@ -73,6 +73,16 @@ pub struct RunBudget {
     deadline: Option<Instant>,
     limit: Option<Duration>,
     state: Arc<Mutex<BudgetState>>,
+    progress: Option<StageProgressReporter>,
+}
+
+#[derive(Clone)]
+struct StageProgressReporter(Arc<dyn Fn(RunStage) + Send + Sync>);
+
+impl fmt::Debug for StageProgressReporter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StageProgressReporter(..)")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -91,7 +101,14 @@ impl RunBudget {
             deadline: limit.map(|duration| started + duration),
             limit,
             state: Arc::new(Mutex::new(BudgetState::default())),
+            progress: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_progress(mut self, progress: impl Fn(RunStage) + Send + Sync + 'static) -> Self {
+        self.progress = Some(StageProgressReporter(Arc::new(progress)));
+        self
     }
 
     pub fn remaining(&self, stage: RunStage) -> Result<Option<Duration>, RunBudgetTimeout> {
@@ -254,6 +271,11 @@ impl RunBudget {
     }
 
     fn record_event(&self, kind: StageEventKind, stage: RunStage) {
+        if kind == StageEventKind::Started
+            && let Some(progress) = &self.progress
+        {
+            (progress.0)(stage);
+        }
         let elapsed_micros = duration_micros(self.started.elapsed());
         self.state
             .lock()
@@ -348,5 +370,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(budget.failure_stage(), None);
+    }
+
+    #[tokio::test]
+    async fn progress_reports_each_started_stage_once() {
+        let stages = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&stages);
+        let budget = RunBudget::new(TimeoutPolicy::Unlimited).with_progress(move |stage| {
+            observed.lock().unwrap().push(stage);
+        });
+
+        budget
+            .run(RunStage::ImagePull, async {
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .await
+            .unwrap();
+        budget
+            .run_sync(RunStage::HelperSpawn, || {
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            *stages.lock().unwrap(),
+            vec![RunStage::ImagePull, RunStage::HelperSpawn]
+        );
     }
 }
