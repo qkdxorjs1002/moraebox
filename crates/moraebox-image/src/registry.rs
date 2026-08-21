@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    Cas, Digest, LayerCompression, RegistryReference, apply_layer, cas::CasError, layer::LayerError,
+    Cas, Digest, LayerCompression, RegistryReference, apply_layer, cas::CasError,
+    layer::LayerError, reference::Selector,
 };
 
 const ACCEPT_MANIFESTS: &str = concat!(
@@ -67,6 +68,7 @@ pub struct Descriptor {
 #[derive(Debug, Clone)]
 pub struct PulledImage {
     pub reference: RegistryReference,
+    pub source_manifest_digest: Digest,
     pub manifest_digest: Digest,
     pub manifest: ImageManifest,
     pub config_digest: Digest,
@@ -142,13 +144,19 @@ impl RegistryClient {
         cas: &Cas,
     ) -> Result<PulledImage, RegistryError> {
         let mut authorization = None;
-        let (mut manifest_bytes, mut manifest_digest) = self
+        let (source_manifest_bytes, source_manifest_digest) = self
             .get_manifest(&reference, reference.selector(), &mut authorization)
             .await?;
+        verify_reference_digest(&reference, &source_manifest_digest)?;
+        cas.put_verified(&source_manifest_digest, &source_manifest_bytes)
+            .await?;
 
-        let envelope: ManifestEnvelope = serde_json::from_slice(&manifest_bytes)?;
-        let manifest = match envelope {
+        let envelope: ManifestEnvelope = serde_json::from_slice(&source_manifest_bytes)?;
+        let (manifest_bytes, manifest_digest, manifest) = match envelope {
             ManifestEnvelope::Index(index) => {
+                if index.schema_version != 2 {
+                    return Err(RegistryError::UnsupportedSchema(index.schema_version));
+                }
                 let descriptor = index
                     .manifests
                     .into_iter()
@@ -158,32 +166,34 @@ impl RegistryClient {
                 let (selected, actual) = self
                     .get_manifest(&reference, &descriptor.digest, &mut authorization)
                     .await?;
-                if actual != expected {
-                    return Err(RegistryError::ManifestDigestMismatch { expected, actual });
-                }
-                manifest_bytes = selected;
-                manifest_digest = actual;
-                serde_json::from_slice(&manifest_bytes)?
+                verify_manifest_descriptor(&descriptor, &expected, &actual, selected.len())?;
+                let manifest = serde_json::from_slice(&selected)?;
+                (selected, actual, manifest)
             }
-            ManifestEnvelope::Manifest(manifest) => manifest,
+            ManifestEnvelope::Manifest(manifest) => (
+                source_manifest_bytes,
+                source_manifest_digest.clone(),
+                manifest,
+            ),
         };
 
         cas.put_verified(&manifest_digest, &manifest_bytes).await?;
         if manifest.schema_version != 2 {
             return Err(RegistryError::UnsupportedSchema(manifest.schema_version));
         }
-        let config_digest = Digest::from_str(&manifest.config.digest)?;
-        self.fetch_blob(&reference, &config_digest, &mut authorization, cas)
+        let config_digest = self
+            .fetch_blob(&reference, &manifest.config, &mut authorization, cas)
             .await?;
         let mut layer_digests = Vec::with_capacity(manifest.layers.len());
         for layer in &manifest.layers {
-            let digest = Digest::from_str(&layer.digest)?;
-            self.fetch_blob(&reference, &digest, &mut authorization, cas)
-                .await?;
-            layer_digests.push(digest);
+            layer_digests.push(
+                self.fetch_blob(&reference, layer, &mut authorization, cas)
+                    .await?,
+            );
         }
         Ok(PulledImage {
             reference,
+            source_manifest_digest,
             manifest_digest,
             manifest,
             config_digest,
@@ -224,14 +234,16 @@ impl RegistryClient {
     async fn fetch_blob(
         &self,
         reference: &RegistryReference,
-        digest: &Digest,
+        descriptor: &Descriptor,
         authorization: &mut Option<String>,
         cas: &Cas,
-    ) -> Result<(), RegistryError> {
-        if tokio::fs::try_exists(cas.blob_path(digest)).await? {
+    ) -> Result<Digest, RegistryError> {
+        let digest = Digest::from_str(&descriptor.digest)?;
+        if tokio::fs::try_exists(cas.blob_path(&digest)).await? {
             // Reading verifies an existing cache entry before trusting it.
-            cas.read(digest).await?;
-            return Ok(());
+            let bytes = cas.read(&digest).await?;
+            verify_descriptor_size(descriptor, bytes.len())?;
+            return Ok(digest);
         }
         let url = format!(
             "https://{}/v2/{}/blobs/{digest}",
@@ -242,8 +254,9 @@ impl RegistryClient {
             .get_authenticated(&url, reference, authorization, None)
             .await?;
         let bytes = response.bytes().await?;
-        cas.put_verified(digest, &bytes).await?;
-        Ok(())
+        verify_descriptor_size(descriptor, bytes.len())?;
+        cas.put_verified(&digest, &bytes).await?;
+        Ok(digest)
     }
 
     async fn get_authenticated(
@@ -339,6 +352,52 @@ fn platform_matches(actual: Option<&Platform>, expected: &Platform) -> bool {
     })
 }
 
+fn verify_reference_digest(
+    reference: &RegistryReference,
+    actual: &Digest,
+) -> Result<(), RegistryError> {
+    if let Selector::Digest(expected) = &reference.selector {
+        let expected = Digest::from_str(expected)?;
+        if expected != *actual {
+            return Err(RegistryError::ManifestDigestMismatch {
+                expected,
+                actual: actual.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn verify_manifest_descriptor(
+    descriptor: &Descriptor,
+    expected: &Digest,
+    actual: &Digest,
+    actual_size: usize,
+) -> Result<(), RegistryError> {
+    if expected != actual {
+        return Err(RegistryError::ManifestDigestMismatch {
+            expected: expected.clone(),
+            actual: actual.clone(),
+        });
+    }
+    verify_descriptor_size(descriptor, actual_size)
+}
+
+fn verify_descriptor_size(
+    descriptor: &Descriptor,
+    actual_size: usize,
+) -> Result<(), RegistryError> {
+    let actual = u64::try_from(actual_size).unwrap_or(u64::MAX);
+    if descriptor.size != actual {
+        return Err(RegistryError::DescriptorSizeMismatch {
+            digest: descriptor.digest.clone(),
+            expected: descriptor.size,
+            actual,
+        });
+    }
+    Ok(())
+}
+
 fn parse_challenge(value: &str) -> Vec<(String, String)> {
     value
         .split(',')
@@ -361,6 +420,8 @@ enum ManifestEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct ImageIndex {
+    #[serde(rename = "schemaVersion")]
+    schema_version: u32,
     manifests: Vec<Descriptor>,
 }
 
@@ -388,6 +449,12 @@ pub enum RegistryError {
     PlatformNotFound(Platform),
     #[error("manifest digest mismatch: expected {expected}, got {actual}")]
     ManifestDigestMismatch { expected: Digest, actual: Digest },
+    #[error("OCI descriptor {digest} size mismatch: expected {expected} bytes, got {actual}")]
+    DescriptorSizeMismatch {
+        digest: String,
+        expected: u64,
+        actual: u64,
+    },
     #[error("unsupported OCI schema version {0}")]
     UnsupportedSchema(u32),
     #[error("refusing to overwrite incomplete rootfs: {}", .0.display())]
@@ -423,5 +490,51 @@ mod tests {
         let platform = Platform::host_linux();
         assert_eq!(platform.os, "linux");
         assert!(["arm64", "amd64"].contains(&platform.architecture.as_str()));
+    }
+
+    #[test]
+    fn digest_selector_must_match_the_top_level_manifest() {
+        let expected = Digest::from_bytes(b"expected");
+        let reference: RegistryReference = format!("example.com/a/b@{expected}").parse().unwrap();
+        let actual = Digest::from_bytes(b"different");
+
+        assert!(matches!(
+            verify_reference_digest(&reference, &actual),
+            Err(RegistryError::ManifestDigestMismatch {
+                expected: reported_expected,
+                actual: reported_actual,
+            }) if reported_expected == expected && reported_actual == actual
+        ));
+    }
+
+    #[test]
+    fn selected_manifest_descriptor_checks_digest_and_exact_size() {
+        let bytes = br#"{"schemaVersion":2}"#;
+        let expected = Digest::from_bytes(bytes);
+        let descriptor = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: expected.to_string(),
+            size: u64::try_from(bytes.len()).unwrap(),
+            platform: Some(Platform {
+                os: "linux".into(),
+                architecture: "arm64".into(),
+                variant: None,
+            }),
+        };
+
+        verify_manifest_descriptor(&descriptor, &expected, &expected, bytes.len()).unwrap();
+        assert!(matches!(
+            verify_manifest_descriptor(&descriptor, &expected, &expected, bytes.len() + 1),
+            Err(RegistryError::DescriptorSizeMismatch {
+                expected: descriptor_size,
+                actual,
+                ..
+            }) if descriptor_size == descriptor.size && actual == descriptor.size + 1
+        ));
+        let actual = Digest::from_bytes(b"different");
+        assert!(matches!(
+            verify_manifest_descriptor(&descriptor, &expected, &actual, bytes.len()),
+            Err(RegistryError::ManifestDigestMismatch { .. })
+        ));
     }
 }

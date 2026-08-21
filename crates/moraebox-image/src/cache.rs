@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::{
     Cas, Credentials, Digest, ImageManifest, ImageReference, Platform, RegistryClient,
-    RegistryError,
+    RegistryError, reference::Selector,
 };
 
 const SCHEMA_VERSION: u32 = 1;
@@ -92,6 +92,8 @@ pub struct CleanReport {
 struct ImageRecord {
     schema_version: u32,
     reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_manifest_digest: Option<String>,
     manifest_digest: String,
     platform: Platform,
 }
@@ -146,9 +148,36 @@ impl ImageCache {
         manifest_digest: &Digest,
         platform: &Platform,
     ) -> Result<(), ImageCacheError> {
+        self.write_image_record(reference, None, manifest_digest, platform)
+    }
+
+    fn record_pulled_image(
+        &self,
+        _lock: &CacheLock,
+        reference: &str,
+        source_manifest_digest: &Digest,
+        manifest_digest: &Digest,
+        platform: &Platform,
+    ) -> Result<(), ImageCacheError> {
+        self.write_image_record(
+            reference,
+            Some(source_manifest_digest),
+            manifest_digest,
+            platform,
+        )
+    }
+
+    fn write_image_record(
+        &self,
+        reference: &str,
+        source_manifest_digest: Option<&Digest>,
+        manifest_digest: &Digest,
+        platform: &Platform,
+    ) -> Result<(), ImageCacheError> {
         let record = ImageRecord {
             schema_version: SCHEMA_VERSION,
             reference: canonical_reference(reference)?,
+            source_manifest_digest: source_manifest_digest.map(ToString::to_string),
             manifest_digest: manifest_digest.to_string(),
             platform: platform.clone(),
         };
@@ -228,6 +257,19 @@ impl ImageCache {
         if record.reference != canonical_reference || &record.platform != platform {
             return Err(ImageCacheError::InvalidRecord(path));
         }
+        if let Some(expected) = pinned_source_digest(canonical_reference)? {
+            let Some(actual) = record
+                .source_manifest_digest
+                .as_deref()
+                .map(parse_digest)
+                .transpose()?
+            else {
+                return Ok(None);
+            };
+            if actual != expected {
+                return Ok(None);
+            }
+        }
         let digest = parse_digest(&record.manifest_digest)?;
         let rootfs = self.rootfs_path(&digest);
         if !is_complete_rootfs(&rootfs) {
@@ -265,9 +307,10 @@ impl ImageCache {
             .await?;
         let rootfs = self.rootfs_path(&image.manifest_digest);
         image.materialize_rootfs(&cas, &rootfs)?;
-        self.record_image(
+        self.record_pulled_image(
             lock,
             &image.reference.to_string(),
+            &image.source_manifest_digest,
             &image.manifest_digest,
             platform,
         )?;
@@ -758,6 +801,9 @@ fn validate_record(record: &ImageRecord, path: &Path) -> Result<(), ImageCacheEr
         return Err(ImageCacheError::InvalidRecord(path.into()));
     }
     parse_digest(&record.manifest_digest)?;
+    if let Some(source_manifest_digest) = &record.source_manifest_digest {
+        parse_digest(source_manifest_digest)?;
+    }
     if record.platform.os.is_empty() || record.platform.architecture.is_empty() {
         return Err(ImageCacheError::InvalidRecord(path.into()));
     }
@@ -771,6 +817,18 @@ fn canonical_reference(value: &str) -> Result<String, ImageCacheError> {
         return Err(ImageCacheError::InvalidTarget(value.into()));
     };
     Ok(reference.to_string())
+}
+
+fn pinned_source_digest(value: &str) -> Result<Option<Digest>, ImageCacheError> {
+    let reference = ImageReference::from_str(value)
+        .map_err(|error| ImageCacheError::InvalidTarget(error.to_string()))?;
+    let ImageReference::Registry(reference) = reference else {
+        return Err(ImageCacheError::InvalidTarget(value.into()));
+    };
+    match reference.selector {
+        Selector::Digest(digest) => parse_digest(&digest).map(Some),
+        Selector::Tag(_) => Ok(None),
+    }
 }
 
 fn parse_target(value: &str) -> Result<ImageTarget, ImageCacheError> {
@@ -1081,6 +1139,67 @@ mod tests {
                 .resolve_reference("python:3.12", &Fixture::platform())
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn digest_pinned_cache_hit_requires_matching_source_manifest_proof() {
+        let fixture = Fixture::new();
+        let selected_digest = fixture.add_image(None);
+        let source_digest = Digest::from_bytes(b"top-level-index");
+        let reference = format!("example.com/a/image@{source_digest}");
+        let lock = fixture.cache.lock_exclusive().unwrap();
+        fixture
+            .cache
+            .record_image(&lock, &reference, &selected_digest, &Fixture::platform())
+            .unwrap();
+        drop(lock);
+        assert!(
+            fixture
+                .cache
+                .resolve_reference(&reference, &Fixture::platform())
+                .unwrap()
+                .is_none(),
+            "legacy pinned records without source proof must be re-pulled"
+        );
+
+        let lock = fixture.cache.lock_exclusive().unwrap();
+        fixture
+            .cache
+            .record_pulled_image(
+                &lock,
+                &reference,
+                &source_digest,
+                &selected_digest,
+                &Fixture::platform(),
+            )
+            .unwrap();
+        drop(lock);
+        let resolved = fixture
+            .cache
+            .resolve_reference(&reference, &Fixture::platform())
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.manifest_digest, selected_digest.to_string());
+
+        let lock = fixture.cache.lock_exclusive().unwrap();
+        fixture
+            .cache
+            .record_pulled_image(
+                &lock,
+                &reference,
+                &Digest::from_bytes(b"wrong-source"),
+                &selected_digest,
+                &Fixture::platform(),
+            )
+            .unwrap();
+        drop(lock);
+        assert!(
+            fixture
+                .cache
+                .resolve_reference(&reference, &Fixture::platform())
+                .unwrap()
+                .is_none()
         );
     }
 

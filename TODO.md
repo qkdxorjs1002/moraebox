@@ -90,7 +90,7 @@
 
 ### OCI integrity와 host resource protection
 
-- [ ] digest-pinned image reference를 실제 manifest digest와 비교하고 기존 CAS object도 신뢰하기 전에 검증한다.
+- [x] digest-pinned image reference를 실제 manifest digest와 비교하고 기존 CAS object도 신뢰하기 전에 검증한다.
   - 손상된 기존 blob은 실패 또는 원자적 교체로 처리한다.
   - top-level manifest, selected platform manifest, 각 layer descriptor의 digest와 size를 모두 검증한다.
 

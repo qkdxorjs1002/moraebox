@@ -75,6 +75,7 @@ impl Cas {
         }
         let destination = self.blob_path(expected);
         if tokio::fs::try_exists(&destination).await? {
+            self.read(expected).await?;
             return Ok(destination);
         }
         let parent = destination.parent().expect("CAS blob has a parent");
@@ -85,6 +86,7 @@ impl Cas {
             Ok(()) => Ok(destination),
             Err(_error) if tokio::fs::try_exists(&destination).await? => {
                 let _ = tokio::fs::remove_file(&temporary).await;
+                self.read(expected).await?;
                 Ok(destination)
             }
             Err(error) => Err(error.into()),
@@ -143,5 +145,26 @@ mod tests {
         let path = cas.put_verified(&digest, b"hello").await.unwrap();
         assert_eq!(tokio::fs::read(path).await.unwrap(), b"hello");
         assert!(cas.put_verified(&digest, b"tampered").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_a_corrupt_existing_blob_instead_of_trusting_its_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = Cas::new(directory.path());
+        let digest = Digest::from_bytes(b"expected");
+        let path = cas.blob_path(&digest);
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, b"corrupt").await.unwrap();
+
+        let error = cas.put_verified(&digest, b"expected").await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            CasError::DigestMismatch { expected, actual }
+                if expected == digest && actual == Digest::from_bytes(b"corrupt")
+        ));
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"corrupt");
     }
 }
