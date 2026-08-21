@@ -1,7 +1,9 @@
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -46,6 +48,11 @@ const E2FSCK_CANDIDATES: &[&str] = &[
     "/usr/local/sbin/e2fsck",
     "/usr/sbin/e2fsck",
 ];
+const EXPECTED_LIBKRUN_VERSION: &str = "1.19.4";
+const EXPECTED_LIBKRUNFW_VERSION: &str = "5.5.0";
+const MIN_RECOMMENDED_CACHE_FREE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const NETWORK_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
+const NETWORK_SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -59,25 +66,102 @@ pub struct DoctorReport {
     pub hypervisor_framework: bool,
     pub helper_path: Option<PathBuf>,
     pub hypervisor_entitlement: bool,
+    #[serde(default)]
+    pub helper: NativeBinaryProbe,
     pub libkrun: LibraryProbe,
     pub libkrunfw: LibraryProbe,
     pub krunvm: ToolProbe,
     pub gvproxy: ToolProbe,
     pub mke2fs: ToolProbe,
     pub e2fsck: ToolProbe,
+    #[serde(default)]
+    pub cache_volume: CacheVolumeProbe,
+    #[serde(default)]
+    pub network: NetworkProbe,
     pub cow_clone_supported: Option<bool>,
     pub libkrun_network_api: Option<bool>,
     pub native_backend_ready: bool,
     pub native_network_ready: bool,
+    #[serde(default)]
+    pub checks: Vec<DoctorCheck>,
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LibraryProbe {
     pub found: bool,
     pub path: Option<PathBuf>,
     pub required_symbols_present: Option<bool>,
     pub missing_symbols: Vec<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub version_matches: Option<bool>,
+    #[serde(default)]
+    pub architecture: Option<String>,
+    #[serde(default)]
+    pub architecture_matches: Option<bool>,
+    #[serde(default)]
+    pub code_signature_valid: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NativeBinaryProbe {
+    pub path: Option<PathBuf>,
+    pub regular_file: bool,
+    pub executable: Option<bool>,
+    pub architecture: Option<String>,
+    pub architecture_matches: Option<bool>,
+    pub code_signature_valid: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CacheVolumeProbe {
+    pub configured_path: PathBuf,
+    pub probe_path: Option<PathBuf>,
+    pub available_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub minimum_recommended_free_bytes: u64,
+    pub free_space_sufficient: Option<bool>,
+    pub reflink_supported: Option<bool>,
+    pub free_space_error: Option<String>,
+    pub reflink_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NetworkProbe {
+    pub helper_executable: bool,
+    pub helper_architecture: Option<String>,
+    pub helper_architecture_matches: Option<bool>,
+    pub socket_created: Option<bool>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorCheckStatus {
+    Pass,
+    #[default]
+    Warn,
+    Fail,
+}
+
+impl std::fmt::Display for DoctorCheckStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Pass => "pass",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DoctorCheck {
+    pub id: String,
+    pub status: DoctorCheckStatus,
+    pub summary: String,
+    pub remediation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,10 +226,12 @@ impl NativeRuntimePaths {
 impl DoctorReport {
     pub fn collect() -> Self {
         let paths = NativeRuntimePaths::discover_with_gvproxy(None, None, None, None);
-        Self::collect_with_paths(
+        let cache_dir = moraebox_core::resolve_cache_dir(None).unwrap_or_else(|_| env::temp_dir());
+        Self::collect_with_paths_and_cache(
             paths,
             configured_path("MORAE_MKE2FS"),
             configured_path("MORAE_E2FSCK"),
+            cache_dir,
         )
     }
 
@@ -153,6 +239,15 @@ impl DoctorReport {
         paths: NativeRuntimePaths,
         mke2fs_override: Option<PathBuf>,
         e2fsck_override: Option<PathBuf>,
+    ) -> Self {
+        Self::collect_with_paths_and_cache(paths, mke2fs_override, e2fsck_override, env::temp_dir())
+    }
+
+    pub fn collect_with_paths_and_cache(
+        paths: NativeRuntimePaths,
+        mke2fs_override: Option<PathBuf>,
+        e2fsck_override: Option<PathBuf>,
+        cache_dir: PathBuf,
     ) -> Self {
         let os = env::consts::OS.to_owned();
         let architecture = env::consts::ARCH.to_owned();
@@ -162,18 +257,22 @@ impl DoctorReport {
         // leaving a dangling-looking compatibility symlink in the framework bundle.
         let hypervisor_framework =
             Path::new("/System/Library/Frameworks/Hypervisor.framework").is_dir();
-        let helper_path = paths.helper;
+        let helper_path = paths.helper.clone();
+        let helper = probe_native_binary(helper_path.as_deref(), &architecture, true);
         let hypervisor_entitlement = helper_path
             .as_deref()
             .filter(|path| path.is_file())
             .is_some_and(binary_has_hypervisor_entitlement);
-        let libkrun = probe_library_path(paths.libkrun, REQUIRED_LIBKRUN_SYMBOLS);
-        let libkrunfw = probe_library_path(paths.libkrunfw, &[]);
+        let libkrun = probe_libkrun(paths.libkrun, &architecture);
+        let libkrunfw = probe_libkrunfw(paths.libkrunfw, &architecture);
         let krunvm = probe_tool("krunvm");
         let gvproxy = probe_tool_path(paths.gvproxy);
         let mke2fs = probe_tool_override(mke2fs_override, "mke2fs", MKE2FS_CANDIDATES);
         let e2fsck = probe_tool_override(e2fsck_override, "e2fsck", E2FSCK_CANDIDATES);
-        let cow_clone_supported = probe_cow_clone();
+        let cache_volume = probe_cache_volume(cache_dir);
+        let cow_clone_supported = cache_volume.reflink_supported;
+        let network_root = nearest_existing_directory(&env::temp_dir());
+        let network = probe_network(&gvproxy, network_root.as_deref(), &architecture);
         let libkrun_network_api = libkrun
             .path
             .as_deref()
@@ -181,53 +280,47 @@ impl DoctorReport {
         let native_backend_ready = host_supported
             && hypervisor_framework
             && hypervisor_entitlement
+            && helper.regular_file
+            && helper.executable == Some(true)
+            && helper.architecture_matches == Some(true)
+            && helper.code_signature_valid == Some(true)
             && libkrun.found
             && libkrun.required_symbols_present == Some(true)
+            && libkrun.version_matches == Some(true)
+            && libkrun.architecture_matches == Some(true)
+            && libkrun.code_signature_valid == Some(true)
             && libkrunfw.found
+            && libkrunfw.version_matches == Some(true)
+            && libkrunfw.architecture_matches == Some(true)
+            && libkrunfw.code_signature_valid == Some(true)
             && mke2fs.found
             && e2fsck.found
             && cow_clone_supported == Some(true);
-        let native_network_ready =
-            native_backend_ready && gvproxy.found && libkrun_network_api == Some(true);
-        let mut warnings = Vec::new();
-        if !libkrun.found {
-            warnings.push("libkrun was not found; the process backend remains available".into());
-        }
-        if !libkrunfw.found {
-            warnings.push("libkrunfw was not found; a native Linux guest cannot boot".into());
-        }
-        if !hypervisor_entitlement {
-            warnings.push(
-                "the current executable lacks com.apple.security.hypervisor; sign the vmm helper before native execution"
-                    .into(),
-            );
-        }
-        if !gvproxy.found {
-            warnings.push(
-                "gvproxy was not found; native runs remain network-isolated unless it is installed and configured"
-                    .into(),
-            );
-        }
-        if libkrun_network_api == Some(false) {
-            warnings.push(
-                "libkrun does not export krun_add_net_unixgram; native network opt-in is unavailable"
-                    .into(),
-            );
-        }
-        if !mke2fs.found || !e2fsck.found {
-            warnings.push(
-                "e2fsprogs mke2fs/e2fsck are required to prepare and recover Box root disks".into(),
-            );
-        }
-        if cow_clone_supported == Some(false) {
-            warnings.push(
-                "the runtime volume does not support strict copy-on-write cloning; ephemeral native runs are unavailable"
-                    .into(),
-            );
-        }
+        let native_network_ready = native_backend_ready
+            && gvproxy.found
+            && network.helper_executable
+            && network.helper_architecture_matches == Some(true)
+            && network.socket_created == Some(true)
+            && libkrun_network_api == Some(true);
+        let checks = build_checks(
+            &cache_volume,
+            &network,
+            &helper,
+            hypervisor_entitlement,
+            &libkrun,
+            &libkrunfw,
+            libkrun_network_api,
+            &mke2fs,
+            &e2fsck,
+        );
+        let warnings = checks
+            .iter()
+            .filter(|check| check.status != DoctorCheckStatus::Pass)
+            .map(format_check_warning)
+            .collect();
         Self {
-            expected_libkrun_version: "1.19.4".into(),
-            expected_libkrunfw_version: "5.5.0".into(),
+            expected_libkrun_version: EXPECTED_LIBKRUN_VERSION.into(),
+            expected_libkrunfw_version: EXPECTED_LIBKRUNFW_VERSION.into(),
             os,
             architecture,
             os_version,
@@ -235,62 +328,97 @@ impl DoctorReport {
             hypervisor_framework,
             helper_path,
             hypervisor_entitlement,
+            helper,
             libkrun,
             libkrunfw,
             krunvm,
             gvproxy,
             mke2fs,
             e2fsck,
+            cache_volume,
+            network,
             cow_clone_supported,
             libkrun_network_api,
             native_backend_ready,
             native_network_ready,
+            checks,
             warnings,
         }
     }
 }
 
-fn probe_library_path(path: Option<PathBuf>, required_symbols: &[&str]) -> LibraryProbe {
+fn probe_library_path(
+    path: Option<PathBuf>,
+    required_symbols: &[&str],
+    package: &str,
+    expected_version: &str,
+    host_architecture: &str,
+) -> LibraryProbe {
     let found = path.as_ref().is_some_and(|path| path.is_file());
     if !found {
         return LibraryProbe {
             found: false,
             path,
-            required_symbols_present: None,
-            missing_symbols: Vec::new(),
+            ..LibraryProbe::default()
         };
     }
     let Some(path) = path else {
         unreachable!("a found library path must be present");
     };
-    if required_symbols.is_empty() {
-        return LibraryProbe {
-            found: true,
-            path: Some(path),
-            required_symbols_present: Some(true),
-            missing_symbols: Vec::new(),
-        };
+    let (required_symbols_present, missing_symbols) = probe_symbols(&path, required_symbols);
+    let version = homebrew_version(&path, package);
+    let architecture = probe_architecture(&path);
+    let code_signature_valid = probe_code_signature(&path);
+    LibraryProbe {
+        found: true,
+        path: Some(path),
+        required_symbols_present,
+        missing_symbols,
+        version_matches: version
+            .as_deref()
+            .map(|version| version == expected_version),
+        version,
+        architecture_matches: architecture
+            .as_deref()
+            .map(|architecture| architecture_matches(architecture, host_architecture)),
+        architecture,
+        code_signature_valid,
     }
-    let symbols = command_output("nm", &["-gU", path.to_string_lossy().as_ref()]);
-    let Some(symbols) = symbols else {
-        return LibraryProbe {
-            found: true,
-            path: Some(path),
-            required_symbols_present: None,
-            missing_symbols: Vec::new(),
-        };
+}
+
+fn probe_libkrun(path: Option<PathBuf>, host_architecture: &str) -> LibraryProbe {
+    probe_library_path(
+        path,
+        REQUIRED_LIBKRUN_SYMBOLS,
+        "libkrun",
+        EXPECTED_LIBKRUN_VERSION,
+        host_architecture,
+    )
+}
+
+fn probe_libkrunfw(path: Option<PathBuf>, host_architecture: &str) -> LibraryProbe {
+    probe_library_path(
+        path,
+        &[],
+        "libkrunfw",
+        EXPECTED_LIBKRUNFW_VERSION,
+        host_architecture,
+    )
+}
+
+fn probe_symbols(path: &Path, required_symbols: &[&str]) -> (Option<bool>, Vec<String>) {
+    if required_symbols.is_empty() {
+        return (Some(true), Vec::new());
+    }
+    let Some(symbols) = command_output("nm", &["-gU", path.to_string_lossy().as_ref()]) else {
+        return (None, Vec::new());
     };
-    let missing_symbols = required_symbols
+    let missing = required_symbols
         .iter()
         .filter(|symbol| !symbols.contains(**symbol))
         .map(|symbol| (*symbol).to_owned())
         .collect::<Vec<_>>();
-    LibraryProbe {
-        found: true,
-        path: Some(path),
-        required_symbols_present: Some(missing_symbols.is_empty()),
-        missing_symbols,
-    }
+    (Some(missing.is_empty()), missing)
 }
 
 fn probe_tool(name: &str) -> ToolProbe {
@@ -331,6 +459,267 @@ fn library_has_symbol(path: &Path, symbol: &str) -> Option<bool> {
         .map(|symbols| symbols.contains(symbol))
 }
 
+fn probe_native_binary(
+    path: Option<&Path>,
+    host_architecture: &str,
+    require_executable: bool,
+) -> NativeBinaryProbe {
+    let regular_file = path.is_some_and(Path::is_file);
+    let executable = regular_file.then(|| !require_executable || is_executable(path.unwrap()));
+    let architecture = path.filter(|_| regular_file).and_then(probe_architecture);
+    NativeBinaryProbe {
+        path: path.map(Path::to_path_buf),
+        regular_file,
+        executable,
+        architecture_matches: architecture
+            .as_deref()
+            .map(|architecture| architecture_matches(architecture, host_architecture)),
+        architecture,
+        code_signature_valid: path.filter(|_| regular_file).and_then(probe_code_signature),
+    }
+}
+
+fn probe_cache_volume(configured_path: PathBuf) -> CacheVolumeProbe {
+    let probe_path = nearest_existing_directory(&configured_path);
+    let (available_bytes, total_bytes, free_space_error) = probe_path.as_deref().map_or_else(
+        || {
+            (
+                None,
+                None,
+                Some("no existing cache path ancestor was found".into()),
+            )
+        },
+        |path| match (fs2::available_space(path), fs2::total_space(path)) {
+            (Ok(available), Ok(total)) => (Some(available), Some(total), None),
+            (available, total) => (
+                available.ok(),
+                total.ok(),
+                Some("failed to query cache volume capacity".into()),
+            ),
+        },
+    );
+    let (reflink_supported, reflink_error) = probe_path.as_deref().map_or_else(
+        || {
+            (
+                None,
+                Some("no writable cache volume probe path is available".into()),
+            )
+        },
+        probe_cow_clone_at,
+    );
+    CacheVolumeProbe {
+        configured_path,
+        probe_path,
+        available_bytes,
+        total_bytes,
+        minimum_recommended_free_bytes: MIN_RECOMMENDED_CACHE_FREE_BYTES,
+        free_space_sufficient: available_bytes
+            .map(|available| available >= MIN_RECOMMENDED_CACHE_FREE_BYTES),
+        reflink_supported,
+        free_space_error,
+        reflink_error,
+    }
+}
+
+fn nearest_existing_directory(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|candidate| candidate.is_dir())
+        .and_then(|candidate| fs::canonicalize(candidate).ok())
+}
+
+fn probe_cow_clone_at(directory: &Path) -> (Option<bool>, Option<String>) {
+    let temporary = match tempfile::Builder::new()
+        .prefix("morae-doctor-cow-")
+        .tempdir_in(directory)
+    {
+        Ok(temporary) => temporary,
+        Err(error) => return (None, Some(format!("cannot write cache volume: {error}"))),
+    };
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let result = fs::File::create(&source).and_then(|file| file.set_len(1024 * 1024));
+    if let Err(error) = result {
+        return (
+            None,
+            Some(format!("cannot create reflink probe file: {error}")),
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    let output = Command::new("/bin/cp")
+        .arg("-c")
+        .arg(&source)
+        .arg(&destination)
+        .output();
+
+    #[cfg(target_os = "linux")]
+    let output = Command::new("cp")
+        .args(["--reflink=always", "--sparse=always", "--"])
+        .arg(&source)
+        .arg(&destination)
+        .output();
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return (
+        None,
+        Some("reflink probing is unsupported on this host".into()),
+    );
+
+    match output {
+        Ok(output) if output.status.success() && destination.is_file() => (Some(true), None),
+        Ok(output) => (
+            Some(false),
+            Some(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
+        ),
+        Err(error) => (
+            None,
+            Some(format!("failed to execute reflink probe: {error}")),
+        ),
+    }
+}
+
+fn probe_network(
+    tool: &ToolProbe,
+    probe_directory: Option<&Path>,
+    host_architecture: &str,
+) -> NetworkProbe {
+    let Some(path) = tool.path.as_deref().filter(|_| tool.found) else {
+        return NetworkProbe {
+            error: Some("gvproxy was not found".into()),
+            ..NetworkProbe::default()
+        };
+    };
+    let helper_executable = is_executable(path);
+    let helper_architecture = probe_architecture(path);
+    let helper_architecture_matches = helper_architecture
+        .as_deref()
+        .map(|architecture| architecture_matches(architecture, host_architecture));
+    if !helper_executable {
+        return NetworkProbe {
+            helper_executable,
+            helper_architecture,
+            helper_architecture_matches,
+            error: Some("gvproxy is not executable".into()),
+            ..NetworkProbe::default()
+        };
+    }
+    let (socket_created, error) = probe_directory.map_or_else(
+        || {
+            (
+                None,
+                Some("no cache volume path is available for a socket probe".into()),
+            )
+        },
+        |directory| probe_network_socket(path, directory),
+    );
+    NetworkProbe {
+        helper_executable,
+        helper_architecture,
+        helper_architecture_matches,
+        socket_created,
+        error,
+    }
+}
+
+fn probe_network_socket(executable: &Path, directory: &Path) -> (Option<bool>, Option<String>) {
+    let state = match tempfile::Builder::new()
+        .prefix("morae-doctor-net-")
+        .tempdir_in(directory)
+    {
+        Ok(state) => state,
+        Err(error) => {
+            return (
+                None,
+                Some(format!("cannot create network probe state: {error}")),
+            );
+        }
+    };
+    let socket_path = state.path().join("gvproxy.sock");
+    let Some(socket_uri) = socket_uri(&socket_path) else {
+        return (
+            Some(false),
+            Some("gvproxy socket path exceeds the Unix limit".into()),
+        );
+    };
+    let child = Command::new(executable)
+        .arg("--listen-vfkit")
+        .arg(socket_uri)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_clear()
+        .spawn();
+    let Ok(mut child) = child else {
+        return (None, Some("failed to start gvproxy".into()));
+    };
+    let result = wait_for_network_socket(&mut child, &socket_path);
+    stop_child(&mut child);
+    result
+}
+
+fn wait_for_network_socket(
+    child: &mut Child,
+    socket_path: &Path,
+) -> (Option<bool>, Option<String>) {
+    let started = Instant::now();
+    loop {
+        if socket_path.exists() {
+            return if path_is_socket(socket_path) {
+                (Some(true), None)
+            } else {
+                (
+                    Some(false),
+                    Some("gvproxy created a non-socket path".into()),
+                )
+            };
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return (
+                    Some(false),
+                    Some(format!("gvproxy exited before socket readiness: {status}")),
+                );
+            }
+            Err(error) => return (None, Some(format!("cannot inspect gvproxy: {error}"))),
+            Ok(None) => {}
+        }
+        if started.elapsed() >= NETWORK_SOCKET_TIMEOUT {
+            return (
+                Some(false),
+                Some("gvproxy socket was not ready within 5s".into()),
+            );
+        }
+        thread::sleep(NETWORK_SOCKET_POLL_INTERVAL);
+    }
+}
+
+fn stop_child(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+fn socket_uri(path: &Path) -> Option<String> {
+    let path = path.to_str()?;
+    #[cfg(unix)]
+    if path.len() >= 104 {
+        return None;
+    }
+    Some(format!("unixgram://{path}"))
+}
+
+#[cfg(unix)]
+fn path_is_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket())
+}
+
+#[cfg(not(unix))]
+fn path_is_socket(path: &Path) -> bool {
+    path.exists()
+}
+
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     env::split_paths(&path)
@@ -351,34 +740,240 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
     }
 }
 
-fn probe_cow_clone() -> Option<bool> {
-    let directory = tempfile::tempdir().ok()?;
-    let source = directory.path().join("source");
-    let destination = directory.path().join("destination");
-    let file = std::fs::File::create(&source).ok()?;
-    file.set_len(1024 * 1024).ok()?;
-    drop(file);
+fn homebrew_version(path: &Path, package: &str) -> Option<String> {
+    let canonical = fs::canonicalize(path).ok()?;
+    let parts = canonical
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>();
+    parts.windows(3).find_map(|parts| {
+        (parts[0] == "Cellar" && parts[1] == package).then(|| parts[2].clone().into_owned())
+    })
+}
 
+fn probe_architecture(path: &Path) -> Option<String> {
     #[cfg(target_os = "macos")]
-    let output = Command::new("/bin/cp")
-        .arg("-c")
-        .arg(&source)
-        .arg(&destination)
+    if let Some(architectures) =
+        command_output("lipo", &["-archs", path.to_string_lossy().as_ref()])
+    {
+        return Some(architectures);
+    }
+    command_output("file", &["-b", path.to_string_lossy().as_ref()])
+}
+
+fn architecture_matches(actual: &str, expected: &str) -> bool {
+    let expected = match expected {
+        "aarch64" => "arm64",
+        other => other,
+    };
+    actual
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .any(|architecture| architecture == expected)
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+#[cfg(target_os = "macos")]
+fn probe_code_signature(path: &Path) -> Option<bool> {
+    Command::new("codesign")
+        .args(["--verify", "--strict"])
+        .arg(path)
         .output()
-        .ok()?;
+        .ok()
+        .map(|output| output.status.success())
+}
 
-    #[cfg(target_os = "linux")]
-    let output = Command::new("cp")
-        .args(["--reflink=always", "--sparse=always", "--"])
-        .arg(&source)
-        .arg(&destination)
-        .output()
-        .ok()?;
+#[cfg(not(target_os = "macos"))]
+fn probe_code_signature(_path: &Path) -> Option<bool> {
+    None
+}
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    return None;
+#[allow(clippy::too_many_arguments)]
+fn build_checks(
+    cache: &CacheVolumeProbe,
+    network: &NetworkProbe,
+    helper: &NativeBinaryProbe,
+    hypervisor_entitlement: bool,
+    libkrun: &LibraryProbe,
+    libkrunfw: &LibraryProbe,
+    libkrun_network_api: Option<bool>,
+    mke2fs: &ToolProbe,
+    e2fsck: &ToolProbe,
+) -> Vec<DoctorCheck> {
+    vec![
+        make_check(
+            "cache_reflink",
+            status_for(&[cache.reflink_supported]),
+            format!(
+                "cache volume reflink support is {} at {}",
+                probe_state(cache.reflink_supported),
+                cache
+                    .probe_path
+                    .as_deref()
+                    .unwrap_or(&cache.configured_path)
+                    .display()
+            ),
+            "Use an APFS/reflink-capable cache volume and pass it with --cache-dir.",
+        ),
+        make_check(
+            "cache_free_space",
+            status_for(&[cache.free_space_sufficient]),
+            format!(
+                "cache volume has {} free; {} is recommended",
+                cache
+                    .available_bytes
+                    .map_or_else(|| "unknown".into(), format_bytes),
+                format_bytes(cache.minimum_recommended_free_bytes)
+            ),
+            "Free cache space or select a larger volume with --cache-dir.",
+        ),
+        make_check(
+            "network_helper",
+            status_for(&[
+                Some(network.helper_executable),
+                network.helper_architecture_matches,
+            ]),
+            format!(
+                "gvproxy executable={}, architecture={}",
+                network.helper_executable,
+                network.helper_architecture.as_deref().unwrap_or("unknown")
+            ),
+            "Install a released executable gvproxy for the host architecture or pass --gvproxy.",
+        ),
+        make_check(
+            "network_socket",
+            status_for(&[network.socket_created]),
+            format!(
+                "gvproxy socket creation is {}",
+                probe_state(network.socket_created)
+            ),
+            "Check gvproxy compatibility and cache path permissions/length, then retry doctor.",
+        ),
+        make_check(
+            "helper_signing",
+            status_for(&[
+                Some(helper.regular_file),
+                helper.executable,
+                helper.architecture_matches,
+                helper.code_signature_valid,
+                Some(hypervisor_entitlement),
+            ]),
+            format!(
+                "helper executable={}, architecture={}, signature={}, entitlement={hypervisor_entitlement}",
+                probe_state(helper.executable),
+                helper.architecture.as_deref().unwrap_or("unknown"),
+                probe_state(helper.code_signature_valid)
+            ),
+            "Ad-hoc sign morae-vmm-helper with assets/moraebox-vmm.entitlements for this architecture.",
+        ),
+        library_check("libkrun_abi", libkrun, EXPECTED_LIBKRUN_VERSION),
+        library_check("libkrunfw_abi", libkrunfw, EXPECTED_LIBKRUNFW_VERSION),
+        make_check(
+            "network_abi",
+            status_for(&[libkrun_network_api]),
+            format!(
+                "krun_add_net_unixgram availability is {}",
+                probe_state(libkrun_network_api)
+            ),
+            "Install the pinned released libkrun build that exports krun_add_net_unixgram.",
+        ),
+        make_check(
+            "disk_tools",
+            status_for(&[Some(mke2fs.found), Some(e2fsck.found)]),
+            format!(
+                "mke2fs found={}, e2fsck found={}",
+                mke2fs.found, e2fsck.found
+            ),
+            "Install e2fsprogs or pass --mke2fs and --e2fsck explicitly.",
+        ),
+    ]
+}
 
-    Some(output.status.success())
+fn library_check(id: &str, probe: &LibraryProbe, expected_version: &str) -> DoctorCheck {
+    make_check(
+        id,
+        status_for(&[
+            Some(probe.found),
+            probe.required_symbols_present,
+            probe.version_matches,
+            probe.architecture_matches,
+            probe.code_signature_valid,
+        ]),
+        format!(
+            "found={}, version={} (expected {expected_version}), architecture={}, symbols={}, signature={}",
+            probe.found,
+            probe.version.as_deref().unwrap_or("unknown"),
+            probe.architecture.as_deref().unwrap_or("unknown"),
+            probe_state(probe.required_symbols_present),
+            probe_state(probe.code_signature_valid)
+        ),
+        "Install the pinned released Homebrew library for this architecture and ensure its code signature is valid.",
+    )
+}
+
+fn status_for(values: &[Option<bool>]) -> DoctorCheckStatus {
+    if values.contains(&Some(false)) {
+        DoctorCheckStatus::Fail
+    } else if values.iter().any(Option::is_none) {
+        DoctorCheckStatus::Warn
+    } else {
+        DoctorCheckStatus::Pass
+    }
+}
+
+fn probe_state(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "ready",
+        Some(false) => "unavailable",
+        None => "unknown",
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if bytes >= GIB {
+        let whole = bytes / GIB;
+        let tenth = (bytes % GIB) * 10 / GIB;
+        format!("{whole}.{tenth} GiB")
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+fn make_check(
+    id: &str,
+    status: DoctorCheckStatus,
+    summary: String,
+    remediation: &str,
+) -> DoctorCheck {
+    DoctorCheck {
+        id: id.into(),
+        status,
+        summary,
+        remediation: (status != DoctorCheckStatus::Pass).then(|| remediation.into()),
+    }
+}
+
+fn format_check_warning(check: &DoctorCheck) -> String {
+    check.remediation.as_ref().map_or_else(
+        || format!("{}: {}", check.id, check.summary),
+        |remediation| {
+            format!(
+                "{}: {}; remediation: {remediation}",
+                check.id, check.summary
+            )
+        },
+    )
 }
 
 fn configured_path(key: &str) -> Option<PathBuf> {
@@ -450,7 +1045,13 @@ mod tests {
     #[test]
     fn missing_library_probe_is_explicit() {
         let path = PathBuf::from("/definitely/not/a/library");
-        let probe = probe_library_path(Some(path.clone()), REQUIRED_LIBKRUN_SYMBOLS);
+        let probe = probe_library_path(
+            Some(path.clone()),
+            REQUIRED_LIBKRUN_SYMBOLS,
+            "libkrun",
+            EXPECTED_LIBKRUN_VERSION,
+            env::consts::ARCH,
+        );
         assert!(!probe.found);
         assert_eq!(probe.path, Some(path));
         assert_eq!(probe.required_symbols_present, None);
@@ -510,5 +1111,60 @@ mod tests {
             Some(Path::new("/opt/native/lib/libkrunfw.dylib")),
         );
         assert_eq!(joined, Some(PathBuf::from("/opt/native/lib")));
+    }
+
+    #[test]
+    fn homebrew_version_comes_from_the_canonical_cellar_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory
+            .path()
+            .join("Cellar/libkrun/1.19.4/lib/libkrun.dylib");
+        fs::create_dir_all(library.parent().unwrap()).unwrap();
+        fs::write(&library, b"fixture").unwrap();
+
+        assert_eq!(
+            homebrew_version(&library, "libkrun").as_deref(),
+            Some("1.19.4")
+        );
+        assert_eq!(homebrew_version(&library, "libkrunfw"), None);
+    }
+
+    #[test]
+    fn cache_probe_uses_the_nearest_existing_volume_ancestor() {
+        let directory = tempfile::tempdir().unwrap();
+        let configured = directory.path().join("not-created/cache");
+        let probe = probe_cache_volume(configured.clone());
+
+        assert_eq!(probe.configured_path, configured);
+        assert_eq!(
+            probe.probe_path,
+            Some(fs::canonicalize(directory.path()).unwrap())
+        );
+        assert!(probe.available_bytes.is_some());
+        assert!(probe.total_bytes.is_some());
+    }
+
+    #[test]
+    fn every_non_pass_check_has_remediation() {
+        let missing_tool = ToolProbe {
+            found: false,
+            path: None,
+            version: None,
+        };
+        let checks = build_checks(
+            &CacheVolumeProbe::default(),
+            &NetworkProbe::default(),
+            &NativeBinaryProbe::default(),
+            false,
+            &LibraryProbe::default(),
+            &LibraryProbe::default(),
+            None,
+            &missing_tool,
+            &missing_tool,
+        );
+
+        assert!(checks.iter().all(|check| {
+            check.status == DoctorCheckStatus::Pass || check.remediation.is_some()
+        }));
     }
 }

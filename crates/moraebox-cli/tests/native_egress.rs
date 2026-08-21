@@ -237,6 +237,31 @@ fn verify_doctor(morae: &Path) {
     assert_eq!(report["native_backend_ready"], true);
     assert_eq!(report["native_network_ready"], true);
     assert_eq!(report["hypervisor_entitlement"], true);
+    assert_eq!(report["cache_volume"]["reflink_supported"], true);
+    assert_eq!(report["cache_volume"]["free_space_sufficient"], true);
+    assert_eq!(report["network"]["socket_created"], true);
+    assert_eq!(report["helper"]["code_signature_valid"], true);
+    assert_eq!(report["libkrun"]["version_matches"], true);
+    assert_eq!(report["libkrunfw"]["version_matches"], true);
+    let checks = report["checks"].as_array().expect("doctor checks");
+    for id in [
+        "cache_reflink",
+        "cache_free_space",
+        "network_helper",
+        "network_socket",
+        "helper_signing",
+        "libkrun_abi",
+        "libkrunfw_abi",
+        "network_abi",
+        "disk_tools",
+    ] {
+        let check = checks
+            .iter()
+            .find(|check| check["id"] == id)
+            .unwrap_or_else(|| panic!("missing doctor check {id}"));
+        assert_eq!(check["status"], "pass", "doctor check {id} failed");
+        assert_eq!(check["remediation"], Value::Null);
+    }
 }
 
 fn ready_image(morae: &Path, cache_dir: Option<&Path>, image: Option<&str>) -> CachedImage {

@@ -54,7 +54,7 @@ morae --version
 morae doctor --strict
 ```
 
-`doctor` is read-only. Use `morae doctor --json` for a machine-readable report of missing libraries, symbols, frameworks, tools, or signing capabilities.
+`doctor` is non-destructive: its temporary cache-volume and gvproxy socket probes are removed before it exits. Use `morae doctor --json` for named checks covering actual cache-volume reflink/free-space, helper and library architecture/signing, pinned released ABI versions and symbols, disk tools, and gvproxy socket creation. Every non-passing check includes a remediation.
 
 ### 3. Run a command
 
@@ -367,7 +367,7 @@ codesign --force --sign - \
   target/release/morae-vmm-helper
 ```
 
-Native execution additionally needs compatible released libkrun/libkrunfw builds, Hypervisor.framework, `mke2fs` and `e2fsck` from `e2fsprogs`, and `gvproxy` for opt-in networking. `morae doctor --json` reports base native readiness and network readiness separately.
+Native execution additionally needs compatible released libkrun/libkrunfw builds, Hypervisor.framework, `mke2fs` and `e2fsck` from `e2fsprogs`, and `gvproxy` for opt-in networking. `morae doctor --json` reports base native readiness and network readiness separately, and probes the effective `--cache-dir` volume rather than an unrelated system temporary volume.
 
 ## Development
 

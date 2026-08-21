@@ -19,7 +19,10 @@ pub use backend::{
     StartupMetrics,
 };
 pub use budget::{RunBudget, RunBudgetTimeout, RunStage, StageError, StageTiming};
-pub use doctor::{DoctorReport, LibraryProbe, NativeRuntimePaths, ToolProbe};
+pub use doctor::{
+    CacheVolumeProbe, DoctorCheck, DoctorCheckStatus, DoctorReport, LibraryProbe,
+    NativeBinaryProbe, NativeRuntimePaths, NetworkProbe, ToolProbe,
+};
 pub use libkrun::{BoxRootSource, BoxRuntimeConfig, LibkrunBackend, LibkrunConfig};
 pub use pool::{PoolConfig, PoolError, PoolStats, PreparedKey, PreparedLease, PreparedPool};
 pub use process::ProcessBackend;

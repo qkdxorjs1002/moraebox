@@ -718,8 +718,13 @@ fn doctor(args: &DoctorArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std:
         global.lib_dir.clone(),
         global.gvproxy.clone(),
     );
-    let report =
-        DoctorReport::collect_with_paths(paths, global.mke2fs.clone(), global.e2fsck.clone());
+    let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
+    let report = DoctorReport::collect_with_paths_and_cache(
+        paths,
+        global.mke2fs.clone(),
+        global.e2fsck.clone(),
+        cache_dir,
+    );
     if global.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -765,8 +770,11 @@ fn doctor(args: &DoctorArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std:
                 .map_or_else(|| "missing".into(), |path| path.display().to_string())
         );
         println!("native network ready: {}", report.native_network_ready);
-        for warning in &report.warnings {
-            println!("warning: {warning}");
+        for check in &report.checks {
+            println!("check {}: {} - {}", check.id, check.status, check.summary);
+            if let Some(remediation) = &check.remediation {
+                println!("  remediation: {remediation}");
+            }
         }
     }
     Ok(i32::from(args.strict && !report.native_backend_ready))
