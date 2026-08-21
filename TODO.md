@@ -150,7 +150,7 @@
 
 - [x] initialize state와 지원 protocol version을 검증하고 `initialized`/cancel notification을 처리한다.
 
-- [ ] 각 tool에 `outputSchema`와 실제 side effect에 맞는 annotations를 추가한다.
+- [x] 각 tool에 `outputSchema`와 실제 side effect에 맞는 annotations를 추가한다.
   - persistent Box에서 실행하는 `sandbox_exec`와 signal/stop의 mutation을 숨기지 않는다.
 
 - [ ] MCP server 시작 시 default image를 eager pull하지 않고 protocol handshake를 먼저 받을 수 있게 한다.

@@ -1408,6 +1408,208 @@ fn protocol_error(id: Value, code: i32, message: &str) -> Value {
     response
 }
 
+fn session_status_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "session_id": { "type": "string", "format": "uuid" },
+            "backend": { "type": "string" },
+            "state": {
+                "type": "string",
+                "enum": ["new", "preparing", "starting", "ready", "running", "stopping", "failed", "timed_out", "dead"]
+            },
+            "termination_reason": {
+                "anyOf": [
+                    { "type": "string", "enum": ["exited", "cancelled", "timed_out", "failed"] },
+                    { "type": "null" }
+                ]
+            },
+            "exit_code": { "anyOf": [{ "type": "integer" }, { "type": "null" }] },
+            "signal": { "anyOf": [{ "type": "integer" }, { "type": "null" }] },
+            "timed_out": { "type": "boolean" },
+            "elapsed_micros": { "type": "integer", "minimum": 0 }
+        },
+        "required": [
+            "session_id", "backend", "state", "termination_reason", "exit_code", "signal",
+            "timed_out", "elapsed_micros"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn output_chunks_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "cursor": { "type": "integer", "minimum": 0 },
+                "channel": { "type": "string", "enum": ["stdout", "stderr"] },
+                "text": { "type": "string" }
+            },
+            "required": ["cursor", "channel", "text"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn execution_output_schema() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "status": session_status_schema(),
+                    "output": output_chunks_schema(),
+                    "next_cursor": { "type": "integer", "minimum": 0 },
+                    "output_next_cursor": { "type": "integer", "minimum": 0 },
+                    "has_more": { "type": "boolean" },
+                    "continuation_cursor": {
+                        "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }]
+                    },
+                    "truncated": { "type": "boolean" }
+                },
+                "required": [
+                    "status", "output", "next_cursor", "output_next_cursor", "has_more",
+                    "continuation_cursor", "truncated"
+                ],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "status": session_status_schema(),
+                    "next_cursor": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["status", "next_cursor"],
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
+fn io_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": session_status_schema(),
+            "output": output_chunks_schema(),
+            "next_cursor": { "type": "integer", "minimum": 0 },
+            "truncated": { "type": "boolean" },
+            "wait_timed_out": { "type": "boolean" }
+        },
+        "required": ["status", "output", "next_cursor", "truncated", "wait_timed_out"],
+        "additionalProperties": false
+    })
+}
+
+fn status_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "status": session_status_schema() },
+        "required": ["status"],
+        "additionalProperties": false
+    })
+}
+
+fn session_list_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "sessions": { "type": "array", "items": session_status_schema() }
+        },
+        "required": ["sessions"],
+        "additionalProperties": false
+    })
+}
+
+fn remove_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "removed": { "type": "boolean" },
+            "status": session_status_schema()
+        },
+        "required": ["removed"],
+        "additionalProperties": false
+    })
+}
+
+fn box_metadata_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "schema_version": { "type": "integer", "minimum": 1 },
+            "box_id": { "type": "string", "format": "uuid" },
+            "state": { "type": "string", "enum": ["ready", "dirty", "needs_repair"] },
+            "manifest_digest": { "type": "string" },
+            "platform": { "type": "string" },
+            "disk_format": { "type": "string", "enum": ["raw_ext4"] },
+            "virtual_size_bytes": { "type": "integer", "minimum": 1 },
+            "generation": { "type": "integer", "minimum": 0 },
+            "created_at_unix_ms": { "type": "integer", "minimum": 0 },
+            "updated_at_unix_ms": { "type": "integer", "minimum": 0 },
+            "owner_uid": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] }
+        },
+        "required": [
+            "schema_version", "box_id", "state", "manifest_digest", "platform", "disk_format",
+            "virtual_size_bytes", "generation", "created_at_unix_ms", "updated_at_unix_ms",
+            "owner_uid"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn box_list_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "boxes": { "type": "array", "items": box_metadata_schema() } },
+        "required": ["boxes"],
+        "additionalProperties": false
+    })
+}
+
+fn deleted_box_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "deleted": { "type": "string", "format": "uuid" } },
+        "required": ["deleted"],
+        "additionalProperties": false
+    })
+}
+
+fn error_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "error": {
+                "type": "object",
+                "properties": {
+                    "code": { "type": "string" },
+                    "stage": { "type": "string" },
+                    "retryable": { "type": "boolean" },
+                    "message": { "type": "string" },
+                    "remediation": { "type": "string" },
+                    "earliest_cursor": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["code", "stage", "retryable", "message", "remediation"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["error"],
+        "additionalProperties": false
+    })
+}
+
+fn tool_output_schema(success_schema: Value) -> Value {
+    let mut schema = serde_json::Map::with_capacity(1);
+    schema.insert(
+        "oneOf".into(),
+        Value::Array(vec![success_schema, error_output_schema()]),
+    );
+    Value::Object(schema)
+}
+
 #[allow(clippy::too_many_lines)]
 fn tools_list() -> Value {
     json!({
@@ -1431,7 +1633,8 @@ fn tools_list() -> Value {
                     "required": ["argv"],
                     "additionalProperties": false
                 },
-                "annotations": { "destructiveHint": false, "openWorldHint": true }
+                "outputSchema": tool_output_schema(execution_output_schema()),
+                "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true }
             },
             {
                 "name": "sandbox_io",
@@ -1453,13 +1656,15 @@ fn tools_list() -> Value {
                     "required": ["session_id"],
                     "additionalProperties": false
                 },
-                "annotations": { "destructiveHint": false, "openWorldHint": false }
+                "outputSchema": tool_output_schema(io_output_schema()),
+                "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false }
             },
             {
                 "name": "sandbox_session_list",
                 "title": "List sandbox sessions",
                 "description": "List current connection-owned sessions in stable SessionId order without waiting or starting a sandbox.",
                 "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+                "outputSchema": tool_output_schema(session_list_output_schema()),
                 "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
             },
             {
@@ -1472,6 +1677,7 @@ fn tools_list() -> Value {
                     "required": ["session_id"],
                     "additionalProperties": false
                 },
+                "outputSchema": tool_output_schema(status_output_schema()),
                 "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
             },
             {
@@ -1484,7 +1690,8 @@ fn tools_list() -> Value {
                     "required": ["session_id"],
                     "additionalProperties": false
                 },
-                "annotations": { "destructiveHint": true, "idempotentHint": true, "openWorldHint": false }
+                "outputSchema": tool_output_schema(status_output_schema()),
+                "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false }
             },
             {
                 "name": "sandbox_remove",
@@ -1496,7 +1703,8 @@ fn tools_list() -> Value {
                     "required": ["session_id"],
                     "additionalProperties": false
                 },
-                "annotations": { "destructiveHint": true, "idempotentHint": true, "openWorldHint": false }
+                "outputSchema": tool_output_schema(remove_output_schema()),
+                "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false }
             },
             {
                 "name": "sandbox_box_create",
@@ -1510,13 +1718,15 @@ fn tools_list() -> Value {
                     },
                     "additionalProperties": false
                 },
-                "annotations": { "destructiveHint": false, "idempotentHint": false, "openWorldHint": true }
+                "outputSchema": tool_output_schema(box_metadata_schema()),
+                "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true }
             },
             {
                 "name": "sandbox_box_list",
                 "title": "List persistent Boxes",
                 "description": "List persistent Box metadata without starting a microVM.",
                 "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+                "outputSchema": tool_output_schema(box_list_output_schema()),
                 "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
             },
             {
@@ -1529,6 +1739,7 @@ fn tools_list() -> Value {
                     "required": ["box_id"],
                     "additionalProperties": false
                 },
+                "outputSchema": tool_output_schema(box_metadata_schema()),
                 "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
             },
             {
@@ -1544,7 +1755,8 @@ fn tools_list() -> Value {
                     "required": ["box_id", "confirm"],
                     "additionalProperties": false
                 },
-                "annotations": { "destructiveHint": true, "idempotentHint": false, "openWorldHint": false }
+                "outputSchema": tool_output_schema(deleted_box_output_schema()),
+                "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false }
             },
             {
                 "name": "sandbox_box_reset",
@@ -1559,7 +1771,8 @@ fn tools_list() -> Value {
                     "required": ["box_id", "confirm"],
                     "additionalProperties": false
                 },
-                "annotations": { "destructiveHint": true, "idempotentHint": false, "openWorldHint": false }
+                "outputSchema": tool_output_schema(box_metadata_schema()),
+                "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false }
             },
             {
                 "name": "sandbox_box_clone",
@@ -1574,7 +1787,8 @@ fn tools_list() -> Value {
                     "required": ["box_id", "confirm"],
                     "additionalProperties": false
                 },
-                "annotations": { "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
+                "outputSchema": tool_output_schema(box_metadata_schema()),
+                "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
             }
         ]
     })
@@ -1773,6 +1987,82 @@ mod tests {
             }))
             .unwrap_err()
             .contains("unsupported protocol version")
+        );
+    }
+
+    #[test]
+    fn tools_advertise_output_contracts_and_side_effects() {
+        let list = tools_list();
+        let tools = list
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("tools list");
+        assert_eq!(tools.len(), 12);
+        assert!(tools.iter().all(|tool| tool.get("outputSchema").is_some()));
+        assert!(tools.iter().all(|tool| {
+            tool.pointer("/outputSchema/oneOf/1/properties/error")
+                .is_some()
+        }));
+
+        let advertised = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.get("name") == Some(&json!(name)))
+                .unwrap_or_else(|| panic!("missing advertised tool {name}"))
+        };
+        for name in [
+            "sandbox_exec",
+            "sandbox_io",
+            "sandbox_stop",
+            "sandbox_remove",
+        ] {
+            let tool = advertised(name);
+            assert_eq!(
+                tool.pointer("/annotations/readOnlyHint"),
+                Some(&json!(false)),
+                "{name} must disclose mutation"
+            );
+            assert_eq!(
+                tool.pointer("/annotations/destructiveHint"),
+                Some(&json!(true)),
+                "{name} must disclose destructive inputs"
+            );
+        }
+        for name in [
+            "sandbox_session_list",
+            "sandbox_session_status",
+            "sandbox_box_list",
+            "sandbox_box_get",
+        ] {
+            assert_eq!(
+                advertised(name).pointer("/annotations/readOnlyHint"),
+                Some(&json!(true)),
+                "{name} must be read-only"
+            );
+        }
+        for name in ["sandbox_box_delete", "sandbox_box_reset"] {
+            assert_eq!(
+                advertised(name).pointer("/annotations/destructiveHint"),
+                Some(&json!(true)),
+                "{name} must disclose destructive Box changes"
+            );
+        }
+
+        assert!(
+            advertised("sandbox_exec")
+                .pointer("/outputSchema/oneOf/0/oneOf")
+                .is_some(),
+            "sandbox_exec must describe wait=true and wait=false results"
+        );
+        assert_eq!(
+            advertised("sandbox_io")
+                .pointer("/outputSchema/oneOf/0/properties/wait_timed_out/type"),
+            Some(&json!("boolean"))
+        );
+        assert_eq!(
+            advertised("sandbox_box_create")
+                .pointer("/outputSchema/oneOf/0/properties/owner_uid/anyOf/1/type"),
+            Some(&json!("null"))
         );
     }
 
