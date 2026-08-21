@@ -12,7 +12,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
-use crate::lock::AdvisoryLock;
+use crate::{durability::sync_directory, lock::AdvisoryLock};
 
 const VERIFY_BUFFER_SIZE: usize = 64 * 1024;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -133,12 +133,17 @@ impl Cas {
         }
         let parent = destination.parent().expect("CAS blob has a parent");
         tokio::fs::create_dir_all(parent).await?;
-        let temporary = parent.join(format!(".{}.{}.tmp", expected.hex(), std::process::id()));
-        tokio::fs::write(&temporary, bytes).await?;
-        match tokio::fs::rename(&temporary, &destination).await {
-            Ok(()) => Ok(destination),
+        let mut staging = create_staged_blob(parent).await?;
+        staging.file().write_all(bytes).await?;
+        staging.file().sync_all().await?;
+        staging.close();
+        match tokio::fs::rename(&staging.path, &destination).await {
+            Ok(()) => {
+                staging.published = true;
+                sync_directory_async(parent.to_path_buf()).await?;
+                Ok(destination)
+            }
             Err(_error) if tokio::fs::try_exists(&destination).await? => {
-                let _ = tokio::fs::remove_file(&temporary).await;
                 self.read(expected).await?;
                 Ok(destination)
             }
@@ -197,7 +202,7 @@ impl Cas {
         verify_stream_size(size, expected_size, maximum_size)?;
         staging
             .file()
-            .flush()
+            .sync_all()
             .await
             .map_err(CasError::from)
             .map_err(PutStreamError::Cas)?;
@@ -241,6 +246,9 @@ impl Cas {
             .map_err(CasError::from)
             .map_err(PutStreamError::Cas)?;
         staging.published = true;
+        sync_directory_async(parent.to_path_buf())
+            .await
+            .map_err(PutStreamError::Cas)?;
         drop(digest_lock);
         Ok(actual)
     }
@@ -270,6 +278,13 @@ impl Cas {
             .join("locks/sha256")
             .join(format!("{}.lock", digest.hex()))
     }
+}
+
+async fn sync_directory_async(path: PathBuf) -> Result<(), CasError> {
+    tokio::task::spawn_blocking(move || sync_directory(&path))
+        .await
+        .map_err(|error| CasError::Task(error.to_string()))??;
+    Ok(())
 }
 
 fn verify_file(path: &Path, expected: &Digest) -> Result<u64, CasError> {
@@ -515,6 +530,19 @@ mod tests {
             b"shared stream"
         );
         assert!(staging_is_empty(&cas).await);
+    }
+
+    #[tokio::test]
+    async fn staging_files_use_create_new_and_cleanup_independently() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = create_staged_blob(directory.path()).await.unwrap();
+        let second = create_staged_blob(directory.path()).await.unwrap();
+
+        assert_ne!(first.path, second.path);
+        assert!(first.path.is_file());
+        assert!(second.path.is_file());
+        drop((first, second));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     async fn staging_is_empty(cas: &Cas) -> bool {

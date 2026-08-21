@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::{
     Cas, Credentials, Digest, ImageManifest, ImageReference, Platform, RegistryClient,
-    RegistryError, lock::AdvisoryLock, reference::Selector,
+    RegistryError, durability::sync_directory, lock::AdvisoryLock, reference::Selector,
 };
 
 const SCHEMA_VERSION: u32 = 1;
@@ -139,6 +139,11 @@ impl StagedRootfs {
 
     fn publish(&self, destination: &Path) -> Result<(), ImageCacheError> {
         fs::rename(&self.rootfs, destination)?;
+        sync_directory(
+            destination
+                .parent()
+                .ok_or_else(|| ImageCacheError::InvalidManagedPath(destination.into()))?,
+        )?;
         Ok(())
     }
 }
@@ -304,7 +309,7 @@ impl ImageCache {
         }
         let digest = parse_digest(&record.manifest_digest)?;
         let rootfs = self.rootfs_path(&digest);
-        if !is_complete_rootfs(&rootfs) {
+        if !is_complete_rootfs(&rootfs, &digest) {
             return Ok(None);
         }
         let default = self.default_reference_unlocked()?;
@@ -367,7 +372,7 @@ impl ImageCache {
         let rootfs = self.rootfs_path(manifest_digest);
         let _digest = AdvisoryLock::acquire(&self.rootfs_lock_path(manifest_digest)).await?;
         let _metadata = AdvisoryLock::acquire(&self.metadata_lock_path()).await?;
-        if !is_complete_rootfs(&rootfs) {
+        if !is_complete_rootfs(&rootfs, manifest_digest) {
             if rootfs.exists() {
                 return Err(RegistryError::RootfsExists(rootfs.clone()).into());
             }
@@ -766,7 +771,7 @@ impl ImageCache {
             };
             let path = entry.path();
             roots.push(RootfsEntry {
-                ready: is_complete_rootfs(&path),
+                ready: is_complete_rootfs(&path, &digest),
                 size_bytes: path_size(&path)?,
                 path,
                 digest,
@@ -950,12 +955,16 @@ fn parse_digest_hex(value: &str) -> Result<Digest, ImageCacheError> {
     parse_digest(value)
 }
 
-fn is_complete_rootfs(path: &Path) -> bool {
+fn is_complete_rootfs(path: &Path, digest: &Digest) -> bool {
     [CURRENT_COMPLETE_MARKER, LEGACY_COMPLETE_MARKER]
         .iter()
         .any(|marker| {
-            fs::symlink_metadata(path.join(marker))
-                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+            let marker = path.join(marker);
+            fs::symlink_metadata(&marker).is_ok_and(|metadata| {
+                metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && fs::read_to_string(marker).is_ok_and(|value| value == digest.to_string())
+            })
         })
 }
 
@@ -1498,7 +1507,10 @@ mod tests {
             second_result.unwrap().rootfs,
             fixture.cache.rootfs_path(&digest)
         );
-        assert!(is_complete_rootfs(&fixture.cache.rootfs_path(&digest)));
+        assert!(is_complete_rootfs(
+            &fixture.cache.rootfs_path(&digest),
+            &digest
+        ));
         assert!(!first_directory.exists());
         assert!(!second_directory.exists());
         assert!(
@@ -1515,6 +1527,29 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn cache_readiness_requires_the_expected_digest_marker() {
+        let fixture = Fixture::new();
+        let digest = Digest::from_bytes(b"manifest");
+        let rootfs = fixture.cache.rootfs_path(&digest);
+        fs::create_dir_all(&rootfs).unwrap();
+        let marker = rootfs.join(CURRENT_COMPLETE_MARKER);
+        fs::write(&marker, "wrong").unwrap();
+        assert!(!is_complete_rootfs(&rootfs, &digest));
+        fs::write(&marker, digest.to_string()).unwrap();
+        assert!(is_complete_rootfs(&rootfs, &digest));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            fs::remove_file(&marker).unwrap();
+            let target = rootfs.join("target");
+            fs::write(&target, digest.to_string()).unwrap();
+            symlink(target, marker).unwrap();
+            assert!(!is_complete_rootfs(&rootfs, &digest));
+        }
     }
 
     fn staged_rootfs(cache: &ImageCache, digest: &Digest, payload: &[u8]) -> StagedRootfs {

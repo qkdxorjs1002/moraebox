@@ -4,6 +4,7 @@
 
 mod cache;
 mod cas;
+mod durability;
 mod layer;
 mod lock;
 mod reference;

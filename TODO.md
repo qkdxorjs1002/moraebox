@@ -173,7 +173,7 @@
 
 - [x] layer extraction과 filesystem hashing을 `spawn_blocking`으로 분리해 async runtime을 막지 않는다.
 
-- [ ] CAS와 materialized image publish를 crash-safe하게 만든다.
+- [x] CAS와 materialized image publish를 crash-safe하게 만든다.
   - unique `create_new` temp file/dir를 사용한다.
   - complete marker가 regular non-symlink file이고 예상 manifest digest를 담는지 확인한다.
   - atomic replace 후 parent directory를 fsync한다.

@@ -1,9 +1,13 @@
 use std::{
     collections::BTreeSet,
-    fs,
+    fs::{self, OpenOptions},
     future::Future,
+    io::Write,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -16,6 +20,7 @@ use tokio::sync::Mutex;
 use crate::{
     Cas, Digest, LayerCompression, RegistryReference,
     cas::{CasError, PutStreamError},
+    durability::{sync_directory, sync_tree},
     layer::{LayerBudget, LayerError, LayerLimits, apply_layer_with_budget},
     reference::Selector,
 };
@@ -34,6 +39,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+const ROOTFS_COMPLETE_MARKER: &str = ".moraebox-rootfs-complete";
+static ROOTFS_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credentials {
@@ -118,14 +125,27 @@ pub struct PulledImage {
     pub limits: ImagePullLimits,
 }
 
+#[derive(Debug)]
+struct MaterializedRootfsStaging {
+    path: std::path::PathBuf,
+    published: bool,
+}
+
+impl Drop for MaterializedRootfsStaging {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 impl PulledImage {
     pub fn materialize_rootfs(
         &self,
         cas: &Cas,
         root: &std::path::Path,
     ) -> Result<(), RegistryError> {
-        let complete = root.join(".moraebox-rootfs-complete");
-        if complete.is_file() {
+        if rootfs_is_complete(root, &self.manifest_digest) {
             return Ok(());
         }
         if root.exists() {
@@ -136,12 +156,7 @@ impl PulledImage {
             .ok_or_else(|| RegistryError::RootfsExists(root.into()))?;
         fs::create_dir_all(parent)?;
         ensure_available_space(parent, self.limits.extraction.max_expanded_bytes)?;
-        let temporary = parent.join(format!(
-            ".{}.{}.tmp",
-            self.manifest_digest.hex(),
-            std::process::id()
-        ));
-        fs::create_dir(&temporary)?;
+        let mut staging = create_rootfs_staging(parent, &self.manifest_digest)?;
         let mut budget = LayerBudget::new(self.limits.extraction);
         let materialized = self
             .manifest
@@ -151,19 +166,64 @@ impl PulledImage {
             .try_for_each(|(descriptor, digest)| {
                 let file = fs::File::open(cas.blob_path(digest))?;
                 let compression = LayerCompression::from_media_type(&descriptor.media_type)?;
-                apply_layer_with_budget(file, compression, &temporary, &mut budget)
+                apply_layer_with_budget(file, compression, &staging.path, &mut budget)
             });
         if let Err(error) = materialized {
-            let _ = fs::remove_dir_all(&temporary);
             return Err(error.into());
         }
-        fs::write(
-            temporary.join(".moraebox-rootfs-complete"),
-            self.manifest_digest.to_string(),
-        )?;
-        fs::rename(temporary, root)?;
+        sync_tree(&staging.path)?;
+        write_complete_marker(&staging.path, &self.manifest_digest)?;
+        sync_directory(&staging.path)?;
+        fs::rename(&staging.path, root)?;
+        staging.published = true;
+        sync_directory(parent)?;
         Ok(())
     }
+}
+
+fn create_rootfs_staging(
+    parent: &std::path::Path,
+    digest: &Digest,
+) -> Result<MaterializedRootfsStaging, RegistryError> {
+    loop {
+        let sequence = ROOTFS_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            digest.hex(),
+            std::process::id(),
+            sequence
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                return Ok(MaterializedRootfsStaging {
+                    path,
+                    published: false,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn write_complete_marker(root: &std::path::Path, digest: &Digest) -> Result<(), RegistryError> {
+    let marker = root.join(ROOTFS_COMPLETE_MARKER);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)?;
+    file.write_all(digest.to_string().as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn rootfs_is_complete(root: &std::path::Path, digest: &Digest) -> bool {
+    let marker = root.join(ROOTFS_COMPLETE_MARKER);
+    fs::symlink_metadata(&marker).is_ok_and(|metadata| {
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && fs::read_to_string(marker).is_ok_and(|value| value == digest.to_string())
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1524,12 +1584,6 @@ mod tests {
             },
         };
         let rootfs = directory.path().join("rootfs");
-        let staging = directory.path().join(format!(
-            ".{}.{}.tmp",
-            manifest_digest.hex(),
-            std::process::id()
-        ));
-
         let error = image.materialize_rootfs(&cas, &rootfs).unwrap_err();
 
         assert!(matches!(
@@ -1537,6 +1591,45 @@ mod tests {
             RegistryError::Layer(LayerError::FileSizeLimitExceeded { .. })
         ));
         assert!(!rootfs.exists());
-        assert!(!staging.exists());
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with('.'))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn rootfs_marker_requires_an_exact_regular_digest_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let digest = Digest::from_bytes(b"manifest");
+        let marker = directory.path().join(ROOTFS_COMPLETE_MARKER);
+        fs::write(&marker, "wrong").unwrap();
+        assert!(!rootfs_is_complete(directory.path(), &digest));
+        fs::write(&marker, digest.to_string()).unwrap();
+        assert!(rootfs_is_complete(directory.path(), &digest));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            fs::remove_file(&marker).unwrap();
+            let target = directory.path().join("target");
+            fs::write(&target, digest.to_string()).unwrap();
+            symlink(target, marker).unwrap();
+            assert!(!rootfs_is_complete(directory.path(), &digest));
+        }
+    }
+
+    #[test]
+    fn rootfs_staging_directories_are_unique_and_cleaned() {
+        let directory = tempfile::tempdir().unwrap();
+        let digest = Digest::from_bytes(b"manifest");
+        let first = create_rootfs_staging(directory.path(), &digest).unwrap();
+        let second = create_rootfs_staging(directory.path(), &digest).unwrap();
+        assert_ne!(first.path, second.path);
+        drop((first, second));
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 }
