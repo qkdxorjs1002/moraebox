@@ -94,7 +94,7 @@
   - 손상된 기존 blob은 실패 또는 원자적 교체로 처리한다.
   - top-level manifest, selected platform manifest, 각 layer descriptor의 digest와 size를 모두 검증한다.
 
-- [ ] OCI download와 extraction에 compressed bytes, expanded bytes, layer/file count, per-file size, total disk quota를 적용한다.
+- [x] OCI download와 extraction에 compressed bytes, expanded bytes, layer/file count, per-file size, total disk quota를 적용한다.
   - descriptor size와 실제 body size 불일치를 거부한다.
   - free-space preflight와 decompression-bomb 회귀 테스트를 추가한다.
 

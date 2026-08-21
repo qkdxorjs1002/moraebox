@@ -1,12 +1,15 @@
 use std::{fs, str::FromStr};
 
+use futures_util::StreamExt;
 use reqwest::{StatusCode, header};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    Cas, Digest, LayerCompression, RegistryReference, apply_layer, cas::CasError,
-    layer::LayerError, reference::Selector,
+    Cas, Digest, LayerCompression, RegistryReference,
+    cas::CasError,
+    layer::{LayerBudget, LayerError, LayerLimits, apply_layer_with_budget},
+    reference::Selector,
 };
 
 const ACCEPT_MANIFESTS: &str = concat!(
@@ -65,6 +68,29 @@ pub struct Descriptor {
     pub platform: Option<Platform>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImagePullLimits {
+    pub max_manifest_bytes: u64,
+    pub max_config_bytes: u64,
+    pub max_layer_bytes: u64,
+    pub max_compressed_bytes: u64,
+    pub max_layers: usize,
+    pub extraction: LayerLimits,
+}
+
+impl Default for ImagePullLimits {
+    fn default() -> Self {
+        Self {
+            max_manifest_bytes: 8 * 1024 * 1024,
+            max_config_bytes: 16 * 1024 * 1024,
+            max_layer_bytes: 1024 * 1024 * 1024,
+            max_compressed_bytes: 4 * 1024 * 1024 * 1024,
+            max_layers: 128,
+            extraction: LayerLimits::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PulledImage {
     pub reference: RegistryReference,
@@ -73,6 +99,7 @@ pub struct PulledImage {
     pub manifest: ImageManifest,
     pub config_digest: Digest,
     pub layer_digests: Vec<Digest>,
+    pub limits: ImagePullLimits,
 }
 
 impl PulledImage {
@@ -92,12 +119,14 @@ impl PulledImage {
             .parent()
             .ok_or_else(|| RegistryError::RootfsExists(root.into()))?;
         fs::create_dir_all(parent)?;
+        ensure_available_space(parent, self.limits.extraction.max_expanded_bytes)?;
         let temporary = parent.join(format!(
             ".{}.{}.tmp",
             self.manifest_digest.hex(),
             std::process::id()
         ));
         fs::create_dir(&temporary)?;
+        let mut budget = LayerBudget::new(self.limits.extraction);
         let materialized = self
             .manifest
             .layers
@@ -106,7 +135,7 @@ impl PulledImage {
             .try_for_each(|(descriptor, digest)| {
                 let file = fs::File::open(cas.blob_path(digest))?;
                 let compression = LayerCompression::from_media_type(&descriptor.media_type)?;
-                apply_layer(file, compression, &temporary)
+                apply_layer_with_budget(file, compression, &temporary, &mut budget)
             });
         if let Err(error) = materialized {
             let _ = fs::remove_dir_all(&temporary);
@@ -125,6 +154,7 @@ impl PulledImage {
 pub struct RegistryClient {
     client: reqwest::Client,
     credentials: Option<Credentials>,
+    limits: ImagePullLimits,
 }
 
 impl RegistryClient {
@@ -134,7 +164,14 @@ impl RegistryClient {
                 .user_agent(concat!("moraebox/", env!("CARGO_PKG_VERSION")))
                 .build()?,
             credentials,
+            limits: ImagePullLimits::default(),
         })
+    }
+
+    #[must_use]
+    pub fn with_limits(mut self, limits: ImagePullLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     pub async fn pull(
@@ -162,6 +199,11 @@ impl RegistryClient {
                     .into_iter()
                     .find(|descriptor| platform_matches(descriptor.platform.as_ref(), platform))
                     .ok_or_else(|| RegistryError::PlatformNotFound(platform.clone()))?;
+                verify_download_limit(
+                    "selected manifest",
+                    descriptor.size,
+                    self.limits.max_manifest_bytes,
+                )?;
                 let expected = Digest::from_str(&descriptor.digest)?;
                 let (selected, actual) = self
                     .get_manifest(&reference, &descriptor.digest, &mut authorization)
@@ -181,6 +223,7 @@ impl RegistryClient {
         if manifest.schema_version != 2 {
             return Err(RegistryError::UnsupportedSchema(manifest.schema_version));
         }
+        validate_manifest_limits(&manifest, &self.limits)?;
         let config_digest = self
             .fetch_blob(&reference, &manifest.config, &mut authorization, cas)
             .await?;
@@ -198,6 +241,7 @@ impl RegistryClient {
             manifest,
             config_digest,
             layer_digests,
+            limits: self.limits,
         })
     }
 
@@ -221,7 +265,8 @@ impl RegistryClient {
             .and_then(|value| value.to_str().ok())
             .map(Digest::from_str)
             .transpose()?;
-        let bytes = response.bytes().await?.to_vec();
+        let bytes =
+            read_bounded_response(response, "manifest", self.limits.max_manifest_bytes).await?;
         let actual = Digest::from_bytes(&bytes);
         if let Some(expected) = header_digest
             && expected != actual
@@ -239,10 +284,11 @@ impl RegistryClient {
         cas: &Cas,
     ) -> Result<Digest, RegistryError> {
         let digest = Digest::from_str(&descriptor.digest)?;
-        if tokio::fs::try_exists(cas.blob_path(&digest)).await? {
+        let blob_path = cas.blob_path(&digest);
+        if tokio::fs::try_exists(&blob_path).await? {
+            verify_descriptor_size_u64(descriptor, tokio::fs::metadata(&blob_path).await?.len())?;
             // Reading verifies an existing cache entry before trusting it.
-            let bytes = cas.read(&digest).await?;
-            verify_descriptor_size(descriptor, bytes.len())?;
+            cas.read(&digest).await?;
             return Ok(digest);
         }
         let url = format!(
@@ -253,8 +299,7 @@ impl RegistryClient {
         let response = self
             .get_authenticated(&url, reference, authorization, None)
             .await?;
-        let bytes = response.bytes().await?;
-        verify_descriptor_size(descriptor, bytes.len())?;
+        let bytes = read_descriptor_response(response, descriptor).await?;
         cas.put_verified(&digest, &bytes).await?;
         Ok(digest)
     }
@@ -341,6 +386,57 @@ impl RegistryClient {
     }
 }
 
+async fn read_bounded_response(
+    response: reqwest::Response,
+    resource: &'static str,
+    maximum: u64,
+) -> Result<Vec<u8>, RegistryError> {
+    if let Some(declared) = response.content_length() {
+        verify_download_limit(resource, declared, maximum)?;
+    }
+    let mut bytes = Vec::new();
+    let mut length = 0_u64;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        length = checked_download_length(resource, length, chunk.len(), maximum)?;
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn read_descriptor_response(
+    response: reqwest::Response,
+    descriptor: &Descriptor,
+) -> Result<Vec<u8>, RegistryError> {
+    if let Some(declared) = response.content_length()
+        && declared != descriptor.size
+    {
+        return Err(RegistryError::DescriptorSizeMismatch {
+            digest: descriptor.digest.clone(),
+            expected: descriptor.size,
+            actual: declared,
+        });
+    }
+    let mut bytes = Vec::new();
+    let mut length = 0_u64;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        length = length.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        if length > descriptor.size {
+            return Err(RegistryError::DescriptorSizeMismatch {
+                digest: descriptor.digest.clone(),
+                expected: descriptor.size,
+                actual: length,
+            });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    verify_descriptor_size(descriptor, bytes.len())?;
+    Ok(bytes)
+}
+
 fn platform_matches(actual: Option<&Platform>, expected: &Platform) -> bool {
     actual.is_some_and(|actual| {
         actual.os == expected.os
@@ -383,11 +479,96 @@ fn verify_manifest_descriptor(
     verify_descriptor_size(descriptor, actual_size)
 }
 
+fn validate_manifest_limits(
+    manifest: &ImageManifest,
+    limits: &ImagePullLimits,
+) -> Result<(), RegistryError> {
+    if manifest.layers.len() > limits.max_layers {
+        return Err(RegistryError::LayerCountLimitExceeded {
+            actual: manifest.layers.len(),
+            maximum: limits.max_layers,
+        });
+    }
+    verify_download_limit(
+        "configuration blob",
+        manifest.config.size,
+        limits.max_config_bytes,
+    )?;
+    let mut compressed = manifest.config.size;
+    for layer in &manifest.layers {
+        verify_download_limit("layer blob", layer.size, limits.max_layer_bytes)?;
+        compressed = compressed.saturating_add(layer.size);
+        if compressed > limits.max_compressed_bytes {
+            return Err(RegistryError::CompressedSizeLimitExceeded {
+                attempted: compressed,
+                maximum: limits.max_compressed_bytes,
+            });
+        }
+    }
+    if compressed > limits.max_compressed_bytes {
+        return Err(RegistryError::CompressedSizeLimitExceeded {
+            attempted: compressed,
+            maximum: limits.max_compressed_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn verify_download_limit(
+    resource: &'static str,
+    actual: u64,
+    maximum: u64,
+) -> Result<(), RegistryError> {
+    if actual > maximum {
+        return Err(RegistryError::DownloadLimitExceeded {
+            resource,
+            actual,
+            maximum,
+        });
+    }
+    Ok(())
+}
+
+fn checked_download_length(
+    resource: &'static str,
+    current: u64,
+    chunk: usize,
+    maximum: u64,
+) -> Result<u64, RegistryError> {
+    let actual = current.saturating_add(u64::try_from(chunk).unwrap_or(u64::MAX));
+    verify_download_limit(resource, actual, maximum)?;
+    Ok(actual)
+}
+
+fn ensure_available_space(path: &std::path::Path, required: u64) -> Result<(), RegistryError> {
+    let available = fs2::available_space(path)?;
+    verify_available_space(path, required, available)
+}
+
+fn verify_available_space(
+    path: &std::path::Path,
+    required: u64,
+    available: u64,
+) -> Result<(), RegistryError> {
+    if available < required {
+        return Err(RegistryError::InsufficientSpace {
+            path: path.to_path_buf(),
+            required,
+            available,
+        });
+    }
+    Ok(())
+}
+
 fn verify_descriptor_size(
     descriptor: &Descriptor,
     actual_size: usize,
 ) -> Result<(), RegistryError> {
     let actual = u64::try_from(actual_size).unwrap_or(u64::MAX);
+    verify_descriptor_size_u64(descriptor, actual)
+}
+
+fn verify_descriptor_size_u64(descriptor: &Descriptor, actual: u64) -> Result<(), RegistryError> {
     if descriptor.size != actual {
         return Err(RegistryError::DescriptorSizeMismatch {
             digest: descriptor.digest.clone(),
@@ -455,6 +636,25 @@ pub enum RegistryError {
         expected: u64,
         actual: u64,
     },
+    #[error("{resource} is {actual} bytes, exceeding the {maximum}-byte download limit")]
+    DownloadLimitExceeded {
+        resource: &'static str,
+        actual: u64,
+        maximum: u64,
+    },
+    #[error("OCI manifest has {actual} layers, exceeding the limit of {maximum}")]
+    LayerCountLimitExceeded { actual: usize, maximum: usize },
+    #[error("OCI blobs total {attempted} compressed bytes, exceeding the {maximum}-byte limit")]
+    CompressedSizeLimitExceeded { attempted: u64, maximum: u64 },
+    #[error(
+        "insufficient space at {}: {available} bytes available, {required} bytes required",
+        path.display()
+    )]
+    InsufficientSpace {
+        path: std::path::PathBuf,
+        required: u64,
+        available: u64,
+    },
     #[error("unsupported OCI schema version {0}")]
     UnsupportedSchema(u32),
     #[error("refusing to overwrite incomplete rootfs: {}", .0.display())]
@@ -471,7 +671,52 @@ pub enum RegistryError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Cursor, Write},
+        path::Path,
+    };
+
+    use flate2::{Compression, write::GzEncoder};
+
     use super::*;
+
+    fn descriptor(size: u64) -> Descriptor {
+        Descriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            digest: Digest::from_bytes(&size.to_le_bytes()).to_string(),
+            size,
+            platform: None,
+        }
+    }
+
+    fn limits_for_tests() -> ImagePullLimits {
+        ImagePullLimits {
+            max_manifest_bytes: 100,
+            max_config_bytes: 10,
+            max_layer_bytes: 10,
+            max_compressed_bytes: 20,
+            max_layers: 2,
+            extraction: LayerLimits::default(),
+        }
+    }
+
+    fn gzip_tar(path: &str, contents: &[u8]) -> Vec<u8> {
+        let mut archive = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut archive);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(u64::try_from(contents.len()).unwrap());
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, Cursor::new(contents))
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&archive).unwrap();
+        encoder.finish().unwrap()
+    }
 
     #[test]
     fn parses_bearer_challenge() {
@@ -536,5 +781,135 @@ mod tests {
             verify_manifest_descriptor(&descriptor, &expected, &actual, bytes.len()),
             Err(RegistryError::ManifestDigestMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_excessive_layer_count_before_download() {
+        let manifest = ImageManifest {
+            schema_version: 2,
+            media_type: None,
+            config: descriptor(1),
+            layers: vec![descriptor(1), descriptor(1), descriptor(1)],
+        };
+
+        assert!(matches!(
+            validate_manifest_limits(&manifest, &limits_for_tests()),
+            Err(RegistryError::LayerCountLimitExceeded {
+                actual: 3,
+                maximum: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_excessive_individual_and_aggregate_compressed_sizes() {
+        let limits = limits_for_tests();
+        let oversized_layer = ImageManifest {
+            schema_version: 2,
+            media_type: None,
+            config: descriptor(1),
+            layers: vec![descriptor(11)],
+        };
+        assert!(matches!(
+            validate_manifest_limits(&oversized_layer, &limits),
+            Err(RegistryError::DownloadLimitExceeded {
+                resource: "layer blob",
+                actual: 11,
+                maximum: 10
+            })
+        ));
+
+        let aggregate = ImageManifest {
+            schema_version: 2,
+            media_type: None,
+            config: descriptor(5),
+            layers: vec![descriptor(8), descriptor(8)],
+        };
+        assert!(matches!(
+            validate_manifest_limits(&aggregate, &limits),
+            Err(RegistryError::CompressedSizeLimitExceeded {
+                attempted: 21,
+                maximum: 20
+            })
+        ));
+    }
+
+    #[test]
+    fn bounded_body_length_rejects_the_first_oversized_chunk() {
+        assert_eq!(checked_download_length("manifest", 4, 5, 9).unwrap(), 9);
+        assert!(matches!(
+            checked_download_length("manifest", 9, 1, 9),
+            Err(RegistryError::DownloadLimitExceeded {
+                resource: "manifest",
+                actual: 10,
+                maximum: 9
+            })
+        ));
+    }
+
+    #[test]
+    fn free_space_preflight_reports_required_and_available_bytes() {
+        let path = Path::new("/cache");
+        verify_available_space(path, 10, 10).unwrap();
+        assert!(matches!(
+            verify_available_space(path, 10, 9),
+            Err(RegistryError::InsufficientSpace {
+                required: 10,
+                available: 9,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn extraction_quota_failure_removes_the_staging_rootfs() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = Cas::new(directory.path().join("cas"));
+        let compressed = gzip_tar("large", &[0; 4096]);
+        let layer_digest = Digest::from_bytes(&compressed);
+        cas.put_verified(&layer_digest, &compressed).await.unwrap();
+        let manifest_digest = Digest::from_bytes(b"manifest");
+        let layer = Descriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            digest: layer_digest.to_string(),
+            size: u64::try_from(compressed.len()).unwrap(),
+            platform: None,
+        };
+        let image = PulledImage {
+            reference: "example.com/a/b:latest".parse().unwrap(),
+            source_manifest_digest: manifest_digest.clone(),
+            manifest_digest: manifest_digest.clone(),
+            manifest: ImageManifest {
+                schema_version: 2,
+                media_type: None,
+                config: descriptor(0),
+                layers: vec![layer],
+            },
+            config_digest: Digest::from_bytes(&[]),
+            layer_digests: vec![layer_digest],
+            limits: ImagePullLimits {
+                extraction: LayerLimits {
+                    max_expanded_bytes: 1024,
+                    max_file_bytes: 1024,
+                    max_entries: 10,
+                },
+                ..limits_for_tests()
+            },
+        };
+        let rootfs = directory.path().join("rootfs");
+        let staging = directory.path().join(format!(
+            ".{}.{}.tmp",
+            manifest_digest.hex(),
+            std::process::id()
+        ));
+
+        let error = image.materialize_rootfs(&cas, &rootfs).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RegistryError::Layer(LayerError::FileSizeLimitExceeded { .. })
+        ));
+        assert!(!rootfs.exists());
+        assert!(!staging.exists());
     }
 }

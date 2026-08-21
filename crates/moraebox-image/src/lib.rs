@@ -14,9 +14,10 @@ pub use cache::{
     ImageCacheError, PreparedImage, PruneReport, RemoveReport,
 };
 pub use cas::{Cas, Digest};
-pub use layer::{LayerCompression, apply_layer};
+pub use layer::{LayerCompression, LayerLimits, apply_layer};
 pub use reference::{ImageReference, RegistryReference};
 pub use registry::{
-    Credentials, ImageManifest, Platform, PulledImage, RegistryClient, RegistryError,
+    Credentials, ImageManifest, ImagePullLimits, Platform, PulledImage, RegistryClient,
+    RegistryError,
 };
 pub use workspace::{WorkspaceError, WorkspaceSnapshot, WorkspaceStage, digest_tree};
