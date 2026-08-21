@@ -178,7 +178,7 @@
   - complete marker가 regular non-symlink file이고 예상 manifest digest를 담는지 확인한다.
   - atomic replace 후 parent directory를 fsync한다.
 
-- [ ] cache usage/list에서 rootfs를 매번 재귀 탐색하지 않도록 indexed metadata와 reconcile/repair를 제공한다.
+- [x] cache usage/list에서 rootfs를 매번 재귀 탐색하지 않도록 indexed metadata와 reconcile/repair를 제공한다.
   - logical size와 sparse/CoW physical allocation을 구분해 표시한다.
 
 - [ ] workspace snapshot의 source/image/source 반복 scan을 줄이면서 build 전후 source mutation 검증은 유지한다.

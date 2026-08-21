@@ -19,8 +19,9 @@ use moraebox_core::{
     resolve_cache_dir, resolve_state_dir,
 };
 use moraebox_image::{
-    CacheUsage, CachedImage, CleanReport, Credentials, ImageCache, Platform, PreparedImage,
-    PruneReport, RemoveReport, WorkspaceSnapshot, WorkspaceStage, digest_tree,
+    CacheReconcileReport, CacheUsage, CachedImage, CleanReport, Credentials, ImageCache, Platform,
+    PreparedImage, PruneReport, RemoveReport, RootfsMetadataIssueKind, WorkspaceSnapshot,
+    WorkspaceStage, digest_tree,
 };
 use moraebox_runtime::{
     Backend, BackendCapabilities, BoxRootSource, BoxRuntimeConfig, DoctorReport, IsolationLevel,
@@ -84,6 +85,9 @@ enum ImageCommand {
 enum CacheCommand {
     /// Show cache entry counts and disk usage.
     Info(CacheInfoArgs),
+    /// Check rootfs size metadata and optionally repair missing, stale, or orphan indexes.
+    #[command(visible_alias = "repair")]
+    Reconcile(CacheReconcileArgs),
     /// Remove OCI blobs and incomplete entries not referenced by a ready rootfs.
     Prune(CachePruneArgs),
     /// Remove all managed image, rootfs, OCI, and workspace cache entries.
@@ -362,6 +366,21 @@ struct CacheInfoArgs {
 }
 
 #[derive(Debug, Args)]
+struct CacheReconcileArgs {
+    /// Cache root; defaults to ~/.moraebox/cache.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Check and report changes without updating metadata.
+    #[arg(long, conflicts_with = "yes")]
+    dry_run: bool,
+    /// Repair rootfs metadata and remove orphan metadata without prompting.
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct CachePruneArgs {
     /// Cache root; defaults to ~/.moraebox/cache.
     #[arg(long)]
@@ -487,6 +506,9 @@ async fn execute(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         Command::Cache {
             command: CacheCommand::Info(args),
         } => cache_info(&args),
+        Command::Cache {
+            command: CacheCommand::Reconcile(args),
+        } => cache_reconcile(&args),
         Command::Cache {
             command: CacheCommand::Prune(args),
         } => cache_prune(&args),
@@ -1356,7 +1378,7 @@ fn image_default(args: &ImageDefaultArgs) -> Result<i32, Box<dyn std::error::Err
 }
 
 fn print_image_list(images: &[CachedImage]) {
-    println!("DEFAULT\tREFERENCE\tDIGEST\tPLATFORM\tSTATUS\tSIZE");
+    println!("DEFAULT\tREFERENCE\tDIGEST\tPLATFORM\tSTATUS\tLOGICAL\tALLOCATED");
     for image in images {
         let reference = image.reference.as_deref().unwrap_or("<unknown>");
         let platform = image.platform.as_ref().map_or_else(
@@ -1366,14 +1388,23 @@ fn print_image_list(images: &[CachedImage]) {
                 None => format!("{}/{}", platform.os, platform.architecture),
             },
         );
+        let (logical, allocated) = if image.size_indexed {
+            (
+                format_bytes(image.size_bytes),
+                format_bytes(image.allocated_bytes),
+            )
+        } else {
+            ("<unindexed>".into(), "<unindexed>".into())
+        };
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             if image.default { "*" } else { "" },
             reference,
             image.manifest_digest,
             platform,
             if image.ready { "ready" } else { "missing" },
-            format_bytes(image.size_bytes)
+            logical,
+            allocated,
         );
     }
 }
@@ -1418,6 +1449,18 @@ fn cache_info(args: &CacheInfoArgs) -> Result<i32, Box<dyn std::error::Error>> {
     Ok(0)
 }
 
+fn cache_reconcile(args: &CacheReconcileArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    let apply = destructive_mode(args.dry_run, args.yes, "cache reconcile")?;
+    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+    let report = ImageCache::new(cache_dir).reconcile(apply)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_reconcile_report(&report);
+    }
+    Ok(0)
+}
+
 fn cache_prune(args: &CachePruneArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let apply = destructive_mode(args.dry_run, args.yes, "cache prune")?;
     let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
@@ -1458,17 +1501,60 @@ fn destructive_mode(dry_run: bool, yes: bool, command: &str) -> Result<bool, Str
 fn print_cache_usage(usage: &CacheUsage) {
     println!("image references: {}", usage.references);
     println!("ready rootfs images: {}", usage.images);
-    println!("rootfs size: {}", format_bytes(usage.rootfs_bytes));
+    println!(
+        "rootfs size: {} logical, {} allocated",
+        format_bytes(usage.rootfs_bytes),
+        format_bytes(usage.rootfs_allocated_bytes)
+    );
+    println!(
+        "rootfs without valid size metadata: {}",
+        usage.rootfs_without_size_metadata
+    );
     println!("immutable Box base disks: {}", usage.base_disks);
     println!(
-        "Box base disk size: {}",
-        format_bytes(usage.base_disk_bytes)
+        "Box base disk size: {} logical, {} allocated",
+        format_bytes(usage.base_disk_bytes),
+        format_bytes(usage.base_disk_allocated_bytes)
     );
     println!("OCI blobs: {}", usage.oci_blobs);
-    println!("OCI size: {}", format_bytes(usage.oci_bytes));
+    println!(
+        "OCI size: {} logical, {} allocated",
+        format_bytes(usage.oci_bytes),
+        format_bytes(usage.oci_allocated_bytes)
+    );
     println!("workspace snapshots: {}", usage.workspaces);
-    println!("workspace size: {}", format_bytes(usage.workspace_bytes));
-    println!("total managed size: {}", format_bytes(usage.total_bytes));
+    println!(
+        "workspace size: {} logical, {} allocated",
+        format_bytes(usage.workspace_bytes),
+        format_bytes(usage.workspace_allocated_bytes)
+    );
+    println!(
+        "total managed size: {} logical, {} allocated",
+        format_bytes(usage.total_bytes),
+        format_bytes(usage.total_allocated_bytes)
+    );
+}
+
+fn print_reconcile_report(report: &CacheReconcileReport) {
+    println!("rootfs checked: {}", report.rootfs_checked);
+    println!("metadata repairs required: {}", report.repairs_required);
+    println!("metadata removals required: {}", report.removals_required);
+    if report.applied {
+        println!("metadata written: {}", report.metadata_written);
+        println!("metadata removed: {}", report.metadata_removed);
+    }
+    for issue in &report.issues {
+        let kind = match issue.kind {
+            RootfsMetadataIssueKind::Missing => "missing",
+            RootfsMetadataIssueKind::Invalid => "invalid",
+            RootfsMetadataIssueKind::Stale => "stale",
+            RootfsMetadataIssueKind::Orphan => "orphan",
+            RootfsMetadataIssueKind::IncompleteRootfs => "incomplete-rootfs",
+            RootfsMetadataIssueKind::InvalidRootfsName => "invalid-rootfs-name",
+        };
+        let digest = issue.manifest_digest.as_deref().unwrap_or("<unknown>");
+        println!("{kind}\t{digest}\t{}", issue.path.display());
+    }
 }
 
 fn print_prune_report(report: &PruneReport) {
@@ -2050,6 +2136,24 @@ mod tests {
 
     #[test]
     fn parses_cache_management_and_requires_all_for_clean() {
+        let reconcile = Cli::try_parse_from(["morae", "cache", "reconcile", "--dry-run"]).unwrap();
+        let Command::Cache {
+            command: CacheCommand::Reconcile(args),
+        } = reconcile.command
+        else {
+            panic!("expected cache reconcile command");
+        };
+        assert!(args.dry_run);
+
+        let repair = Cli::try_parse_from(["morae", "cache", "repair", "--yes"]).unwrap();
+        let Command::Cache {
+            command: CacheCommand::Reconcile(args),
+        } = repair.command
+        else {
+            panic!("expected cache repair alias");
+        };
+        assert!(args.yes);
+
         let prune = Cli::try_parse_from(["morae", "cache", "prune", "--dry-run"]).unwrap();
         let Command::Cache {
             command: CacheCommand::Prune(args),
@@ -2077,6 +2181,7 @@ mod tests {
         assert!(!destructive_mode(true, false, "cache prune").unwrap());
         assert!(destructive_mode(false, true, "cache prune").unwrap());
         assert!(destructive_mode(false, false, "cache prune").is_err());
+        assert!(destructive_mode(false, false, "cache reconcile").is_err());
     }
 
     #[test]

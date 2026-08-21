@@ -12,8 +12,9 @@ mod registry;
 mod workspace;
 
 pub use cache::{
-    BUILTIN_DEFAULT_IMAGE, CacheLock, CacheUsage, CachedImage, CleanReport, ImageCache,
-    ImageCacheError, PreparedImage, PruneReport, RemoveReport,
+    BUILTIN_DEFAULT_IMAGE, CacheLock, CacheReconcileReport, CacheUsage, CachedImage, CleanReport,
+    ImageCache, ImageCacheError, PreparedImage, PruneReport, RemoveReport, RootfsMetadataIssue,
+    RootfsMetadataIssueKind,
 };
 pub use cas::{Cas, Digest};
 pub use layer::{LayerCompression, LayerLimits, apply_layer};

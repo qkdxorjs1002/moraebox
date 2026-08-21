@@ -16,6 +16,7 @@ use crate::{
 };
 
 const SCHEMA_VERSION: u32 = 1;
+const ROOTFS_METADATA_SCHEMA_VERSION: u32 = 1;
 const CURRENT_COMPLETE_MARKER: &str = ".moraebox-rootfs-complete";
 const LEGACY_COMPLETE_MARKER: &str = ".fastmvm-rootfs-complete";
 pub const BUILTIN_DEFAULT_IMAGE: &str = "docker.io/library/python:3.12";
@@ -40,6 +41,8 @@ pub struct CachedImage {
     pub ready: bool,
     pub default: bool,
     pub size_bytes: u64,
+    pub allocated_bytes: u64,
+    pub size_indexed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -63,13 +66,50 @@ pub struct CacheUsage {
     pub references: usize,
     pub images: usize,
     pub rootfs_bytes: u64,
+    pub rootfs_allocated_bytes: u64,
+    pub rootfs_without_size_metadata: usize,
     pub base_disks: usize,
     pub base_disk_bytes: u64,
+    pub base_disk_allocated_bytes: u64,
     pub oci_blobs: usize,
     pub oci_bytes: u64,
+    pub oci_allocated_bytes: u64,
     pub workspaces: usize,
     pub workspace_bytes: u64,
+    pub workspace_allocated_bytes: u64,
     pub total_bytes: u64,
+    pub total_allocated_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CacheReconcileReport {
+    pub rootfs_checked: usize,
+    pub repairs_required: usize,
+    pub removals_required: usize,
+    pub metadata_written: usize,
+    pub metadata_removed: usize,
+    pub issues: Vec<RootfsMetadataIssue>,
+    pub applied: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RootfsMetadataIssue {
+    pub kind: RootfsMetadataIssueKind,
+    pub manifest_digest: Option<String>,
+    pub path: PathBuf,
+    pub logical_bytes: Option<u64>,
+    pub allocated_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RootfsMetadataIssueKind {
+    Missing,
+    Invalid,
+    Stale,
+    Orphan,
+    IncompleteRootfs,
+    InvalidRootfsName,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -110,18 +150,80 @@ struct StoredRecord {
     value: ImageRecord,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StorageUsage {
+    logical_bytes: u64,
+    allocated_bytes: u64,
+    entries: u64,
+}
+
+impl StorageUsage {
+    fn add(&mut self, other: Self) {
+        self.logical_bytes = self.logical_bytes.saturating_add(other.logical_bytes);
+        self.allocated_bytes = self.allocated_bytes.saturating_add(other.allocated_bytes);
+        self.entries = self.entries.saturating_add(other.entries);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RootfsMetadata {
+    schema_version: u32,
+    manifest_digest: String,
+    logical_bytes: u64,
+    allocated_bytes: u64,
+    entries: u64,
+}
+
+impl RootfsMetadata {
+    fn new(digest: &Digest, usage: StorageUsage) -> Self {
+        Self {
+            schema_version: ROOTFS_METADATA_SCHEMA_VERSION,
+            manifest_digest: digest.to_string(),
+            logical_bytes: usage.logical_bytes,
+            allocated_bytes: usage.allocated_bytes,
+            entries: usage.entries,
+        }
+    }
+
+    fn usage(&self) -> StorageUsage {
+        StorageUsage {
+            logical_bytes: self.logical_bytes,
+            allocated_bytes: self.allocated_bytes,
+            entries: self.entries,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RootfsMetadataState {
+    Missing,
+    Invalid,
+    Valid(RootfsMetadata),
+}
+
+impl RootfsMetadataState {
+    fn usage(&self) -> Option<StorageUsage> {
+        match self {
+            Self::Valid(metadata) => Some(metadata.usage()),
+            Self::Missing | Self::Invalid => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RootfsEntry {
     digest: Digest,
     path: PathBuf,
     ready: bool,
-    size_bytes: u64,
+    valid_digest_name: bool,
+    metadata: RootfsMetadataState,
 }
 
 #[derive(Debug)]
 struct StagedRootfs {
     directory: PathBuf,
     rootfs: PathBuf,
+    metadata: Option<RootfsMetadata>,
 }
 
 impl StagedRootfs {
@@ -134,7 +236,11 @@ impl StagedRootfs {
             sequence
         ));
         let rootfs = directory.join("rootfs");
-        Self { directory, rootfs }
+        Self {
+            directory,
+            rootfs,
+            metadata: None,
+        }
     }
 
     fn publish(&self, destination: &Path) -> Result<(), ImageCacheError> {
@@ -320,9 +426,9 @@ impl ImageCache {
             rootfs,
             ready: true,
             default: record.reference == default,
-            // Size calculation recursively walks the rootfs and intentionally belongs only to
-            // management operations such as `list` and `usage`, never the run hot path.
             size_bytes: 0,
+            allocated_bytes: 0,
+            size_indexed: false,
         }))
     }
 
@@ -346,8 +452,13 @@ impl ImageCache {
         let materialize_cas = cas.clone();
         let materialize_rootfs = staging.rootfs.clone();
         let staging = tokio::task::spawn_blocking(move || {
+            let mut staging = staging;
             materialize_image.materialize_rootfs(&materialize_cas, &materialize_rootfs)?;
-            Ok::<_, RegistryError>(staging)
+            staging.metadata = Some(RootfsMetadata::new(
+                &materialize_image.manifest_digest,
+                tree_storage_usage(&materialize_rootfs)?,
+            ));
+            Ok::<_, ImageCacheError>(staging)
         })
         .await
         .map_err(|error| ImageCacheError::Task(error.to_string()))??;
@@ -370,15 +481,34 @@ impl ImageCache {
         platform: &Platform,
     ) -> Result<PreparedImage, ImageCacheError> {
         let rootfs = self.rootfs_path(manifest_digest);
+        let staged_metadata = staging
+            .metadata
+            .clone()
+            .ok_or_else(|| ImageCacheError::MissingRootfsMetadata(staging.rootfs.clone()))?;
         let _digest = AdvisoryLock::acquire(&self.rootfs_lock_path(manifest_digest)).await?;
-        let _metadata = AdvisoryLock::acquire(&self.metadata_lock_path()).await?;
-        if !is_complete_rootfs(&rootfs, manifest_digest) {
+        let rootfs_metadata = if is_complete_rootfs(&rootfs, manifest_digest) {
+            match self.read_rootfs_metadata(manifest_digest)? {
+                RootfsMetadataState::Valid(metadata) => metadata,
+                RootfsMetadataState::Missing | RootfsMetadataState::Invalid => {
+                    let rootfs = rootfs.clone();
+                    let digest = manifest_digest.clone();
+                    tokio::task::spawn_blocking(move || {
+                        tree_storage_usage(&rootfs).map(|usage| RootfsMetadata::new(&digest, usage))
+                    })
+                    .await
+                    .map_err(|error| ImageCacheError::Task(error.to_string()))??
+                }
+            }
+        } else {
             if rootfs.exists() {
                 return Err(RegistryError::RootfsExists(rootfs.clone()).into());
             }
             fs::create_dir_all(self.rootfs_directory())?;
             staging.publish(&rootfs)?;
-        }
+            staged_metadata
+        };
+        let _metadata = AdvisoryLock::acquire(&self.metadata_lock_path()).await?;
+        self.write_rootfs_metadata(manifest_digest, &rootfs_metadata, false)?;
         self.record_pulled_image(reference, source_manifest_digest, manifest_digest, platform)?;
         Ok(PreparedImage {
             reference: reference.into(),
@@ -463,7 +593,9 @@ impl ImageCache {
             }
         }
 
-        let reclaimed_bytes = roots_to_remove.iter().map(|entry| entry.size_bytes).sum();
+        let reclaimed_bytes = roots_to_remove.iter().try_fold(0_u64, |total, entry| {
+            rootfs_entry_logical_size(entry).map(|bytes| total.saturating_add(bytes))
+        })?;
         let mut references_removed = records_to_remove
             .iter()
             .map(|record| record.value.reference.clone())
@@ -481,6 +613,7 @@ impl ImageCache {
             }
             for root in &roots_to_remove {
                 remove_managed_directory(&root.path)?;
+                remove_file_if_exists(&self.rootfs_metadata_path(&root.digest))?;
             }
         }
 
@@ -496,6 +629,110 @@ impl ImageCache {
     pub fn usage(&self) -> Result<CacheUsage, ImageCacheError> {
         let _lock = self.lock_shared()?;
         self.usage_unlocked()
+    }
+
+    pub fn reconcile(&self, apply: bool) -> Result<CacheReconcileReport, ImageCacheError> {
+        let _activity = self.lock_activity(true)?;
+        let _metadata = self.lock(apply)?;
+        let roots = self.read_rootfs_entries()?;
+        let root_digests = roots
+            .iter()
+            .filter(|entry| entry.valid_digest_name)
+            .map(|entry| entry.digest.clone())
+            .collect::<BTreeSet<_>>();
+        let mut report = CacheReconcileReport {
+            rootfs_checked: 0,
+            repairs_required: 0,
+            removals_required: 0,
+            metadata_written: 0,
+            metadata_removed: 0,
+            issues: Vec::new(),
+            applied: apply,
+        };
+
+        for root in &roots {
+            if !root.valid_digest_name {
+                report.issues.push(rootfs_metadata_issue(
+                    RootfsMetadataIssueKind::InvalidRootfsName,
+                    None,
+                    root.path.clone(),
+                    None,
+                ));
+                continue;
+            }
+            if !root.ready {
+                report.issues.push(rootfs_metadata_issue(
+                    RootfsMetadataIssueKind::IncompleteRootfs,
+                    Some(&root.digest),
+                    root.path.clone(),
+                    None,
+                ));
+                if !matches!(root.metadata, RootfsMetadataState::Missing) {
+                    report.removals_required += 1;
+                    if apply
+                        && remove_managed_path_if_exists(&self.rootfs_metadata_path(&root.digest))?
+                    {
+                        report.metadata_removed += 1;
+                    }
+                }
+                continue;
+            }
+
+            report.rootfs_checked += 1;
+            let actual_usage = tree_storage_usage(&root.path)?;
+            let actual = RootfsMetadata::new(&root.digest, actual_usage);
+            let issue_kind = match &root.metadata {
+                RootfsMetadataState::Missing => Some(RootfsMetadataIssueKind::Missing),
+                RootfsMetadataState::Invalid => Some(RootfsMetadataIssueKind::Invalid),
+                RootfsMetadataState::Valid(indexed) if indexed != &actual => {
+                    Some(RootfsMetadataIssueKind::Stale)
+                }
+                RootfsMetadataState::Valid(_) => None,
+            };
+            if let Some(kind) = issue_kind {
+                report.repairs_required += 1;
+                report.issues.push(rootfs_metadata_issue(
+                    kind,
+                    Some(&root.digest),
+                    self.rootfs_metadata_path(&root.digest),
+                    Some(actual_usage),
+                ));
+                if apply {
+                    self.write_rootfs_metadata(&root.digest, &actual, true)?;
+                    report.metadata_written += 1;
+                }
+            }
+        }
+
+        let mut metadata_entries = read_entries(&self.rootfs_metadata_directory())?;
+        metadata_entries.sort_by_key(fs::DirEntry::path);
+        for entry in metadata_entries {
+            let path = entry.path();
+            let digest = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .and_then(|value| parse_digest_hex(value).ok());
+            if digest
+                .as_ref()
+                .is_some_and(|digest| root_digests.contains(digest))
+            {
+                continue;
+            }
+            report.removals_required += 1;
+            report.issues.push(rootfs_metadata_issue(
+                RootfsMetadataIssueKind::Orphan,
+                digest.as_ref(),
+                path.clone(),
+                None,
+            ));
+            if apply && remove_managed_path_if_exists(&path)? {
+                report.metadata_removed += 1;
+            }
+        }
+        report
+            .issues
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(report)
     }
 
     pub fn prune(&self, apply: bool) -> Result<PruneReport, ImageCacheError> {
@@ -537,15 +774,23 @@ impl ImageCache {
                     .map_or(true, |digest| !complete.contains(&digest))
             })
             .collect::<Vec<_>>();
-        let reclaimed_bytes = blobs_to_remove.iter().map(|(_, bytes)| bytes).sum::<u64>()
-            + incomplete_roots
-                .iter()
-                .map(|entry| entry.size_bytes)
-                .sum::<u64>()
-            + stale_records
-                .iter()
-                .map(|record| file_size(&record.path).unwrap_or(0))
-                .sum::<u64>();
+        let incomplete_rootfs_bytes = incomplete_roots.iter().try_fold(
+            0_u64,
+            |total, entry| -> Result<_, ImageCacheError> {
+                Ok(total.saturating_add(rootfs_entry_logical_size(entry)?))
+            },
+        )?;
+        let reclaimed_bytes = blobs_to_remove
+            .iter()
+            .map(|(_, bytes)| bytes)
+            .sum::<u64>()
+            .saturating_add(incomplete_rootfs_bytes)
+            .saturating_add(
+                stale_records
+                    .iter()
+                    .map(|record| file_size(&record.path).unwrap_or(0))
+                    .sum::<u64>(),
+            );
 
         if apply {
             for (path, _) in &blobs_to_remove {
@@ -553,6 +798,9 @@ impl ImageCache {
             }
             for root in &incomplete_roots {
                 remove_managed_directory(&root.path)?;
+                if root.valid_digest_name {
+                    remove_file_if_exists(&self.rootfs_metadata_path(&root.digest))?;
+                }
             }
             for record in &stale_records {
                 remove_file_if_exists(&record.path)?;
@@ -575,6 +823,7 @@ impl ImageCache {
             self.root.join("images"),
             self.root.join("oci"),
             self.root.join("rootfs"),
+            self.root.join("rootfs-metadata"),
             self.root.join("box-bases"),
             self.root.join("workspaces"),
             self.default_path(),
@@ -651,7 +900,13 @@ impl ImageCache {
                 rootfs: rootfs_path,
                 ready: root.is_some_and(|entry| entry.ready),
                 default: is_default,
-                size_bytes: root.map_or(0, |entry| entry.size_bytes),
+                size_bytes: root
+                    .and_then(|entry| entry.metadata.usage())
+                    .map_or(0, |usage| usage.logical_bytes),
+                allocated_bytes: root
+                    .and_then(|entry| entry.metadata.usage())
+                    .map_or(0, |usage| usage.allocated_bytes),
+                size_indexed: root.is_some_and(|entry| entry.metadata.usage().is_some()),
             });
         }
 
@@ -664,7 +919,12 @@ impl ImageCache {
                     rootfs: root.path,
                     ready: root.ready,
                     default: false,
-                    size_bytes: root.size_bytes,
+                    size_bytes: root.metadata.usage().map_or(0, |usage| usage.logical_bytes),
+                    allocated_bytes: root
+                        .metadata
+                        .usage()
+                        .map_or(0, |usage| usage.allocated_bytes),
+                    size_indexed: root.metadata.usage().is_some(),
                 });
             }
         }
@@ -680,22 +940,46 @@ impl ImageCache {
         let references = self.read_records()?.len();
         let roots = self.read_rootfs_entries()?;
         let images = roots.iter().filter(|entry| entry.ready).count();
-        let rootfs_bytes = roots.iter().map(|entry| entry.size_bytes).sum();
-        let (base_disks, base_disk_bytes) = count_base_disks(&self.root.join("box-bases"))?;
-        let (oci_blobs, oci_bytes) = count_regular_files(&self.blob_directory())?;
-        let (workspaces, workspace_bytes) =
+        let rootfs_usage = roots
+            .iter()
+            .filter_map(|entry| entry.metadata.usage())
+            .fold(StorageUsage::default(), |mut total, usage| {
+                total.add(usage);
+                total
+            });
+        let rootfs_without_size_metadata = roots
+            .iter()
+            .filter(|entry| entry.metadata.usage().is_none())
+            .count();
+        let (base_disks, base_disk_usage) = count_base_disks(&self.root.join("box-bases"))?;
+        let (oci_blobs, oci_usage) = count_regular_files(&self.blob_directory())?;
+        let (workspaces, workspace_usage) =
             count_regular_files(&self.root.join("workspaces/sha256"))?;
         Ok(CacheUsage {
             references,
             images,
-            rootfs_bytes,
+            rootfs_bytes: rootfs_usage.logical_bytes,
+            rootfs_allocated_bytes: rootfs_usage.allocated_bytes,
+            rootfs_without_size_metadata,
             base_disks,
-            base_disk_bytes,
+            base_disk_bytes: base_disk_usage.logical_bytes,
+            base_disk_allocated_bytes: base_disk_usage.allocated_bytes,
             oci_blobs,
-            oci_bytes,
+            oci_bytes: oci_usage.logical_bytes,
+            oci_allocated_bytes: oci_usage.allocated_bytes,
             workspaces,
-            workspace_bytes,
-            total_bytes: rootfs_bytes + base_disk_bytes + oci_bytes + workspace_bytes,
+            workspace_bytes: workspace_usage.logical_bytes,
+            workspace_allocated_bytes: workspace_usage.allocated_bytes,
+            total_bytes: rootfs_usage
+                .logical_bytes
+                .saturating_add(base_disk_usage.logical_bytes)
+                .saturating_add(oci_usage.logical_bytes)
+                .saturating_add(workspace_usage.logical_bytes),
+            total_allocated_bytes: rootfs_usage
+                .allocated_bytes
+                .saturating_add(base_disk_usage.allocated_bytes)
+                .saturating_add(oci_usage.allocated_bytes)
+                .saturating_add(workspace_usage.allocated_bytes),
         })
     }
 
@@ -763,18 +1047,20 @@ impl ImageCache {
                 let path = entry.path();
                 roots.push(RootfsEntry {
                     digest: Digest::from_bytes(path.as_os_str().as_encoded_bytes()),
-                    size_bytes: path_size(&path)?,
                     path,
                     ready: false,
+                    valid_digest_name: false,
+                    metadata: RootfsMetadataState::Missing,
                 });
                 continue;
             };
             let path = entry.path();
             roots.push(RootfsEntry {
                 ready: is_complete_rootfs(&path, &digest),
-                size_bytes: path_size(&path)?,
+                metadata: self.read_rootfs_metadata(&digest)?,
                 path,
                 digest,
+                valid_digest_name: true,
             });
         }
         roots.sort_by(|left, right| left.path.cmp(&right.path));
@@ -867,6 +1153,62 @@ impl ImageCache {
         self.rootfs_directory().join(digest.hex())
     }
 
+    fn rootfs_metadata_directory(&self) -> PathBuf {
+        self.root.join("rootfs-metadata/sha256")
+    }
+
+    fn rootfs_metadata_path(&self, digest: &Digest) -> PathBuf {
+        self.rootfs_metadata_directory()
+            .join(format!("{}.json", digest.hex()))
+    }
+
+    fn read_rootfs_metadata(
+        &self,
+        digest: &Digest,
+    ) -> Result<RootfsMetadataState, ImageCacheError> {
+        let path = self.rootfs_metadata_path(digest);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RootfsMetadataState::Missing);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Ok(RootfsMetadataState::Invalid);
+        }
+        let Some(value) = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<RootfsMetadata>(&bytes).ok())
+        else {
+            return Ok(RootfsMetadataState::Invalid);
+        };
+        if value.schema_version != ROOTFS_METADATA_SCHEMA_VERSION
+            || value.manifest_digest != digest.to_string()
+        {
+            return Ok(RootfsMetadataState::Invalid);
+        }
+        Ok(RootfsMetadataState::Valid(value))
+    }
+
+    fn write_rootfs_metadata(
+        &self,
+        digest: &Digest,
+        metadata: &RootfsMetadata,
+        replace_unmanaged_type: bool,
+    ) -> Result<(), ImageCacheError> {
+        let path = self.rootfs_metadata_path(digest);
+        if fs::symlink_metadata(&path)
+            .is_ok_and(|value| !value.is_file() || value.file_type().is_symlink())
+        {
+            if !replace_unmanaged_type {
+                return Err(ImageCacheError::InvalidManagedPath(path));
+            }
+            remove_managed_path(&path)?;
+        }
+        write_json_atomic(&path, metadata)
+    }
+
     fn blob_directory(&self) -> PathBuf {
         self.root.join("oci/blobs/sha256")
     }
@@ -889,6 +1231,28 @@ fn prepared_image(image: CachedImage) -> PreparedImage {
             .expect("resolved cache entries always have a reference"),
         manifest_digest: image.manifest_digest,
         rootfs: image.rootfs,
+    }
+}
+
+fn rootfs_metadata_issue(
+    kind: RootfsMetadataIssueKind,
+    digest: Option<&Digest>,
+    path: PathBuf,
+    usage: Option<StorageUsage>,
+) -> RootfsMetadataIssue {
+    RootfsMetadataIssue {
+        kind,
+        manifest_digest: digest.map(ToString::to_string),
+        path,
+        logical_bytes: usage.map(|usage| usage.logical_bytes),
+        allocated_bytes: usage.map(|usage| usage.allocated_bytes),
+    }
+}
+
+fn rootfs_entry_logical_size(entry: &RootfsEntry) -> Result<u64, ImageCacheError> {
+    match entry.metadata.usage() {
+        Some(usage) => Ok(usage.logical_bytes),
+        None => path_size(&entry.path),
     }
 }
 
@@ -986,7 +1350,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), ImageCa
     serde_json::to_writer_pretty(&temporary_file, value)?;
     temporary_file.sync_all()?;
     drop(temporary_file);
-    match fs::rename(&temporary, path) {
+    let result = match fs::rename(&temporary, path) {
         Ok(()) => Ok(()),
         Err(_) => match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
@@ -1003,7 +1367,10 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), ImageCa
                 Err(error.into())
             }
         },
-    }
+    };
+    result?;
+    sync_directory(parent)?;
+    Ok(())
 }
 
 fn read_entries(path: &Path) -> Result<Vec<fs::DirEntry>, ImageCacheError> {
@@ -1032,37 +1399,104 @@ fn path_size(path: &Path) -> Result<u64, ImageCacheError> {
     Ok(bytes)
 }
 
+fn tree_storage_usage(path: &Path) -> Result<StorageUsage, ImageCacheError> {
+    let mut seen = BTreeSet::new();
+    tree_storage_usage_inner(path, &mut seen)
+}
+
+fn tree_storage_usage_inner(
+    path: &Path,
+    seen: &mut BTreeSet<(u64, u64)>,
+) -> Result<StorageUsage, ImageCacheError> {
+    let metadata = fs::symlink_metadata(path)?;
+    let file_type = metadata.file_type();
+    let mut usage = StorageUsage {
+        logical_bytes: if file_type.is_symlink() || metadata.is_file() {
+            metadata.len()
+        } else {
+            0
+        },
+        allocated_bytes: allocated_bytes(&metadata),
+        entries: 1,
+    };
+
+    if !metadata.is_dir() || file_type.is_symlink() {
+        if is_duplicate_file(&metadata, seen) {
+            return Ok(StorageUsage::default());
+        }
+        return Ok(usage);
+    }
+
+    for entry in fs::read_dir(path)? {
+        usage.add(tree_storage_usage_inner(&entry?.path(), seen)?);
+    }
+    Ok(usage)
+}
+
+#[cfg(unix)]
+fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
+    metadata.len()
+}
+
+#[cfg(unix)]
+fn is_duplicate_file(metadata: &fs::Metadata, seen: &mut BTreeSet<(u64, u64)>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    !seen.insert((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn is_duplicate_file(_metadata: &fs::Metadata, _seen: &mut BTreeSet<(u64, u64)>) -> bool {
+    false
+}
+
 fn file_size(path: &Path) -> Result<u64, ImageCacheError> {
     Ok(fs::symlink_metadata(path)?.len())
 }
 
-fn count_regular_files(path: &Path) -> Result<(usize, u64), ImageCacheError> {
+fn count_regular_files(path: &Path) -> Result<(usize, StorageUsage), ImageCacheError> {
     let mut count = 0;
-    let mut bytes = 0;
+    let mut usage = StorageUsage::default();
     for entry in read_entries(path)? {
         if entry.file_type()?.is_file() {
+            let metadata = entry.metadata()?;
             count += 1;
-            bytes += entry.metadata()?.len();
+            usage.logical_bytes = usage.logical_bytes.saturating_add(metadata.len());
+            usage.allocated_bytes = usage
+                .allocated_bytes
+                .saturating_add(allocated_bytes(&metadata));
+            usage.entries = usage.entries.saturating_add(1);
         }
     }
-    Ok((count, bytes))
+    Ok((count, usage))
 }
 
-fn count_base_disks(path: &Path) -> Result<(usize, u64), ImageCacheError> {
+fn count_base_disks(path: &Path) -> Result<(usize, StorageUsage), ImageCacheError> {
     let mut count = 0;
-    let mut bytes = 0_u64;
+    let mut usage = StorageUsage::default();
     for entry in read_entries(path)? {
-        let metadata = entry.metadata()?;
+        let metadata = fs::symlink_metadata(entry.path())?;
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            let (child_count, child_bytes) = count_base_disks(&entry.path())?;
+            let (child_count, child_usage) = count_base_disks(&entry.path())?;
             count += child_count;
-            bytes = bytes.saturating_add(child_bytes);
+            usage.add(child_usage);
         } else if metadata.is_file() && entry.file_name() == "root.ext4" {
             count += 1;
-            bytes = bytes.saturating_add(metadata.len());
+            usage.logical_bytes = usage.logical_bytes.saturating_add(metadata.len());
+            usage.allocated_bytes = usage
+                .allocated_bytes
+                .saturating_add(allocated_bytes(&metadata));
+            usage.entries = usage.entries.saturating_add(1);
         }
     }
-    Ok((count, bytes))
+    Ok((count, usage))
 }
 
 fn remove_file_if_exists(path: &Path) -> Result<bool, ImageCacheError> {
@@ -1094,6 +1528,17 @@ fn remove_managed_path(path: &Path) -> Result<(), ImageCacheError> {
     Ok(())
 }
 
+fn remove_managed_path_if_exists(path: &Path) -> Result<bool, ImageCacheError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            remove_managed_path(path)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ImageCacheError {
     #[error("image cache is busy at {}; wait for the other operation to finish: {source}", .path.display())]
@@ -1121,6 +1566,8 @@ pub enum ImageCacheError {
     InvalidManifest(String),
     #[error("refusing to operate on unmanaged cache path: {}", .0.display())]
     InvalidManagedPath(PathBuf),
+    #[error("materialized rootfs is missing indexed metadata: {}", .0.display())]
+    MissingRootfsMetadata(PathBuf),
     #[error("image cache JSON is invalid: {0}")]
     Json(#[from] serde_json::Error),
     #[error("image cache I/O failed: {0}")]
@@ -1199,6 +1646,13 @@ mod tests {
             )
             .unwrap();
             fs::write(rootfs.join("payload"), b"rootfs").unwrap();
+            let rootfs_metadata =
+                RootfsMetadata::new(&manifest_digest, tree_storage_usage(&rootfs).unwrap());
+            write_json_atomic(
+                &self.cache.rootfs_metadata_path(&manifest_digest),
+                &rootfs_metadata,
+            )
+            .unwrap();
             if let Some(reference) = reference {
                 let lock = self.cache.lock_exclusive().unwrap();
                 self.cache
@@ -1348,6 +1802,7 @@ mod tests {
         assert!(fixture.cache.rootfs_path(&digest).is_dir());
         fixture.cache.remove("python:latest", true).unwrap();
         assert!(!fixture.cache.rootfs_path(&digest).exists());
+        assert!(!fixture.cache.rootfs_metadata_path(&digest).exists());
     }
 
     #[test]
@@ -1370,6 +1825,120 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert!(images[0].reference.is_none());
         assert_eq!(images[0].manifest_digest, digest.to_string());
+        assert!(images[0].size_indexed);
+    }
+
+    #[test]
+    fn list_and_usage_use_indexed_rootfs_size_without_rescanning() {
+        let fixture = Fixture::new();
+        let digest = fixture.add_image(Some("python:3.12"));
+        let before = fixture.cache.list().unwrap().remove(0);
+        fs::write(
+            fixture.cache.rootfs_path(&digest).join("added-after-index"),
+            vec![0_u8; 32 * 1024],
+        )
+        .unwrap();
+
+        let after = fixture.cache.list().unwrap().remove(0);
+        let usage = fixture.cache.usage().unwrap();
+        assert!(after.size_indexed);
+        assert_eq!(after.size_bytes, before.size_bytes);
+        assert_eq!(after.allocated_bytes, before.allocated_bytes);
+        assert_eq!(usage.rootfs_bytes, before.size_bytes);
+        assert_eq!(usage.rootfs_allocated_bytes, before.allocated_bytes);
+        assert_eq!(usage.rootfs_without_size_metadata, 0);
+    }
+
+    #[test]
+    fn reconcile_previews_and_repairs_missing_rootfs_metadata() {
+        let fixture = Fixture::new();
+        let digest = fixture.add_image(Some("python:3.12"));
+        fs::remove_file(fixture.cache.rootfs_metadata_path(&digest)).unwrap();
+
+        let image = fixture.cache.list().unwrap().remove(0);
+        let usage = fixture.cache.usage().unwrap();
+        assert!(!image.size_indexed);
+        assert_eq!(image.size_bytes, 0);
+        assert_eq!(usage.rootfs_without_size_metadata, 1);
+
+        let preview = fixture.cache.reconcile(false).unwrap();
+        assert!(!preview.applied);
+        assert_eq!(preview.repairs_required, 1);
+        assert_eq!(preview.metadata_written, 0);
+        assert_eq!(preview.issues[0].kind, RootfsMetadataIssueKind::Missing);
+
+        let repaired = fixture.cache.reconcile(true).unwrap();
+        assert_eq!(repaired.metadata_written, 1);
+        assert!(fixture.cache.list().unwrap()[0].size_indexed);
+        assert_eq!(
+            fixture.cache.usage().unwrap().rootfs_without_size_metadata,
+            0
+        );
+    }
+
+    #[test]
+    fn reconcile_replaces_invalid_and_stale_rootfs_metadata() {
+        let fixture = Fixture::new();
+        let digest = fixture.add_image(None);
+        let metadata_path = fixture.cache.rootfs_metadata_path(&digest);
+        fs::write(&metadata_path, b"not-json").unwrap();
+        let invalid = fixture.cache.reconcile(false).unwrap();
+        assert_eq!(invalid.issues[0].kind, RootfsMetadataIssueKind::Invalid);
+        fixture.cache.reconcile(true).unwrap();
+
+        fs::write(
+            fixture.cache.rootfs_path(&digest).join("new-payload"),
+            b"new",
+        )
+        .unwrap();
+        let stale = fixture.cache.reconcile(false).unwrap();
+        assert_eq!(stale.issues[0].kind, RootfsMetadataIssueKind::Stale);
+        assert_eq!(stale.repairs_required, 1);
+        fixture.cache.reconcile(true).unwrap();
+        assert!(fixture.cache.reconcile(false).unwrap().issues.is_empty());
+    }
+
+    #[test]
+    fn reconcile_removes_orphan_rootfs_metadata_only_when_applied() {
+        let fixture = Fixture::new();
+        let digest = fixture.add_image(None);
+        let metadata_path = fixture.cache.rootfs_metadata_path(&digest);
+        remove_managed_directory(&fixture.cache.rootfs_path(&digest)).unwrap();
+
+        let preview = fixture.cache.reconcile(false).unwrap();
+        assert_eq!(preview.removals_required, 1);
+        assert_eq!(preview.metadata_removed, 0);
+        assert_eq!(preview.issues[0].kind, RootfsMetadataIssueKind::Orphan);
+        assert!(metadata_path.is_file());
+
+        let repaired = fixture.cache.reconcile(true).unwrap();
+        assert_eq!(repaired.metadata_removed, 1);
+        assert!(!metadata_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_storage_usage_counts_hard_links_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        fs::write(&original, b"payload").unwrap();
+        fs::hard_link(&original, directory.path().join("linked")).unwrap();
+
+        let usage = tree_storage_usage(directory.path()).unwrap();
+        assert_eq!(usage.logical_bytes, 7);
+        assert_eq!(usage.entries, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_storage_usage_distinguishes_sparse_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let sparse = File::create(directory.path().join("sparse")).unwrap();
+        sparse.set_len(16 * 1024 * 1024).unwrap();
+
+        let usage = tree_storage_usage(directory.path()).unwrap();
+        assert_eq!(usage.logical_bytes, 16 * 1024 * 1024);
+        assert!(usage.allocated_bytes < usage.logical_bytes);
     }
 
     #[test]
@@ -1511,6 +2080,10 @@ mod tests {
             &fixture.cache.rootfs_path(&digest),
             &digest
         ));
+        assert!(matches!(
+            fixture.cache.read_rootfs_metadata(&digest).unwrap(),
+            RootfsMetadataState::Valid(_)
+        ));
         assert!(!first_directory.exists());
         assert!(!second_directory.exists());
         assert!(
@@ -1553,7 +2126,7 @@ mod tests {
     }
 
     fn staged_rootfs(cache: &ImageCache, digest: &Digest, payload: &[u8]) -> StagedRootfs {
-        let staging = StagedRootfs::new(cache.root(), digest);
+        let mut staging = StagedRootfs::new(cache.root(), digest);
         fs::create_dir_all(&staging.rootfs).unwrap();
         fs::write(
             staging.rootfs.join(CURRENT_COMPLETE_MARKER),
@@ -1561,6 +2134,10 @@ mod tests {
         )
         .unwrap();
         fs::write(staging.rootfs.join("payload"), payload).unwrap();
+        staging.metadata = Some(RootfsMetadata::new(
+            digest,
+            tree_storage_usage(&staging.rootfs).unwrap(),
+        ));
         staging
     }
 }
