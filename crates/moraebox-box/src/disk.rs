@@ -5,6 +5,7 @@ use std::{
     process::Command,
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 use fs2::FileExt;
@@ -13,9 +14,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    BoxDiskFormat, BoxStoreError, now_unix_millis, remove_managed_directory, secure_directory,
-    set_file_permissions, sync_parent, validate_directory, validate_regular_file,
-    write_json_atomic,
+    BoxDiskFormat, BoxStoreError, DEFAULT_GC_MIN_AGE, GarbageCollectionLock,
+    GarbageCollectionReport, garbage_collection_candidate_is_old, garbage_collection_lock,
+    now_unix_millis, remove_managed_directory, secure_directory, set_file_permissions, sync_parent,
+    validate_directory, validate_regular_file, write_json_atomic,
 };
 
 pub const BASE_DISK_LAYOUT_VERSION: u32 = 1;
@@ -166,16 +168,7 @@ impl BaseDiskStore {
         let key = spec.key()?;
         let bases = self.bases_directory();
         secure_directory(&bases)?;
-        let locks = bases.join(LOCKS_DIRECTORY);
-        secure_directory(&locks)?;
-        let lock_path = locks.join(format!("{key}.lock"));
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        set_file_permissions(&lock_path)?;
+        let (lock, lock_path) = self.open_base_lock(&key)?;
         FileExt::lock_exclusive(&lock).map_err(|source| BoxStoreError::BaseDiskBusy {
             path: lock_path,
             source,
@@ -245,6 +238,70 @@ impl BaseDiskStore {
         result
     }
 
+    pub fn garbage_collect(&self) -> Result<GarbageCollectionReport, BoxStoreError> {
+        self.garbage_collect_older_than(DEFAULT_GC_MIN_AGE)
+    }
+
+    pub fn garbage_collect_older_than(
+        &self,
+        minimum_age: Duration,
+    ) -> Result<GarbageCollectionReport, BoxStoreError> {
+        ensure_private_storage_root(&self.cache_root)?;
+        let bases = self.bases_directory();
+        if !bases.exists() {
+            return Ok(GarbageCollectionReport::default());
+        }
+        validate_directory(&bases, "base disk directory")?;
+        let mut report = GarbageCollectionReport::default();
+        for entry in fs::read_dir(&bases)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(key) = parse_base_staging_name(&name) else {
+                continue;
+            };
+            let candidate = entry.path();
+            validate_directory(&candidate, "base disk staging directory")?;
+            if !garbage_collection_candidate_is_old(&candidate, minimum_age)? {
+                report.skipped_young += 1;
+                continue;
+            }
+            let (lock, lock_path) = self.open_base_lock(&key)?;
+            match FileExt::try_lock_exclusive(&lock) {
+                Ok(()) => {
+                    remove_managed_directory(&candidate)?;
+                    sync_parent(&candidate)?;
+                    report.removed += 1;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    report.skipped_busy += 1;
+                }
+                Err(source) => {
+                    return Err(BoxStoreError::BaseDiskBusy {
+                        path: lock_path,
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    fn open_base_lock(&self, key: &str) -> Result<(File, PathBuf), BoxStoreError> {
+        let locks = self.bases_directory().join(LOCKS_DIRECTORY);
+        secure_directory(&locks)?;
+        let lock_path = locks.join(format!("{key}.lock"));
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        set_file_permissions(&lock_path)?;
+        Ok((lock, lock_path))
+    }
+
     fn bases_directory(&self) -> PathBuf {
         self.cache_root.join(BASES_DIRECTORY)
     }
@@ -277,11 +334,7 @@ impl EphemeralDisk {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct EphemeralGcReport {
-    pub removed: usize,
-    pub skipped_busy: usize,
-}
+pub type EphemeralGcReport = GarbageCollectionReport;
 
 impl EphemeralDiskStore {
     pub fn new(runtime_root: impl Into<PathBuf>) -> Self {
@@ -341,6 +394,13 @@ impl EphemeralDiskStore {
     }
 
     pub fn garbage_collect(&self) -> Result<EphemeralGcReport, BoxStoreError> {
+        self.garbage_collect_older_than(DEFAULT_GC_MIN_AGE)
+    }
+
+    pub fn garbage_collect_older_than(
+        &self,
+        minimum_age: Duration,
+    ) -> Result<EphemeralGcReport, BoxStoreError> {
         ensure_private_storage_root(&self.runtime_root)?;
         let root = self.directory();
         if !root.exists() {
@@ -353,27 +413,26 @@ impl EphemeralDiskStore {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            if name.starts_with('.') || SessionId::from_str(&name).is_err() {
+            if SessionId::from_str(&name).is_err()
+                && parse_session_artifact_name(&name, ".creating-").is_none()
+                && parse_session_artifact_name(&name, ".deleting-").is_none()
+            {
                 continue;
             }
             let directory = entry.path();
             validate_directory(&directory, "ephemeral session directory")?;
-            let lock_path = directory.join(LOCK_FILE);
-            let lock_file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    remove_managed_directory(&directory)?;
-                    report.removed += 1;
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            if FileExt::try_lock_exclusive(&lock_file).is_err() {
-                report.skipped_busy += 1;
+            if !garbage_collection_candidate_is_old(&directory, minimum_age)? {
+                report.skipped_young += 1;
                 continue;
             }
-            remove_managed_directory(&directory)?;
-            report.removed += 1;
+            match garbage_collection_lock(&directory)? {
+                GarbageCollectionLock::Acquired(_lock) => {
+                    remove_managed_directory(&directory)?;
+                    sync_parent(&directory)?;
+                    report.removed += 1;
+                }
+                GarbageCollectionLock::Busy => report.skipped_busy += 1,
+            }
         }
         Ok(report)
     }
@@ -381,6 +440,29 @@ impl EphemeralDiskStore {
     fn directory(&self) -> PathBuf {
         self.runtime_root.join(EPHEMERAL_DIRECTORY)
     }
+}
+
+fn parse_base_staging_name(name: &str) -> Option<String> {
+    let key = parse_generated_artifact_name(name, ".creating-")?;
+    (key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(key)
+}
+
+fn parse_session_artifact_name(name: &str, prefix: &str) -> Option<SessionId> {
+    SessionId::from_str(&parse_generated_artifact_name(name, prefix)?).ok()
+}
+
+fn parse_generated_artifact_name(name: &str, prefix: &str) -> Option<String> {
+    let value = name.strip_prefix(prefix)?;
+    let mut parts = value.rsplitn(3, '-');
+    let sequence = parts.next()?;
+    let process = parts.next()?;
+    let identifier = parts.next()?;
+    (!identifier.is_empty()
+        && !process.is_empty()
+        && process.bytes().all(|byte| byte.is_ascii_digit())
+        && !sequence.is_empty()
+        && sequence.bytes().all(|byte| byte.is_ascii_digit()))
+    .then(|| identifier.to_owned())
 }
 
 impl Drop for EphemeralDisk {
@@ -863,19 +945,85 @@ mod tests {
     }
 
     #[test]
-    fn garbage_collection_removes_an_unlocked_orphan() {
+    fn base_garbage_collection_requires_age_and_an_unlocked_key() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = BaseDiskStore::new(temporary.path().join("cache"));
+        ensure_private_storage_root(&store.cache_root).unwrap();
+        let bases = store.bases_directory();
+        secure_directory(&bases).unwrap();
+        let key = BaseDiskSpec::new("sha256:gc", "linux/arm64", DISK_BYTES)
+            .key()
+            .unwrap();
+        let candidate = bases.join(format!(".creating-{key}-1-1"));
+        secure_directory(&candidate).unwrap();
+
+        let young = store.garbage_collect().unwrap();
+        assert_eq!(young.skipped_young, 1);
+        assert!(candidate.exists());
+
+        let (lock, _) = store.open_base_lock(&key).unwrap();
+        FileExt::lock_exclusive(&lock).unwrap();
+        let busy = store.garbage_collect_older_than(Duration::ZERO).unwrap();
+        assert_eq!(busy.skipped_busy, 1);
+        assert!(candidate.exists());
+        drop(lock);
+
+        let stale = store.garbage_collect_older_than(Duration::ZERO).unwrap();
+        assert_eq!(stale.removed, 1);
+        assert!(!candidate.exists());
+    }
+
+    #[test]
+    fn ephemeral_garbage_collection_handles_exact_crash_artifacts() {
         let temporary = tempfile::tempdir().unwrap();
         let store = EphemeralDiskStore::new(temporary.path());
         let session_id = SessionId::new();
         let orphan = store.directory().join(session_id.to_string());
         secure_directory(&orphan).unwrap();
         File::create(orphan.join(LOCK_FILE)).unwrap();
+        let creating = store
+            .directory()
+            .join(format!(".creating-{}-1-1", SessionId::new()));
+        secure_directory(&creating).unwrap();
+        let deleting = store
+            .directory()
+            .join(format!(".deleting-{}-1-1", SessionId::new()));
+        secure_directory(&deleting).unwrap();
+        let unknown = store.directory().join(".creating-not-managed");
+        secure_directory(&unknown).unwrap();
 
-        let report = store.garbage_collect().unwrap();
+        let young = store.garbage_collect().unwrap();
+        assert_eq!(young.skipped_young, 3);
 
-        assert_eq!(report.removed, 1);
+        let report = store.garbage_collect_older_than(Duration::ZERO).unwrap();
+
+        assert_eq!(report.removed, 3);
         assert_eq!(report.skipped_busy, 0);
         assert!(!orphan.exists());
+        assert!(!creating.exists());
+        assert!(!deleting.exists());
+        assert!(unknown.exists());
+    }
+
+    #[test]
+    fn ephemeral_garbage_collection_skips_a_locked_artifact() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = EphemeralDiskStore::new(temporary.path());
+        let candidate = store.directory().join(SessionId::new().to_string());
+        secure_directory(&candidate).unwrap();
+        let lock_path = candidate.join(LOCK_FILE);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .unwrap();
+        FileExt::lock_exclusive(&lock).unwrap();
+
+        let report = store.garbage_collect_older_than(Duration::ZERO).unwrap();
+
+        assert_eq!(report.skipped_busy, 1);
+        assert!(candidate.exists());
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

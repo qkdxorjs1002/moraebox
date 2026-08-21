@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use fs2::FileExt;
@@ -32,6 +32,19 @@ const METADATA_FILE: &str = "metadata.json";
 const ROOT_DISK_FILE: &str = "root.ext4";
 const LOCK_FILE: &str = ".lock";
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+pub const DEFAULT_GC_MIN_AGE: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GarbageCollectionReport {
+    pub removed: usize,
+    pub skipped_busy: usize,
+    pub skipped_young: usize,
+}
+
+pub(crate) enum GarbageCollectionLock {
+    Acquired(Option<File>),
+    Busy,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -264,6 +277,79 @@ impl BoxStore {
         Ok(report)
     }
 
+    pub fn garbage_collect(&self) -> Result<GarbageCollectionReport, BoxStoreError> {
+        self.garbage_collect_older_than(DEFAULT_GC_MIN_AGE)
+    }
+
+    pub fn garbage_collect_older_than(
+        &self,
+        minimum_age: Duration,
+    ) -> Result<GarbageCollectionReport, BoxStoreError> {
+        self.ensure_root()?;
+        let boxes = self.boxes_directory();
+        if !boxes.exists() {
+            return Ok(GarbageCollectionReport::default());
+        }
+        validate_directory(&boxes, "box store")?;
+        let mut report = GarbageCollectionReport::default();
+        for entry in fs::read_dir(&boxes)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let path = entry.path();
+            if parse_box_artifact_name(&name, ".creating-").is_some()
+                || parse_box_artifact_name(&name, ".deleted-").is_some()
+            {
+                collect_stale_directory(&path, minimum_age, &mut report)?;
+                continue;
+            }
+            if BoxId::from_str(&name).is_ok() {
+                Self::collect_reset_temporary_disks(&path, minimum_age, &mut report)?;
+            }
+        }
+        Ok(report)
+    }
+
+    fn collect_reset_temporary_disks(
+        box_directory: &Path,
+        minimum_age: Duration,
+        report: &mut GarbageCollectionReport,
+    ) -> Result<(), BoxStoreError> {
+        validate_directory(box_directory, "box directory")?;
+        let mut stale = Vec::new();
+        for entry in fs::read_dir(box_directory)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !is_reset_temporary_disk_name(&name) {
+                continue;
+            }
+            let path = entry.path();
+            validate_regular_file(&path, "reset temporary disk")?;
+            if garbage_collection_candidate_is_old(&path, minimum_age)? {
+                stale.push(path);
+            } else {
+                report.skipped_young += 1;
+            }
+        }
+        if stale.is_empty() {
+            return Ok(());
+        }
+        match garbage_collection_lock(box_directory)? {
+            GarbageCollectionLock::Acquired(_lock) => {
+                for path in stale {
+                    fs::remove_file(&path)?;
+                    sync_parent(&path)?;
+                    report.removed += 1;
+                }
+            }
+            GarbageCollectionLock::Busy => report.skipped_busy += stale.len(),
+        }
+        Ok(())
+    }
+
     fn scan(&self) -> Result<BoxScan, BoxStoreError> {
         self.ensure_root()?;
         let directory = self.boxes_directory();
@@ -447,6 +533,14 @@ impl BoxStore {
         secure_directory(&staging)?;
         let disk = staging.join(ROOT_DISK_FILE);
         let result = (|| {
+            let lock = staging.join(LOCK_FILE);
+            let lock_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&lock)?;
+            set_file_permissions(&lock)?;
+            FileExt::lock_exclusive(&lock_file)?;
             copy_disk(source_disk, &disk)?;
             let now = now_unix_millis()?;
             let metadata = BoxMetadata {
@@ -463,13 +557,7 @@ impl BoxStore {
                 owner_uid: owner_uid(&staging)?,
             };
             write_json_atomic(&staging.join(METADATA_FILE), &metadata)?;
-            let lock = staging.join(LOCK_FILE);
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock)?
-                .sync_all()?;
-            set_file_permissions(&lock)?;
+            lock_file.sync_all()?;
             fs::rename(&staging, &destination)?;
             sync_parent(&destination)?;
             Ok(metadata)
@@ -620,6 +708,81 @@ fn lock_for_quarantine(directory: &Path, box_id: BoxId) -> Result<Option<File>, 
     set_file_permissions(&path)?;
     FileExt::try_lock_exclusive(&lock).map_err(|source| BoxStoreError::Busy { box_id, source })?;
     Ok(Some(lock))
+}
+
+pub(crate) fn garbage_collection_lock(
+    directory: &Path,
+) -> Result<GarbageCollectionLock, BoxStoreError> {
+    validate_directory(directory, "garbage collection candidate")?;
+    let lock_path = directory.join(LOCK_FILE);
+    let lock = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(GarbageCollectionLock::Acquired(None));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    validate_regular_file(&lock_path, "garbage collection lock")?;
+    match FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => Ok(GarbageCollectionLock::Acquired(Some(lock))),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(GarbageCollectionLock::Busy),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn garbage_collection_candidate_is_old(
+    path: &Path,
+    minimum_age: Duration,
+) -> Result<bool, BoxStoreError> {
+    let modified = path.symlink_metadata()?.modified()?;
+    Ok(SystemTime::now()
+        .duration_since(modified)
+        .is_ok_and(|age| age >= minimum_age))
+}
+
+fn collect_stale_directory(
+    path: &Path,
+    minimum_age: Duration,
+    report: &mut GarbageCollectionReport,
+) -> Result<(), BoxStoreError> {
+    validate_directory(path, "box garbage collection candidate")?;
+    if !garbage_collection_candidate_is_old(path, minimum_age)? {
+        report.skipped_young += 1;
+        return Ok(());
+    }
+    match garbage_collection_lock(path)? {
+        GarbageCollectionLock::Acquired(_lock) => {
+            remove_managed_directory(path)?;
+            sync_parent(path)?;
+            report.removed += 1;
+        }
+        GarbageCollectionLock::Busy => report.skipped_busy += 1,
+    }
+    Ok(())
+}
+
+fn parse_box_artifact_name(name: &str, prefix: &str) -> Option<BoxId> {
+    let value = name.strip_prefix(prefix)?;
+    let mut parts = value.rsplitn(3, '-');
+    let sequence = parts.next()?;
+    let process = parts.next()?;
+    let box_id = parts.next()?;
+    if process.is_empty()
+        || !process.bytes().all(|byte| byte.is_ascii_digit())
+        || sequence.is_empty()
+        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    BoxId::from_str(box_id).ok()
+}
+
+fn is_reset_temporary_disk_name(name: &str) -> bool {
+    name.strip_prefix(&format!(".{ROOT_DISK_FILE}."))
+        .and_then(|value| value.strip_suffix(".tmp"))
+        .is_some_and(|sequence| {
+            !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn read_metadata(path: &Path, expected_id: BoxId) -> Result<BoxMetadata, BoxStoreError> {
@@ -1126,6 +1289,62 @@ mod tests {
             .box_directory(created.box_id)
             .join(ROOT_DISK_FILE);
         assert_eq!(fs::read(disk).unwrap()[0], 42);
+    }
+
+    #[test]
+    fn garbage_collection_removes_only_exact_stale_box_artifacts() {
+        let fixture = Fixture::new();
+        let created = fixture.create();
+        let box_directory = fixture.store.box_directory(created.box_id);
+        let reset_temporary = box_directory.join(format!(".{ROOT_DISK_FILE}.999.tmp"));
+        File::create(&reset_temporary).unwrap();
+
+        let creating = fixture
+            .store
+            .boxes_directory()
+            .join(format!(".creating-{}-1-1", BoxId::new()));
+        secure_directory(&creating).unwrap();
+        File::create(creating.join(LOCK_FILE)).unwrap();
+        let deleted = fixture
+            .store
+            .boxes_directory()
+            .join(format!(".deleted-{}-1-1", BoxId::new()));
+        secure_directory(&deleted).unwrap();
+        File::create(deleted.join(LOCK_FILE)).unwrap();
+        let unknown = fixture.store.boxes_directory().join(".deleted-not-managed");
+        secure_directory(&unknown).unwrap();
+
+        let young = fixture.store.garbage_collect().unwrap();
+        assert_eq!(young.skipped_young, 3);
+
+        let stale = fixture
+            .store
+            .garbage_collect_older_than(Duration::ZERO)
+            .unwrap();
+        assert_eq!(stale.removed, 3);
+        assert!(!reset_temporary.exists());
+        assert!(!creating.exists());
+        assert!(!deleted.exists());
+        assert!(unknown.exists());
+        assert!(box_directory.exists());
+    }
+
+    #[test]
+    fn garbage_collection_skips_a_busy_box_temporary_disk() {
+        let fixture = Fixture::new();
+        let created = fixture.create();
+        let box_directory = fixture.store.box_directory(created.box_id);
+        let reset_temporary = box_directory.join(format!(".{ROOT_DISK_FILE}.999.tmp"));
+        File::create(&reset_temporary).unwrap();
+        let _lease = fixture.store.try_acquire(created.box_id).unwrap();
+
+        let report = fixture
+            .store
+            .garbage_collect_older_than(Duration::ZERO)
+            .unwrap();
+
+        assert_eq!(report.skipped_busy, 1);
+        assert!(reset_temporary.exists());
     }
 
     #[test]

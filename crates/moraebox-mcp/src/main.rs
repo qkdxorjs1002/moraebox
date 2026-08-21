@@ -404,6 +404,8 @@ fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error::Erro
             config.vcpus = args.cpus;
             config.memory_mib = args.memory_mib;
             let ephemeral_disks = EphemeralDiskStore::new(cache_dir.join("runtime"));
+            let _ = box_store.garbage_collect()?;
+            let _ = base_disks.garbage_collect()?;
             let _ = ephemeral_disks.garbage_collect()?;
             let runtime = BoxRuntimeConfig {
                 boxes: box_store.clone(),

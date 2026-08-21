@@ -211,6 +211,8 @@ Mutating cache operations require either `--dry-run` or `--yes`; durable Box mut
 
 `morae box list` keeps returning healthy Boxes when another entry is corrupt and includes an `errors` array in JSON output. `morae box repair --dry-run` previews those entries; `--yes` acquires each valid Box lock and moves corrupt entries into a private `state/quarantine` batch directory. Quarantine never deletes or reconstructs disk data, and busy entries remain in place with a per-entry failure.
 
+Native CLI and MCP startup garbage-collect crash leftovers only after they are at least one hour old and their base, Box, or session lock is available. The collector recognizes only moraebox-generated `.creating`, `.deleting`, delete tombstone, and reset temporary-disk names; it leaves active, recent, quarantined, and unknown entries untouched.
+
 ### Exercise the lifecycle without isolation
 
 ```sh

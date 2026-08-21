@@ -214,7 +214,7 @@
 
 - [x] base disk 준비 lock을 key별 waitable lock으로 바꾸고 동일 key만 직렬화한다.
 
-- [ ] crash 후 남은 `.creating`, `.deleting`, 임시 disk와 tombstone을 age/lock 기준으로 안전하게 GC한다.
+- [x] crash 후 남은 `.creating`, `.deleting`, 임시 disk와 tombstone을 age/lock 기준으로 안전하게 GC한다.
 
 - [ ] writable Box 실행 전 `Dirty` 상태를 durable하게 기록하고 clean shutdown/e2fsck 이후에만 `Ready`로 전환한다.
 

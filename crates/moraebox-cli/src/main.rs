@@ -14,7 +14,7 @@ use std::{
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use moraebox_box::{
-    BaseDiskSpec, BaseDiskStore, BoxMetadata, BoxRepairReport, BoxStore, CreateBox,
+    BaseDiskSpec, BaseDiskStore, BoxMetadata, BoxRepairReport, BoxStore, BoxStoreError, CreateBox,
     EphemeralDiskStore,
 };
 use moraebox_core::{
@@ -968,11 +968,10 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::
                 .as_ref()
                 .map(|snapshot| snapshot.image_path.clone());
             config.network_runtime_dir = cache_dir.join("network");
-            let ephemeral_disks = EphemeralDiskStore::new(cache_dir.join("runtime"));
-            let _ = ephemeral_disks.garbage_collect()?;
+            let (boxes, base_disks, ephemeral_disks) = box_runtime_stores(state_dir, cache_dir)?;
             let runtime = BoxRuntimeConfig {
-                boxes: BoxStore::new(state_dir),
-                base_disks: BaseDiskStore::new(cache_dir),
+                boxes,
+                base_disks,
                 ephemeral_disks,
                 source: root_source,
                 e2fsck_path: global.e2fsck.clone().unwrap_or_else(default_e2fsck),
@@ -2041,11 +2040,10 @@ async fn benchmark(
             config.vcpus = args.cpus;
             config.memory_mib = args.memory_mib;
             config.network_runtime_dir = cache_dir.join("network");
-            let ephemeral_disks = EphemeralDiskStore::new(cache_dir.join("runtime"));
-            let _ = ephemeral_disks.garbage_collect()?;
+            let (boxes, base_disks, ephemeral_disks) = box_runtime_stores(state_dir, &cache_dir)?;
             let runtime = BoxRuntimeConfig {
-                boxes: BoxStore::new(state_dir),
-                base_disks: BaseDiskStore::new(&cache_dir),
+                boxes,
+                base_disks,
                 ephemeral_disks,
                 source: root_source,
                 e2fsck_path: global.e2fsck.clone().unwrap_or_else(default_e2fsck),
@@ -2262,6 +2260,19 @@ fn native_config(
     config.library_search_path = paths.library_search_path;
     config.gvproxy_path = paths.gvproxy;
     Ok(config)
+}
+
+fn box_runtime_stores(
+    state_dir: impl Into<PathBuf>,
+    cache_dir: &Path,
+) -> Result<(BoxStore, BaseDiskStore, EphemeralDiskStore), BoxStoreError> {
+    let boxes = BoxStore::new(state_dir);
+    let base_disks = BaseDiskStore::new(cache_dir);
+    let ephemeral_disks = EphemeralDiskStore::new(cache_dir.join("runtime"));
+    let _ = boxes.garbage_collect()?;
+    let _ = base_disks.garbage_collect()?;
+    let _ = ephemeral_disks.garbage_collect()?;
+    Ok((boxes, base_disks, ephemeral_disks))
 }
 
 fn required_path(
