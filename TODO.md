@@ -167,7 +167,7 @@
   - network download와 layer materialization은 global metadata lock 밖에서 수행한다.
   - 동일 digest publish는 짧은 atomic critical section에서 double-check한다.
 
-- [ ] registry response를 temp CAS file로 streaming하면서 hash와 size를 검증한다.
+- [x] registry response를 temp CAS file로 streaming하면서 hash와 size를 검증한다.
   - layer download는 bounded concurrency를 허용하되 적용 순서는 유지한다.
   - HTTP client/token을 재사용하고 connect/read/overall timeout, bounded retry, `Retry-After`를 적용한다.
 

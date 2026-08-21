@@ -1,13 +1,21 @@
-use std::{collections::BTreeSet, fs, str::FromStr};
+use std::{
+    collections::BTreeSet,
+    fs,
+    future::Future,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
-use futures_util::StreamExt;
-use reqwest::{StatusCode, Url, header, redirect};
+use futures_util::{StreamExt, TryStreamExt, stream};
+use reqwest::{RequestBuilder, StatusCode, Url, header, redirect};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 use crate::{
     Cas, Digest, LayerCompression, RegistryReference,
-    cas::CasError,
+    cas::{CasError, PutStreamError},
     layer::{LayerBudget, LayerError, LayerLimits, apply_layer_with_budget},
     reference::Selector,
 };
@@ -19,6 +27,13 @@ const ACCEPT_MANIFESTS: &str = concat!(
     "application/vnd.docker.distribution.manifest.v2+json"
 );
 const MAX_TOKEN_RESPONSE_BYTES: u64 = 1024 * 1024;
+const MAX_CONCURRENT_LAYER_DOWNLOADS: usize = 4;
+const MAX_REQUEST_ATTEMPTS: usize = 3;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credentials {
@@ -177,6 +192,17 @@ impl RealmOrigin {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct Authorization {
+    token: Arc<Mutex<Option<String>>>,
+}
+
+impl Authorization {
+    async fn current(&self) -> Option<String> {
+        self.token.lock().await.clone()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RegistryClient {
     client: reqwest::Client,
@@ -193,11 +219,17 @@ impl RegistryClient {
             client: reqwest::Client::builder()
                 .user_agent(user_agent)
                 .https_only(true)
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(READ_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
                 .build()?,
             token_client: reqwest::Client::builder()
                 .user_agent(user_agent)
                 .https_only(true)
                 .redirect(redirect::Policy::none())
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(READ_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
                 .build()?,
             credentials,
             allowed_credential_realms: BTreeSet::new(),
@@ -227,16 +259,14 @@ impl RegistryClient {
         platform: &Platform,
         cas: &Cas,
     ) -> Result<PulledImage, RegistryError> {
-        let mut authorization = None;
+        let authorization = Authorization::default();
         let (source_manifest_bytes, source_manifest_digest) = self
-            .get_manifest(&reference, reference.selector(), &mut authorization)
+            .get_manifest(&reference, reference.selector(), None, &authorization, cas)
             .await?;
         verify_reference_digest(&reference, &source_manifest_digest)?;
-        cas.put_verified(&source_manifest_digest, &source_manifest_bytes)
-            .await?;
 
         let envelope: ManifestEnvelope = serde_json::from_slice(&source_manifest_bytes)?;
-        let (manifest_bytes, manifest_digest, manifest) = match envelope {
+        let (manifest_digest, manifest) = match envelope {
             ManifestEnvelope::Index(index) => {
                 if index.schema_version != 2 {
                     return Err(RegistryError::UnsupportedSchema(index.schema_version));
@@ -253,34 +283,39 @@ impl RegistryClient {
                 )?;
                 let expected = Digest::from_str(&descriptor.digest)?;
                 let (selected, actual) = self
-                    .get_manifest(&reference, &descriptor.digest, &mut authorization)
+                    .get_manifest(
+                        &reference,
+                        &descriptor.digest,
+                        Some(descriptor.size),
+                        &authorization,
+                        cas,
+                    )
                     .await?;
                 verify_manifest_descriptor(&descriptor, &expected, &actual, selected.len())?;
                 let manifest = serde_json::from_slice(&selected)?;
-                (selected, actual, manifest)
+                (actual, manifest)
             }
-            ManifestEnvelope::Manifest(manifest) => (
-                source_manifest_bytes,
-                source_manifest_digest.clone(),
-                manifest,
-            ),
+            ManifestEnvelope::Manifest(manifest) => (source_manifest_digest.clone(), manifest),
         };
 
-        cas.put_verified(&manifest_digest, &manifest_bytes).await?;
         if manifest.schema_version != 2 {
             return Err(RegistryError::UnsupportedSchema(manifest.schema_version));
         }
         validate_manifest_limits(&manifest, &self.limits)?;
         let config_digest = self
-            .fetch_blob(&reference, &manifest.config, &mut authorization, cas)
+            .fetch_blob(&reference, &manifest.config, &authorization, cas)
             .await?;
-        let mut layer_digests = Vec::with_capacity(manifest.layers.len());
-        for layer in &manifest.layers {
-            layer_digests.push(
-                self.fetch_blob(&reference, layer, &mut authorization, cas)
-                    .await?,
-            );
-        }
+        let layer_reference = &reference;
+        let layer_authorization = &authorization;
+        let layer_digests = try_buffered_map(
+            manifest.layers.clone(),
+            MAX_CONCURRENT_LAYER_DOWNLOADS,
+            |layer| async move {
+                self.fetch_blob(layer_reference, &layer, layer_authorization, cas)
+                    .await
+            },
+        )
+        .await?;
         Ok(PulledImage {
             reference,
             source_manifest_digest,
@@ -296,46 +331,93 @@ impl RegistryClient {
         &self,
         reference: &RegistryReference,
         selector: &str,
-        authorization: &mut Option<String>,
+        expected_size: Option<u64>,
+        authorization: &Authorization,
+        cas: &Cas,
     ) -> Result<(Vec<u8>, Digest), RegistryError> {
         let url = format!(
             "https://{}/v2/{}/manifests/{selector}",
             reference.endpoint_registry(),
             reference.repository
         );
-        let response = self
-            .get_authenticated(&url, reference, authorization, Some(ACCEPT_MANIFESTS))
-            .await?;
-        let header_digest = response
-            .headers()
-            .get("docker-content-digest")
-            .and_then(|value| value.to_str().ok())
-            .map(Digest::from_str)
+        let selector_digest = selector
+            .starts_with("sha256:")
+            .then(|| Digest::from_str(selector))
             .transpose()?;
-        let bytes =
-            read_bounded_response(response, "manifest", self.limits.max_manifest_bytes).await?;
-        let actual = Digest::from_bytes(&bytes);
-        if let Some(expected) = header_digest
-            && expected != actual
-        {
-            return Err(RegistryError::ManifestDigestMismatch { expected, actual });
+        for attempt in 0..MAX_REQUEST_ATTEMPTS {
+            let response = self
+                .get_authenticated(&url, reference, authorization, Some(ACCEPT_MANIFESTS))
+                .await?;
+            if let Some(declared) = response.content_length() {
+                verify_download_limit("manifest", declared, self.limits.max_manifest_bytes)?;
+                if let Some(expected) = expected_size
+                    && declared != expected
+                {
+                    return Err(RegistryError::DescriptorSizeMismatch {
+                        digest: selector.into(),
+                        expected,
+                        actual: declared,
+                    });
+                }
+            }
+            let header_digest = response
+                .headers()
+                .get("docker-content-digest")
+                .and_then(|value| value.to_str().ok())
+                .map(Digest::from_str)
+                .transpose()?;
+            if let (Some(expected), Some(reported)) = (&selector_digest, &header_digest)
+                && expected != reported
+            {
+                return Err(RegistryError::ManifestDigestMismatch {
+                    expected: expected.clone(),
+                    actual: reported.clone(),
+                });
+            }
+            let expected_digest = selector_digest.as_ref().or(header_digest.as_ref());
+            match cas
+                .put_stream(
+                    expected_digest,
+                    expected_size,
+                    self.limits.max_manifest_bytes,
+                    response.bytes_stream(),
+                )
+                .await
+            {
+                Ok(digest) => {
+                    let bytes = cas.read(&digest).await?;
+                    return Ok((bytes, digest));
+                }
+                Err(PutStreamError::Source(error))
+                    if retryable_transport_error(&error) && attempt + 1 < MAX_REQUEST_ATTEMPTS =>
+                {
+                    tokio::time::sleep(default_retry_delay(attempt)).await;
+                }
+                Err(error) => {
+                    return Err(map_manifest_stream_error(
+                        error,
+                        selector,
+                        expected_size,
+                        self.limits.max_manifest_bytes,
+                    ));
+                }
+            }
         }
-        Ok((bytes, actual))
+        unreachable!("manifest download retry loop always returns")
     }
 
     async fn fetch_blob(
         &self,
         reference: &RegistryReference,
         descriptor: &Descriptor,
-        authorization: &mut Option<String>,
+        authorization: &Authorization,
         cas: &Cas,
     ) -> Result<Digest, RegistryError> {
         let digest = Digest::from_str(&descriptor.digest)?;
         let blob_path = cas.blob_path(&digest);
         if tokio::fs::try_exists(&blob_path).await? {
             verify_descriptor_size_u64(descriptor, tokio::fs::metadata(&blob_path).await?.len())?;
-            // Reading verifies an existing cache entry before trusting it.
-            cas.read(&digest).await?;
+            cas.verify(&digest).await?;
             return Ok(digest);
         }
         let url = format!(
@@ -343,42 +425,67 @@ impl RegistryClient {
             reference.endpoint_registry(),
             reference.repository
         );
-        let response = self
-            .get_authenticated(&url, reference, authorization, None)
-            .await?;
-        let bytes = read_descriptor_response(response, descriptor).await?;
-        cas.put_verified(&digest, &bytes).await?;
-        Ok(digest)
+        for attempt in 0..MAX_REQUEST_ATTEMPTS {
+            let response = self
+                .get_authenticated(&url, reference, authorization, None)
+                .await?;
+            if let Some(declared) = response.content_length()
+                && declared != descriptor.size
+            {
+                return Err(RegistryError::DescriptorSizeMismatch {
+                    digest: descriptor.digest.clone(),
+                    expected: descriptor.size,
+                    actual: declared,
+                });
+            }
+            match cas
+                .put_stream(
+                    Some(&digest),
+                    Some(descriptor.size),
+                    descriptor.size,
+                    response.bytes_stream(),
+                )
+                .await
+            {
+                Ok(digest) => return Ok(digest),
+                Err(PutStreamError::Source(error))
+                    if retryable_transport_error(&error) && attempt + 1 < MAX_REQUEST_ATTEMPTS =>
+                {
+                    tokio::time::sleep(default_retry_delay(attempt)).await;
+                }
+                Err(error) => return Err(map_descriptor_stream_error(error, descriptor)),
+            }
+        }
+        unreachable!("blob download retry loop always returns")
     }
 
     async fn get_authenticated(
         &self,
         url: &str,
         reference: &RegistryReference,
-        authorization: &mut Option<String>,
+        authorization: &Authorization,
         accept: Option<&str>,
     ) -> Result<reqwest::Response, RegistryError> {
-        let mut request = self.client.get(url);
-        if let Some(value) = accept {
-            request = request.header(header::ACCEPT, value);
-        }
-        if let Some(token) = authorization.as_ref() {
-            request = request.bearer_auth(token);
-        }
-        let mut response = request.send().await?;
+        let current = authorization.current().await;
+        let mut response = self
+            .send_retrying(self.authenticated_request(url, accept, current.as_deref()))
+            .await?;
         if response.status() == StatusCode::UNAUTHORIZED {
             let challenge = response
                 .headers()
                 .get(header::WWW_AUTHENTICATE)
                 .and_then(|value| value.to_str().ok())
-                .ok_or(RegistryError::MissingChallenge)?;
-            let token = self.exchange_token(challenge, reference).await?;
-            *authorization = Some(token.clone());
-            let mut retry = self.client.get(url).bearer_auth(token);
-            if let Some(value) = accept {
-                retry = retry.header(header::ACCEPT, value);
+                .ok_or(RegistryError::MissingChallenge)?
+                .to_owned();
+            let mut token = authorization.token.lock().await;
+            if token.as_ref() == current.as_ref() {
+                *token = Some(self.exchange_token(&challenge, reference).await?);
             }
-            response = retry.send().await?;
+            let refreshed = token.clone().ok_or(RegistryError::MissingToken)?;
+            drop(token);
+            response = self
+                .send_retrying(self.authenticated_request(url, accept, Some(&refreshed)))
+                .await?;
         }
         if !response.status().is_success() {
             return Err(RegistryError::HttpStatus {
@@ -389,30 +496,89 @@ impl RegistryClient {
         Ok(response)
     }
 
+    fn authenticated_request(
+        &self,
+        url: &str,
+        accept: Option<&str>,
+        token: Option<&str>,
+    ) -> RequestBuilder {
+        let mut request = self.client.get(url);
+        if let Some(value) = accept {
+            request = request.header(header::ACCEPT, value);
+        }
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        request
+    }
+
+    async fn send_retrying(
+        &self,
+        request: RequestBuilder,
+    ) -> Result<reqwest::Response, RegistryError> {
+        for attempt in 0..MAX_REQUEST_ATTEMPTS {
+            let retry = request
+                .try_clone()
+                .ok_or(RegistryError::RequestNotCloneable)?;
+            match retry.send().await {
+                Ok(response)
+                    if retryable_status(response.status())
+                        && attempt + 1 < MAX_REQUEST_ATTEMPTS =>
+                {
+                    let delay = retry_delay(response.headers(), attempt, SystemTime::now());
+                    drop(response);
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if retryable_transport_error(&error) && attempt + 1 < MAX_REQUEST_ATTEMPTS =>
+                {
+                    tokio::time::sleep(default_retry_delay(attempt)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("request retry loop always returns")
+    }
+
     async fn exchange_token(
         &self,
         challenge: &str,
         reference: &RegistryReference,
     ) -> Result<String, RegistryError> {
-        let response = self.token_request(challenge, reference)?.send().await?;
-        if response.status().is_redirection() {
-            return Err(RegistryError::TokenRedirectDisallowed(response.status()));
+        for attempt in 0..MAX_REQUEST_ATTEMPTS {
+            let request = self.token_request(challenge, reference)?;
+            let response = self.send_retrying(request).await?;
+            if response.status().is_redirection() {
+                return Err(RegistryError::TokenRedirectDisallowed(response.status()));
+            }
+            if !response.status().is_success() {
+                return Err(RegistryError::TokenStatus(response.status()));
+            }
+            match read_bounded_response(
+                response,
+                "registry token response",
+                MAX_TOKEN_RESPONSE_BYTES,
+            )
+            .await
+            {
+                Ok(bytes) => {
+                    let token: TokenResponse = serde_json::from_slice(&bytes)?;
+                    return token
+                        .token
+                        .or(token.access_token)
+                        .filter(|token| !token.is_empty())
+                        .ok_or(RegistryError::MissingToken);
+                }
+                Err(RegistryError::Http(error))
+                    if retryable_transport_error(&error) && attempt + 1 < MAX_REQUEST_ATTEMPTS =>
+                {
+                    tokio::time::sleep(default_retry_delay(attempt)).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        if !response.status().is_success() {
-            return Err(RegistryError::TokenStatus(response.status()));
-        }
-        let bytes = read_bounded_response(
-            response,
-            "registry token response",
-            MAX_TOKEN_RESPONSE_BYTES,
-        )
-        .await?;
-        let token: TokenResponse = serde_json::from_slice(&bytes)?;
-        token
-            .token
-            .or(token.access_token)
-            .filter(|token| !token.is_empty())
-            .ok_or(RegistryError::MissingToken)
+        unreachable!("token response retry loop always returns")
     }
 
     fn token_request(
@@ -443,6 +609,116 @@ impl RegistryClient {
     }
 }
 
+async fn try_buffered_map<I, F, Fut, T, E>(
+    items: I,
+    maximum_concurrency: usize,
+    map: F,
+) -> Result<Vec<T>, E>
+where
+    I: IntoIterator,
+    F: FnMut(I::Item) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    stream::iter(items)
+        .map(map)
+        .buffered(maximum_concurrency)
+        .try_collect()
+        .await
+}
+
+fn map_manifest_stream_error(
+    error: PutStreamError<reqwest::Error>,
+    selector: &str,
+    expected_size: Option<u64>,
+    maximum_size: u64,
+) -> RegistryError {
+    match error {
+        PutStreamError::Source(error) => RegistryError::Http(error),
+        PutStreamError::Cas(CasError::DigestMismatch { expected, actual }) => {
+            RegistryError::ManifestDigestMismatch { expected, actual }
+        }
+        PutStreamError::Cas(error) => RegistryError::Cas(error),
+        PutStreamError::SizeExceeded { actual } | PutStreamError::SizeMismatch { actual, .. }
+            if expected_size.is_some() =>
+        {
+            RegistryError::DescriptorSizeMismatch {
+                digest: selector.into(),
+                expected: expected_size.expect("guarded by is_some"),
+                actual,
+            }
+        }
+        PutStreamError::SizeExceeded { actual } => RegistryError::DownloadLimitExceeded {
+            resource: "manifest",
+            actual,
+            maximum: maximum_size,
+        },
+        PutStreamError::SizeMismatch { expected, actual } => {
+            RegistryError::DescriptorSizeMismatch {
+                digest: selector.into(),
+                expected,
+                actual,
+            }
+        }
+    }
+}
+
+fn map_descriptor_stream_error(
+    error: PutStreamError<reqwest::Error>,
+    descriptor: &Descriptor,
+) -> RegistryError {
+    match error {
+        PutStreamError::Source(error) => RegistryError::Http(error),
+        PutStreamError::Cas(error) => RegistryError::Cas(error),
+        PutStreamError::SizeExceeded { actual } | PutStreamError::SizeMismatch { actual, .. } => {
+            RegistryError::DescriptorSizeMismatch {
+                digest: descriptor.digest.clone(),
+                expected: descriptor.size,
+                actual,
+            }
+        }
+    }
+}
+
+fn retryable_transport_error(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout() || error.is_body() || error.is_request()
+}
+
+fn retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn retry_delay(headers: &header::HeaderMap, attempt: usize, now: SystemTime) -> Duration {
+    headers
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_retry_after(value, now))
+        .unwrap_or_else(|| default_retry_delay(attempt))
+        .min(MAX_RETRY_DELAY)
+}
+
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+        .or_else(|| {
+            let retry_at = httpdate::parse_http_date(value).ok()?;
+            Some(retry_at.duration_since(now).unwrap_or(Duration::ZERO))
+        })
+}
+
+fn default_retry_delay(attempt: usize) -> Duration {
+    let multiplier = 1_u32.checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX));
+    multiplier
+        .map_or(MAX_RETRY_DELAY, |value| {
+            BASE_RETRY_DELAY.saturating_mul(value)
+        })
+        .min(MAX_RETRY_DELAY)
+}
+
 async fn read_bounded_response(
     response: reqwest::Response,
     resource: &'static str,
@@ -459,38 +735,6 @@ async fn read_bounded_response(
         length = checked_download_length(resource, length, chunk.len(), maximum)?;
         bytes.extend_from_slice(&chunk);
     }
-    Ok(bytes)
-}
-
-async fn read_descriptor_response(
-    response: reqwest::Response,
-    descriptor: &Descriptor,
-) -> Result<Vec<u8>, RegistryError> {
-    if let Some(declared) = response.content_length()
-        && declared != descriptor.size
-    {
-        return Err(RegistryError::DescriptorSizeMismatch {
-            digest: descriptor.digest.clone(),
-            expected: descriptor.size,
-            actual: declared,
-        });
-    }
-    let mut bytes = Vec::new();
-    let mut length = 0_u64;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        length = length.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-        if length > descriptor.size {
-            return Err(RegistryError::DescriptorSizeMismatch {
-                digest: descriptor.digest.clone(),
-                expected: descriptor.size,
-                actual: length,
-            });
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    verify_descriptor_size(descriptor, bytes.len())?;
     Ok(bytes)
 }
 
@@ -823,6 +1067,8 @@ struct TokenResponse {
 pub enum RegistryError {
     #[error("registry HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("registry request cannot be cloned for bounded retry")]
+    RequestNotCloneable,
     #[error("registry returned {status} for {url}")]
     HttpStatus { status: StatusCode, url: String },
     #[error("registry token exchange returned {0}")]
@@ -893,6 +1139,10 @@ mod tests {
     use std::{
         io::{Cursor, Write},
         path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use flate2::{Compression, write::GzEncoder};
@@ -946,6 +1196,47 @@ mod tests {
 
     fn bearer_challenge(realm: &str) -> String {
         format!(r#"Bearer realm="{realm}",service="registry.example",scope="repository:a/b:pull""#)
+    }
+
+    #[tokio::test]
+    async fn buffered_downloads_bound_concurrency_and_preserve_descriptor_order() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let result = try_buffered_map(0_u64..8, 3, |index| {
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            async move {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis((8 - index) * 2)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok::<_, ()>(index)
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result, (0_u64..8).collect::<Vec<_>>());
+        assert_eq!(maximum.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn retry_policy_is_bounded_and_honors_delta_and_date_retry_after() {
+        assert!(retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!retryable_status(StatusCode::UNAUTHORIZED));
+        assert_eq!(default_retry_delay(0), Duration::from_millis(100));
+        assert_eq!(default_retry_delay(1), Duration::from_millis(200));
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert_eq!(parse_retry_after("3", now), Some(Duration::from_secs(3)));
+        let date = httpdate::fmt_http_date(now + Duration::from_secs(4));
+        assert_eq!(parse_retry_after(&date, now), Some(Duration::from_secs(4)));
+
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, header::HeaderValue::from_static("60"));
+        assert_eq!(retry_delay(&headers, 0, now), MAX_RETRY_DELAY);
     }
 
     #[test]
