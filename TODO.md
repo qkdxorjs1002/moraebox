@@ -200,7 +200,7 @@
 
 - [x] `--output-limit`과 `--kill-grace`를 CLI/MCP에서 명시적으로 설정할 수 있게 한다.
 
-- [ ] `--json` 실행 오류에도 stable JSON error envelope와 stage를 제공한다.
+- [x] `--json` 실행 오류에도 stable JSON error envelope와 stage를 제공한다.
 
 - [ ] image pull policy `missing|always|never`를 추가하고 실제 resolved digest를 결과에 표시한다.
 

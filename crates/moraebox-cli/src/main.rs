@@ -406,15 +406,139 @@ struct CompletionArgs {
     shell: Shell,
 }
 
+#[derive(Debug, Serialize)]
+struct CliErrorDocument {
+    error: CliErrorEnvelope,
+}
+
+#[derive(Debug, Serialize)]
+struct CliErrorEnvelope {
+    code: &'static str,
+    stage: &'static str,
+    retryable: bool,
+    message: String,
+    remediation: &'static str,
+}
+
+impl CliErrorEnvelope {
+    fn for_command(stage: &'static str, error: &dyn std::error::Error) -> Self {
+        let (code, remediation) = if stage == "run" || stage == "benchmark" {
+            (
+                "execution_failed",
+                "Review the command, backend options, and diagnostics, then retry.",
+            )
+        } else if stage.starts_with("image_") {
+            (
+                "image_operation_failed",
+                "Check the image reference, registry access, cache permissions, and retry.",
+            )
+        } else if stage.starts_with("box_") {
+            (
+                "box_operation_failed",
+                "Inspect Box state and storage permissions before retrying the operation.",
+            )
+        } else if stage.starts_with("cache_") {
+            (
+                "cache_operation_failed",
+                "Inspect cache permissions and the requested operation, then retry.",
+            )
+        } else if stage == "doctor" {
+            (
+                "doctor_failed",
+                "Review native dependency paths and run `morae doctor` for human-readable diagnostics.",
+            )
+        } else {
+            (
+                "command_failed",
+                "Review the command arguments and diagnostics, then retry.",
+            )
+        };
+        Self {
+            code,
+            stage,
+            retryable: false,
+            message: error.to_string(),
+            remediation,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse_from(normalize_help_alias(std::env::args_os()));
+    let json = cli.global.json;
+    let stage = command_stage(&cli.command);
     match execute(cli).await {
         Ok(code) => exit_code(code),
         Err(error) => {
-            eprintln!("morae: {error}");
+            if json {
+                let document = CliErrorDocument {
+                    error: CliErrorEnvelope::for_command(stage, error.as_ref()),
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string(&document)
+                        .expect("CLI error envelope serialization must succeed")
+                );
+            } else {
+                eprintln!("morae: {error}");
+            }
             ExitCode::FAILURE
         }
+    }
+}
+
+fn command_stage(command: &Command) -> &'static str {
+    match command {
+        Command::Doctor(_) => "doctor",
+        Command::Run(_) => "run",
+        Command::Image {
+            command: ImageCommand::Pull(_),
+        } => "image_pull",
+        Command::Image {
+            command: ImageCommand::List(_),
+        } => "image_list",
+        Command::Image {
+            command: ImageCommand::Remove(_),
+        } => "image_remove",
+        Command::Image {
+            command: ImageCommand::Default(_),
+        } => "image_default",
+        Command::Cache {
+            command: CacheCommand::Info(_),
+        } => "cache_info",
+        Command::Cache {
+            command: CacheCommand::Reconcile(_),
+        } => "cache_reconcile",
+        Command::Cache {
+            command: CacheCommand::Prune(_),
+        } => "cache_prune",
+        Command::Cache {
+            command: CacheCommand::Clean(_),
+        } => "cache_clean",
+        Command::Box {
+            command: BoxCommand::Create(_),
+        } => "box_create",
+        Command::Box {
+            command: BoxCommand::List(_),
+        } => "box_list",
+        Command::Box {
+            command: BoxCommand::Show(_),
+        } => "box_show",
+        Command::Box {
+            command: BoxCommand::Delete(_),
+        } => "box_delete",
+        Command::Box {
+            command: BoxCommand::Reset(_),
+        } => "box_reset",
+        Command::Box {
+            command: BoxCommand::Clone(_),
+        } => "box_clone",
+        Command::Box {
+            command: BoxCommand::Repair(_),
+        } => "box_repair",
+        Command::Benchmark(_) => "benchmark",
+        Command::Completion(_) => "completion",
     }
 }
 

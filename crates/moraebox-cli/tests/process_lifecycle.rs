@@ -43,6 +43,50 @@ fn process_backend_rejects_the_vm_network_option() {
 }
 
 #[test]
+fn json_execution_errors_use_the_stable_envelope_on_stdout() {
+    let output = Command::new(env!("CARGO_BIN_EXE_morae"))
+        .args([
+            "run",
+            "--backend",
+            "process",
+            "--network",
+            "--json",
+            "--",
+            "not-executed",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        document.pointer("/error/code"),
+        Some(&serde_json::json!("execution_failed"))
+    );
+    assert_eq!(
+        document.pointer("/error/stage"),
+        Some(&serde_json::json!("run"))
+    );
+    assert_eq!(
+        document.pointer("/error/retryable"),
+        Some(&serde_json::json!(false))
+    );
+    assert!(
+        document
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| message.contains("--network requires --backend libkrun"))
+    );
+    assert!(
+        document
+            .pointer("/error/remediation")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|remediation| !remediation.is_empty())
+    );
+}
+
+#[test]
 fn process_backend_rejects_tty_from_typed_capabilities() {
     let output = Command::new(env!("CARGO_BIN_EXE_morae"))
         .args(["run", "--backend", "process", "--tty", "--", "not-executed"])

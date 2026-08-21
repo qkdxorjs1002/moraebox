@@ -80,6 +80,8 @@ morae run \
 
 보존 출력은 기본 64 MiB이며 실행별로 `--output-limit 8MiB`(최대 1 GiB)처럼 제한할 수 있습니다. TERM 이후 강제 정리까지의 유예 시간은 기본 5초이며 `--kill-grace 750ms`(최대 60초)로 설정합니다. MCP의 같은 옵션은 단위가 명확한 `sandbox_exec.output_limit_bytes`와 `sandbox_exec.kill_grace_ms`입니다.
 
+인자 파싱 이후 명령 실행이 실패하면 `--json` 모드는 stdout에 `{"error":{"code":"...","stage":"...","retryable":false,"message":"...","remediation":"..."}}` 형태의 JSON 문서 하나를 쓰고 0이 아닌 상태로 종료합니다. `--json`이 없으면 기존의 사람이 읽는 `morae: ...` stderr 형식을 유지합니다. Clap 도움말과 인자 문법 오류는 Clap의 표준 출력 계약을 그대로 사용합니다.
+
 `--` 뒤의 값은 모두 argv로 전달됩니다. 셸을 명령으로 직접 지정한 경우에만 셸 문법을 해석합니다.
 
 ```sh

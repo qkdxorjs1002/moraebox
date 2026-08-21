@@ -206,9 +206,13 @@ fn interactive_rejects_json_output() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("--interactive cannot be combined with --json")
+        document
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| message.contains("--interactive cannot be combined with --json"))
     );
 }
 
