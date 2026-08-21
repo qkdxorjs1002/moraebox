@@ -19,6 +19,8 @@ use thiserror::Error;
 
 mod disk;
 
+use disk::copy_disk;
+
 pub use disk::{
     BASE_DISK_LAYOUT_VERSION, BaseDisk, BaseDiskMetadata, BaseDiskSpec, BaseDiskStore,
     DEFAULT_BOX_DISK_SIZE_BYTES, EphemeralDisk, EphemeralDiskStore, EphemeralGcReport,
@@ -696,17 +698,6 @@ fn write_json_atomic_with_durability(
     Ok(())
 }
 
-fn copy_disk(source: &Path, destination: &Path) -> Result<(), BoxStoreError> {
-    validate_regular_file(source, "source root disk")?;
-    if destination.symlink_metadata().is_ok() {
-        return Err(BoxStoreError::InvalidPath(destination.into()));
-    }
-    fs::copy(source, destination)?;
-    set_file_permissions(destination)?;
-    File::open(destination)?.sync_all()?;
-    Ok(())
-}
-
 fn secure_directory(path: &Path) -> Result<(), BoxStoreError> {
     fs::create_dir_all(path)?;
     validate_directory(path, "managed directory")?;
@@ -1087,12 +1078,34 @@ mod tests {
     fn clones_into_an_independent_box() {
         let fixture = Fixture::new();
         let source = fixture.create();
+        let source_disk = fixture
+            .store
+            .box_directory(source.box_id)
+            .join(ROOT_DISK_FILE);
+        OpenOptions::new()
+            .write(true)
+            .open(&source_disk)
+            .unwrap()
+            .write_all(&[7])
+            .unwrap();
         let cloned = fixture.store.clone_box(source.box_id).unwrap();
+        let cloned_disk = fixture
+            .store
+            .box_directory(cloned.box_id)
+            .join(ROOT_DISK_FILE);
+        OpenOptions::new()
+            .write(true)
+            .open(&cloned_disk)
+            .unwrap()
+            .write_all(&[9])
+            .unwrap();
 
         assert_ne!(source.box_id, cloned.box_id);
         assert_eq!(source.manifest_digest, cloned.manifest_digest);
         assert_eq!(source.virtual_size_bytes, cloned.virtual_size_bytes);
         assert_eq!(fixture.store.list().unwrap().boxes.len(), 2);
+        assert_eq!(fs::read(source_disk).unwrap()[0], 7);
+        assert_eq!(fs::read(cloned_disk).unwrap()[0], 9);
     }
 
     #[test]
@@ -1105,6 +1118,7 @@ mod tests {
         fs::write(&replacement, bytes).unwrap();
 
         let reset = fixture.store.reset(created.box_id, &replacement).unwrap();
+        fs::write(&replacement, [7]).unwrap();
 
         assert_eq!(reset.generation, 1);
         let disk = fixture

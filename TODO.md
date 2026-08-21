@@ -208,7 +208,7 @@
 
 ### Box와 native backend
 
-- [ ] Box clone/reset과 ephemeral disk 준비에 reflink/clonefile 또는 sparse-aware copy를 사용한다.
+- [x] Box clone/reset과 ephemeral disk 준비에 reflink/clonefile 또는 sparse-aware copy를 사용한다.
   - CoW clone은 별도의 독립 disk identity를 유지한다.
   - 실제 cache volume에서 capability를 검사한다.
 

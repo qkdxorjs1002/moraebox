@@ -1,5 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
+    io::{self, Read as _, Seek as _, SeekFrom, Write as _},
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
@@ -419,44 +420,250 @@ fn validate_base_metadata(
 
 fn strict_cow_clone(source: &Path, destination: &Path) -> Result<(), BoxStoreError> {
     validate_regular_file(source, "immutable base disk")?;
-    if destination.exists() {
-        return Err(BoxStoreError::InvalidPath(destination.into()));
+    native_cow_clone(source, destination)?;
+    finish_disk_copy(source, destination, "immutable base disk")
+}
+
+pub(crate) fn copy_disk(source: &Path, destination: &Path) -> Result<(), BoxStoreError> {
+    validate_regular_file(source, "source root disk")?;
+    ensure_destination_absent(destination)?;
+
+    match native_cow_clone(source, destination) {
+        Ok(()) => {}
+        Err(BoxStoreError::CowCloneUnavailable { .. }) => {
+            sparse_copy(source, destination)?;
+        }
+        Err(error) => return Err(error),
     }
 
-    #[cfg(target_os = "macos")]
-    let output = Command::new("/bin/cp")
-        .arg("-c")
-        .arg(source)
-        .arg(destination)
-        .output()?;
-
-    #[cfg(target_os = "linux")]
-    let output = Command::new("cp")
-        .args(["--reflink=always", "--sparse=always", "--"])
-        .arg(source)
-        .arg(destination)
-        .output()?;
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    return Err(BoxStoreError::CowCloneUnavailable {
-        detail: "strict CoW cloning is supported only on macOS and Linux".into(),
-    });
-
-    if !output.status.success() {
+    let result = finish_disk_copy(source, destination, "source root disk")
+        .and_then(|()| set_file_permissions(destination).map_err(BoxStoreError::from));
+    if result.is_err() {
         let _ = fs::remove_file(destination);
+    }
+    result
+}
+
+fn ensure_destination_absent(destination: &Path) -> Result<(), BoxStoreError> {
+    match destination.symlink_metadata() {
+        Ok(_) => Err(BoxStoreError::InvalidPath(destination.into())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_cow_clone(source: &Path, destination: &Path) -> Result<(), BoxStoreError> {
+    use rustix::fs::{CloneFlags, fclonefileat};
+
+    ensure_destination_absent(destination)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| BoxStoreError::InvalidPath(destination.into()))?;
+    let name = destination
+        .file_name()
+        .ok_or_else(|| BoxStoreError::InvalidPath(destination.into()))?;
+    let source_file = File::open(source)?;
+    let parent_directory = File::open(parent)?;
+    fclonefileat(
+        &source_file,
+        &parent_directory,
+        name,
+        CloneFlags::NOFOLLOW | CloneFlags::NOOWNERCOPY,
+    )
+    .map_err(|error| {
+        if destination.symlink_metadata().is_ok() {
+            BoxStoreError::InvalidPath(destination.into())
+        } else {
+            BoxStoreError::CowCloneUnavailable {
+                detail: format!("clonefile failed for {}: {error}", source.display()),
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn native_cow_clone(source: &Path, destination: &Path) -> Result<(), BoxStoreError> {
+    use rustix::fs::ioctl_ficlone;
+
+    ensure_destination_absent(destination)?;
+    let source_file = File::open(source)?;
+    let destination_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                BoxStoreError::InvalidPath(destination.into())
+            } else {
+                error.into()
+            }
+        })?;
+    if let Err(error) = ioctl_ficlone(&destination_file, &source_file) {
+        drop(destination_file);
+        fs::remove_file(destination)?;
         return Err(BoxStoreError::CowCloneUnavailable {
-            detail: format!(
-                "clone command exited with status {:?}: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
+            detail: format!("FICLONE failed for {}: {error}", source.display()),
         });
     }
-    if fs::metadata(source)?.len() != fs::metadata(destination)?.len() {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn native_cow_clone(_source: &Path, _destination: &Path) -> Result<(), BoxStoreError> {
+    Err(BoxStoreError::CowCloneUnavailable {
+        detail: "native CoW cloning is supported only on macOS and Linux".into(),
+    })
+}
+
+fn sparse_copy(source: &Path, destination: &Path) -> Result<(), BoxStoreError> {
+    ensure_destination_absent(destination)?;
+    let mut source_file = File::open(source)?;
+    let mut destination_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                BoxStoreError::InvalidPath(destination.into())
+            } else {
+                error.into()
+            }
+        })?;
+    let copy_result = (|| {
+        let length = source_file.metadata()?.len();
+        destination_file.set_len(length)?;
+        copy_sparse_extents(&mut source_file, &mut destination_file, length).and_then(|supported| {
+            if supported {
+                Ok(())
+            } else {
+                copy_sparse_zero_ranges(&mut source_file, &mut destination_file, length)
+            }
+        })
+    })();
+    if let Err(error) = copy_result {
+        drop(destination_file);
         let _ = fs::remove_file(destination);
-        return Err(BoxStoreError::CorruptStore(
-            "CoW clone size does not match immutable base disk".into(),
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "illumos",
+    target_os = "solaris"
+))]
+fn copy_sparse_extents(source: &mut File, destination: &mut File, length: u64) -> io::Result<bool> {
+    use rustix::{fs::SeekFrom as RustixSeekFrom, io::Errno};
+
+    if length == 0 {
+        return Ok(true);
+    }
+    let mut data_offset = match rustix::fs::seek(&*source, RustixSeekFrom::Data(0)) {
+        Ok(offset) => offset,
+        Err(Errno::NXIO) => return Ok(true),
+        Err(Errno::INVAL | Errno::NOTSUP) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    while data_offset < length {
+        let hole_offset = rustix::fs::seek(&*source, RustixSeekFrom::Hole(data_offset))
+            .map_err(io::Error::from)?
+            .min(length);
+        copy_exact_range(source, destination, data_offset, hole_offset)?;
+        if hole_offset >= length {
+            break;
+        }
+        data_offset = match rustix::fs::seek(&*source, RustixSeekFrom::Data(hole_offset)) {
+            Ok(offset) => offset,
+            Err(Errno::NXIO) => break,
+            Err(error) => return Err(error.into()),
+        };
+    }
+    Ok(true)
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "illumos",
+    target_os = "solaris"
+)))]
+fn copy_sparse_extents(
+    _source: &mut File,
+    _destination: &mut File,
+    _length: u64,
+) -> io::Result<bool> {
+    Ok(false)
+}
+
+fn copy_exact_range(
+    source: &mut File,
+    destination: &mut File,
+    start: u64,
+    end: u64,
+) -> io::Result<()> {
+    let length = end
+        .checked_sub(start)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid sparse extent"))?;
+    source.seek(SeekFrom::Start(start))?;
+    destination.seek(SeekFrom::Start(start))?;
+    let copied = io::copy(&mut source.take(length), destination)?;
+    if copied != length {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "source disk changed while copying a sparse extent",
         ));
+    }
+    Ok(())
+}
+
+fn copy_sparse_zero_ranges(
+    source: &mut File,
+    destination: &mut File,
+    length: u64,
+) -> io::Result<()> {
+    const BUFFER_SIZE: usize = 1024 * 1024;
+
+    source.seek(SeekFrom::Start(0))?;
+    destination.seek(SeekFrom::Start(0))?;
+    let mut remaining = length;
+    let mut buffer = vec![0_u8; BUFFER_SIZE];
+    while remaining > 0 {
+        let requested = usize::try_from(remaining.min(BUFFER_SIZE as u64))
+            .map_err(|_| io::Error::other("copy buffer length overflow"))?;
+        source.read_exact(&mut buffer[..requested])?;
+        if buffer[..requested].iter().all(|byte| *byte == 0) {
+            destination.seek(SeekFrom::Current(
+                i64::try_from(requested)
+                    .map_err(|_| io::Error::other("copy seek offset overflow"))?,
+            ))?;
+        } else {
+            destination.write_all(&buffer[..requested])?;
+        }
+        remaining -= u64::try_from(requested)
+            .map_err(|_| io::Error::other("copy buffer length overflow"))?;
+    }
+    Ok(())
+}
+
+fn finish_disk_copy(
+    source: &Path,
+    destination: &Path,
+    source_label: &str,
+) -> Result<(), BoxStoreError> {
+    let source_size = fs::metadata(source)?.len();
+    let destination_size = fs::metadata(destination)?.len();
+    if source_size != destination_size {
+        let _ = fs::remove_file(destination);
+        return Err(BoxStoreError::CorruptStore(format!(
+            "copied disk size {destination_size} does not match {source_label} size {source_size}"
+        )));
     }
     File::open(destination)?.sync_all()?;
     Ok(())
@@ -487,7 +694,7 @@ fn to_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 
     use super::*;
 
@@ -603,7 +810,70 @@ mod tests {
         fs::write(&source, b"source").unwrap();
         fs::write(&destination, b"existing").unwrap();
 
-        assert!(crate::copy_disk(&source, &destination).is_err());
+        assert!(copy_disk(&source, &destination).is_err());
         assert_eq!(fs::read(destination).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn sparse_copy_preserves_content_size_and_holes() {
+        const SPARSE_BYTES: u64 = 64 * 1024 * 1024;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source.ext4");
+        let destination = temporary.path().join("destination.ext4");
+        let mut source_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&source)
+            .unwrap();
+        source_file.set_len(SPARSE_BYTES).unwrap();
+        source_file.write_all(b"head").unwrap();
+        source_file.seek(SeekFrom::Start(SPARSE_BYTES - 4)).unwrap();
+        source_file.write_all(b"tail").unwrap();
+        source_file.sync_all().unwrap();
+        drop(source_file);
+
+        sparse_copy(&source, &destination).unwrap();
+        finish_disk_copy(&source, &destination, "test source").unwrap();
+
+        let mut copied = File::open(&destination).unwrap();
+        let mut head = [0_u8; 4];
+        copied.read_exact(&mut head).unwrap();
+        assert_eq!(&head, b"head");
+        copied.seek(SeekFrom::Start(SPARSE_BYTES - 4)).unwrap();
+        let mut tail = [0_u8; 4];
+        copied.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, b"tail");
+        assert_eq!(copied.metadata().unwrap().len(), SPARSE_BYTES);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let allocated_bytes = copied.metadata().unwrap().blocks().saturating_mul(512);
+            assert!(allocated_bytes < SPARSE_BYTES / 4);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn native_cow_clone_is_content_independent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source.ext4");
+        let destination = temporary.path().join("destination.ext4");
+        fs::write(&source, b"source").unwrap();
+
+        match native_cow_clone(&source, &destination) {
+            Ok(()) => {
+                fs::write(&destination, b"cloned").unwrap();
+                assert_eq!(fs::read(&source).unwrap(), b"source");
+                assert_eq!(fs::read(&destination).unwrap(), b"cloned");
+            }
+            Err(BoxStoreError::CowCloneUnavailable { .. }) => {
+                assert!(!destination.exists());
+            }
+            Err(error) => panic!("unexpected clone error: {error}"),
+        }
     }
 }
