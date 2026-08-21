@@ -629,6 +629,25 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let state_dir = (args.backend == "libkrun")
         .then(|| resolve_state_dir(args.state_dir.as_deref()))
         .transpose()?;
+    if let Some(source) = args.workspace.as_deref() {
+        if !capabilities.workspace.is_supported() {
+            return Err("--workspace requires --backend libkrun".into());
+        }
+        if spec.cwd.is_some() {
+            return Err("--cwd and --workspace cannot be combined in this version".into());
+        }
+        let cache_dir = cache_dir
+            .as_deref()
+            .ok_or("--workspace requires a cache directory")?;
+        let state_dir = state_dir
+            .as_ref()
+            .ok_or("--workspace requires a state directory")?;
+        WorkspaceSnapshot::validate_managed_roots(
+            source,
+            cache_dir,
+            std::slice::from_ref(state_dir),
+        )?;
+    }
     let image_reference = if spec.box_id.is_some() {
         None
     } else {
@@ -664,23 +683,21 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let mke2fs = args.mke2fs.unwrap_or_else(default_mke2fs);
 
     let workspace = if let Some(source) = args.workspace.as_deref() {
-        if !capabilities.workspace.is_supported() {
-            return Err("--workspace requires --backend libkrun".into());
-        }
-        if spec.cwd.is_some() {
-            return Err("--cwd and --workspace cannot be combined in this version".into());
-        }
         let cache_dir = cache_dir
             .as_deref()
             .ok_or("--workspace requires a cache directory")?;
+        let state_dir = state_dir
+            .as_ref()
+            .ok_or("--workspace requires a state directory")?;
         let workspace_timeout = budget.remaining(RunStage::WorkspacePrepare)?;
         Some(
             budget
                 .observe(
                     RunStage::WorkspacePrepare,
-                    WorkspaceSnapshot::create_async(
+                    WorkspaceSnapshot::create_async_with_managed_roots(
                         source,
                         cache_dir,
+                        std::slice::from_ref(state_dir),
                         &mke2fs,
                         workspace_timeout,
                         report_workspace_stage,

@@ -181,7 +181,7 @@
 - [x] cache usage/list에서 rootfs를 매번 재귀 탐색하지 않도록 indexed metadata와 reconcile/repair를 제공한다.
   - logical size와 sparse/CoW physical allocation을 구분해 표시한다.
 
-- [ ] workspace snapshot의 source/image/source 반복 scan을 줄이면서 build 전후 source mutation 검증은 유지한다.
+- [x] workspace snapshot의 source/image/source 반복 scan을 줄이면서 build 전후 source mutation 검증은 유지한다.
   - file/inode count를 ext4 sizing에 반영한다.
   - cache/state 경로가 source tree 내부에 있으면 재귀 포함 전에 거부한다.
 

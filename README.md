@@ -143,7 +143,7 @@ morae run \
   -- /bin/sh -c 'ls -la /workspace'
 ```
 
-moraebox walks the host tree without following symlinks, rejects unsafe entries, creates a read-only ext4 snapshot, and attaches it at `/workspace`. It does not expose the original host directory to the VM.
+moraebox walks the host tree without following symlinks, rejects unsafe entries, sizes ext4 data and inodes from the scan, creates a read-only snapshot, and attaches it at `/workspace`. It does not expose the original host directory to the VM. Cache and state roots must remain outside the workspace source; overlapping paths are rejected before image preparation.
 
 ### Use an interactive terminal
 

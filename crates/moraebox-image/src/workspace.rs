@@ -3,6 +3,7 @@ use std::{
     io::{self, Read},
     path::{Component, Path, PathBuf},
     process::{Command as StdCommand, Stdio},
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -10,14 +11,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 
-use crate::Digest;
+use crate::{Digest, durability::sync_directory};
 
 const MIN_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const IMAGE_HEADROOM_BYTES: u64 = 32 * 1024 * 1024;
+const EXT4_BLOCK_BYTES: u64 = 4 * 1024;
+const EXT4_INODE_BYTES: u64 = 256;
+const EXT4_FAST_SYMLINK_BYTES: u64 = 60;
+const MIN_INODE_HEADROOM: u64 = 128;
+const WORKSPACE_IMAGE_METADATA_SCHEMA_VERSION: u32 = 1;
 const MKE2FS_STDERR_LIMIT: usize = 64 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -36,7 +43,7 @@ impl std::fmt::Display for WorkspaceStage {
             Self::ScanSource => "scanning source",
             Self::CreateImage => "creating sparse image",
             Self::PopulateFilesystem => "populating ext4 image with mke2fs",
-            Self::HashImage => "hashing ext4 image",
+            Self::HashImage => "checking ext4 image digest",
             Self::VerifySource => "verifying source is unchanged",
         })
     }
@@ -46,26 +53,48 @@ impl std::fmt::Display for WorkspaceStage {
 pub struct WorkspaceSnapshot {
     pub source: PathBuf,
     pub source_digest: Digest,
+    pub source_metadata_digest: Digest,
     pub image_path: PathBuf,
     pub image_digest: Digest,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SourceTreeStats {
+    content_bytes: u64,
+    entry_count: u64,
+    estimated_payload_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SourceScan {
+    content_digest: Digest,
+    metadata_digest: Digest,
+    stats: SourceTreeStats,
+}
+
 impl WorkspaceSnapshot {
     pub fn create(source: &Path, cache_root: &Path, mke2fs: &Path) -> Result<Self, WorkspaceError> {
-        let source = source.canonicalize()?;
-        if !source.is_dir() {
-            return Err(WorkspaceError::NotDirectory(source));
-        }
-        let cache_root = resolve_for_overlap(cache_root)?;
-        ensure_disjoint(&source, &cache_root)?;
-        let (source_digest, content_bytes) = digest_tree_with_size(&source)?;
+        Self::create_with_managed_roots(source, cache_root, &[], mke2fs)
+    }
+
+    pub fn create_with_managed_roots(
+        source: &Path,
+        cache_root: &Path,
+        managed_roots: &[PathBuf],
+        mke2fs: &Path,
+    ) -> Result<Self, WorkspaceError> {
+        let (source, cache_root) = resolve_workspace_paths(source, cache_root, managed_roots)?;
+        let scan = scan_source(&source)?;
+        let source_digest = scan.content_digest;
         let directory = cache_root.join("workspaces/sha256");
         fs::create_dir_all(&directory)?;
         let image_path = directory.join(format!("{}.ext4", source_digest.hex()));
         if !image_path.exists() {
-            let staging = StagingImage::create(&directory, &source_digest, content_bytes)?;
+            let staging = StagingImage::create(&directory, &source_digest, scan.stats)?;
             let output = StdCommand::new(mke2fs)
-                .args(["-q", "-t", "ext4", "-F", "-d"])
+                .args(["-q", "-t", "ext4", "-F", "-N"])
+                .arg(provisioned_inode_count(scan.stats).to_string())
+                .arg("-d")
                 .arg(&source)
                 .arg(staging.path())
                 .env_clear()
@@ -79,20 +108,48 @@ impl WorkspaceSnapshot {
             set_read_only(staging.path())?;
             staging.publish(&image_path)?;
         }
-        let image_digest = digest_file(&image_path)?;
-        let snapshot = Self {
+        let image_digest = workspace_image_digest(
+            &image_path,
+            &workspace_image_metadata_path(&cache_root, &source_digest),
+            &source_digest,
+            None,
+        )?;
+        let source_metadata_digest =
+            verify_source_state(&source, &source_digest, &scan.metadata_digest, None)?;
+        Ok(Self {
             source,
             source_digest,
+            source_metadata_digest,
             image_path,
             image_digest,
-        };
-        snapshot.verify_source_unchanged()?;
-        Ok(snapshot)
+        })
     }
 
     pub async fn create_async<F>(
         source: &Path,
         cache_root: &Path,
+        mke2fs: &Path,
+        stage_timeout: Option<Duration>,
+        progress: F,
+    ) -> Result<Self, WorkspaceError>
+    where
+        F: FnMut(WorkspaceStage),
+    {
+        Self::create_async_with_managed_roots(
+            source,
+            cache_root,
+            &[],
+            mke2fs,
+            stage_timeout,
+            progress,
+        )
+        .await
+    }
+
+    pub async fn create_async_with_managed_roots<F>(
+        source: &Path,
+        cache_root: &Path,
+        managed_roots: &[PathBuf],
         mke2fs: &Path,
         stage_timeout: Option<Duration>,
         mut progress: F,
@@ -101,22 +158,17 @@ impl WorkspaceSnapshot {
         F: FnMut(WorkspaceStage),
     {
         let deadline = WorkspaceDeadline::new(stage_timeout);
-        let source = source.canonicalize()?;
-        if !source.is_dir() {
-            return Err(WorkspaceError::NotDirectory(source));
-        }
-        let cache_root = resolve_for_overlap(cache_root)?;
-        ensure_disjoint(&source, &cache_root)?;
+        let (source, cache_root) = resolve_workspace_paths(source, cache_root, managed_roots)?;
 
         let scan_timeout = deadline.remaining(WorkspaceStage::ScanSource)?;
         progress(WorkspaceStage::ScanSource);
         let digest_source = source.clone();
-        let (source_digest, content_bytes) =
-            run_blocking_stage(WorkspaceStage::ScanSource, scan_timeout, move |cancelled| {
-                digest_tree_with_size_cancel(&digest_source, &cancelled)
-            })
-            .await
-            .map_err(|error| deadline.normalize_timeout(error))?;
+        let scan = run_blocking_stage(WorkspaceStage::ScanSource, scan_timeout, move |cancelled| {
+            scan_source_cancel(&digest_source, &cancelled)
+        })
+        .await
+        .map_err(|error| deadline.normalize_timeout(error))?;
+        let source_digest = scan.content_digest.clone();
 
         let directory = cache_root.join("workspaces/sha256");
         let image_path = directory.join(format!("{}.ext4", source_digest.hex()));
@@ -131,16 +183,22 @@ impl WorkspaceSnapshot {
                 move |cancelled| {
                     check_cancelled(Some(&cancelled))?;
                     fs::create_dir_all(&staging_directory)?;
-                    StagingImage::create(&staging_directory, &staging_digest, content_bytes)
+                    StagingImage::create(&staging_directory, &staging_digest, scan.stats)
                 },
             )
             .await
             .map_err(|error| deadline.normalize_timeout(error))?;
             let populate_timeout = deadline.remaining(WorkspaceStage::PopulateFilesystem)?;
             progress(WorkspaceStage::PopulateFilesystem);
-            populate_ext4(mke2fs, &source, staging.path(), populate_timeout)
-                .await
-                .map_err(|error| deadline.normalize_timeout(error))?;
+            populate_ext4(
+                mke2fs,
+                &source,
+                staging.path(),
+                provisioned_inode_count(scan.stats),
+                populate_timeout,
+            )
+            .await
+            .map_err(|error| deadline.normalize_timeout(error))?;
             set_read_only(staging.path())?;
             staging.publish(&image_path)?;
         }
@@ -148,9 +206,16 @@ impl WorkspaceSnapshot {
         let hash_timeout = deadline.remaining(WorkspaceStage::HashImage)?;
         progress(WorkspaceStage::HashImage);
         let digest_image_path = image_path.clone();
+        let digest_metadata_path = workspace_image_metadata_path(&cache_root, &source_digest);
+        let digest_source = source_digest.clone();
         let image_digest =
             run_blocking_stage(WorkspaceStage::HashImage, hash_timeout, move |cancelled| {
-                digest_file_cancel(&digest_image_path, &cancelled)
+                workspace_image_digest(
+                    &digest_image_path,
+                    &digest_metadata_path,
+                    &digest_source,
+                    Some(&cancelled),
+                )
             })
             .await
             .map_err(|error| deadline.normalize_timeout(error))?;
@@ -158,38 +223,48 @@ impl WorkspaceSnapshot {
         let verify_timeout = deadline.remaining(WorkspaceStage::VerifySource)?;
         progress(WorkspaceStage::VerifySource);
         let verify_source = source.clone();
-        let actual = run_blocking_stage(
+        let expected_source_digest = source_digest.clone();
+        let expected_metadata_digest = scan.metadata_digest;
+        let source_metadata_digest = run_blocking_stage(
             WorkspaceStage::VerifySource,
             verify_timeout,
-            move |cancelled| digest_tree_cancel(&verify_source, &cancelled),
+            move |cancelled| {
+                verify_source_state(
+                    &verify_source,
+                    &expected_source_digest,
+                    &expected_metadata_digest,
+                    Some(&cancelled),
+                )
+            },
         )
         .await
         .map_err(|error| deadline.normalize_timeout(error))?;
-        if actual != source_digest {
-            return Err(WorkspaceError::SourceChanged {
-                expected: source_digest,
-                actual,
-            });
-        }
 
         Ok(Self {
             source,
             source_digest,
+            source_metadata_digest,
             image_path,
             image_digest,
         })
     }
 
     pub fn verify_source_unchanged(&self) -> Result<(), WorkspaceError> {
-        let actual = digest_tree(&self.source)?;
-        if actual == self.source_digest {
-            Ok(())
-        } else {
-            Err(WorkspaceError::SourceChanged {
-                expected: self.source_digest.clone(),
-                actual,
-            })
-        }
+        verify_source_state(
+            &self.source,
+            &self.source_digest,
+            &self.source_metadata_digest,
+            None,
+        )
+        .map(|_| ())
+    }
+
+    pub fn validate_managed_roots(
+        source: &Path,
+        cache_root: &Path,
+        managed_roots: &[PathBuf],
+    ) -> Result<(), WorkspaceError> {
+        resolve_workspace_paths(source, cache_root, managed_roots).map(|_| ())
     }
 }
 
@@ -232,61 +307,213 @@ impl WorkspaceDeadline {
 }
 
 pub fn digest_tree(root: &Path) -> Result<Digest, WorkspaceError> {
-    digest_tree_with_size(root).map(|(digest, _)| digest)
+    scan_source(root).map(|scan| scan.content_digest)
 }
 
-fn digest_tree_with_size(root: &Path) -> Result<(Digest, u64), WorkspaceError> {
-    digest_tree_with_size_impl(root, None)
+fn scan_source(root: &Path) -> Result<SourceScan, WorkspaceError> {
+    scan_source_impl(root, None)
 }
 
-fn digest_tree_with_size_cancel(
-    root: &Path,
-    cancelled: &AtomicBool,
-) -> Result<(Digest, u64), WorkspaceError> {
-    digest_tree_with_size_impl(root, Some(cancelled))
+fn scan_source_cancel(root: &Path, cancelled: &AtomicBool) -> Result<SourceScan, WorkspaceError> {
+    scan_source_impl(root, Some(cancelled))
 }
 
-fn digest_tree_with_size_impl(
+fn scan_source_impl(
     root: &Path,
     cancelled: Option<&AtomicBool>,
-) -> Result<(Digest, u64), WorkspaceError> {
-    let mut hasher = Sha256::new();
-    let mut content_bytes = 0_u64;
+) -> Result<SourceScan, WorkspaceError> {
+    let mut content_hasher = Sha256::new();
+    let mut metadata_hasher = Sha256::new();
+    let mut stats = SourceTreeStats {
+        estimated_payload_bytes: EXT4_BLOCK_BYTES,
+        ..SourceTreeStats::default()
+    };
     walk(root, root, cancelled, &mut |relative, metadata| {
         check_cancelled(cancelled)?;
-        hash_path(&mut hasher, relative);
+        stats.entry_count = stats.entry_count.saturating_add(1);
+        hash_path(&mut content_hasher, relative);
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            hasher.update(metadata.mode().to_le_bytes());
+            content_hasher.update(metadata.mode().to_le_bytes());
         }
         let kind = metadata.file_type();
         if kind.is_file() {
-            hasher.update(b"file\0");
+            content_hasher.update(b"file\0");
+            hash_entry_metadata(&mut metadata_hasher, relative, metadata, None);
+            let before = source_entry_fingerprint(metadata);
             let mut file = File::open(root.join(relative))?;
             let mut buffer = vec![0_u8; 64 * 1024];
+            let mut file_bytes = 0_u64;
             loop {
                 check_cancelled(cancelled)?;
                 let count = file.read(&mut buffer)?;
                 if count == 0 {
                     break;
                 }
-                hasher.update(&buffer[..count]);
-                content_bytes =
-                    content_bytes.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+                content_hasher.update(&buffer[..count]);
+                file_bytes = file_bytes.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+            }
+            stats.content_bytes = stats.content_bytes.saturating_add(file_bytes);
+            stats.estimated_payload_bytes = stats
+                .estimated_payload_bytes
+                .saturating_add(round_up_to_block(file_bytes));
+            let path = root.join(relative);
+            let after = fs::symlink_metadata(&path)?;
+            if source_entry_fingerprint(&after) != before {
+                return Err(WorkspaceError::SourceChangedDuringScan(path));
             }
         } else if kind.is_dir() {
-            hasher.update(b"dir\0");
+            content_hasher.update(b"dir\0");
+            hash_entry_metadata(&mut metadata_hasher, relative, metadata, None);
+            stats.estimated_payload_bytes = stats
+                .estimated_payload_bytes
+                .saturating_add(EXT4_BLOCK_BYTES);
         } else if kind.is_symlink() {
-            hasher.update(b"symlink\0");
+            content_hasher.update(b"symlink\0");
             let target = fs::read_link(root.join(relative))?;
-            hash_path(&mut hasher, &target);
+            hash_path(&mut content_hasher, &target);
+            hash_entry_metadata(&mut metadata_hasher, relative, metadata, Some(&target));
+            if metadata.len() > EXT4_FAST_SYMLINK_BYTES {
+                stats.estimated_payload_bytes = stats
+                    .estimated_payload_bytes
+                    .saturating_add(round_up_to_block(metadata.len()));
+            }
         } else {
             return Err(WorkspaceError::UnsupportedFile(root.join(relative)));
         }
         Ok(())
     })?;
-    Ok((Digest::from_sha256(hasher.finalize().into()), content_bytes))
+    Ok(SourceScan {
+        content_digest: Digest::from_sha256(content_hasher.finalize().into()),
+        metadata_digest: Digest::from_sha256(metadata_hasher.finalize().into()),
+        stats,
+    })
+}
+
+fn metadata_tree_digest(
+    root: &Path,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Digest, WorkspaceError> {
+    let mut hasher = Sha256::new();
+    walk(root, root, cancelled, &mut |relative, metadata| {
+        check_cancelled(cancelled)?;
+        let target = if metadata.file_type().is_symlink() {
+            Some(fs::read_link(root.join(relative))?)
+        } else {
+            None
+        };
+        hash_entry_metadata(&mut hasher, relative, metadata, target.as_deref());
+        Ok(())
+    })?;
+    Ok(Digest::from_sha256(hasher.finalize().into()))
+}
+
+fn verify_source_state(
+    root: &Path,
+    expected_content: &Digest,
+    expected_metadata: &Digest,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Digest, WorkspaceError> {
+    let actual_metadata = metadata_tree_digest(root, cancelled)?;
+    if &actual_metadata == expected_metadata {
+        return Ok(actual_metadata);
+    }
+    let actual = scan_source_impl(root, cancelled)?;
+    if &actual.content_digest == expected_content {
+        Ok(actual.metadata_digest)
+    } else {
+        Err(WorkspaceError::SourceChanged {
+            expected: expected_content.clone(),
+            actual: actual.content_digest,
+        })
+    }
+}
+
+fn hash_entry_metadata(
+    hasher: &mut Sha256,
+    relative: &Path,
+    metadata: &fs::Metadata,
+    symlink_target: Option<&Path>,
+) {
+    hash_path(hasher, relative);
+    let kind = metadata.file_type();
+    hasher.update(if kind.is_file() {
+        b"file\0".as_slice()
+    } else if kind.is_dir() {
+        b"dir\0".as_slice()
+    } else if kind.is_symlink() {
+        b"symlink\0".as_slice()
+    } else {
+        b"other\0".as_slice()
+    });
+    hasher.update(metadata.len().to_le_bytes());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        hasher.update(metadata.mode().to_le_bytes());
+        hasher.update(metadata.dev().to_le_bytes());
+        hasher.update(metadata.ino().to_le_bytes());
+        hasher.update(metadata.mtime().to_le_bytes());
+        hasher.update(metadata.mtime_nsec().to_le_bytes());
+        hasher.update(metadata.ctime().to_le_bytes());
+        hasher.update(metadata.ctime_nsec().to_le_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        hasher.update([u8::from(metadata.permissions().readonly())]);
+        if let Ok(modified) = metadata.modified()
+            && let Ok(elapsed) = modified.duration_since(std::time::UNIX_EPOCH)
+        {
+            hasher.update(elapsed.as_secs().to_le_bytes());
+            hasher.update(elapsed.subsec_nanos().to_le_bytes());
+        }
+    }
+    if let Some(target) = symlink_target {
+        hash_path(hasher, target);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceEntryFingerprint {
+    len: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    mtime: i64,
+    #[cfg(unix)]
+    mtime_nsec: i64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+fn source_entry_fingerprint(metadata: &fs::Metadata) -> SourceEntryFingerprint {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        SourceEntryFingerprint {
+            len: metadata.len(),
+            mode: metadata.mode(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+    #[cfg(not(unix))]
+    SourceEntryFingerprint {
+        len: metadata.len(),
+    }
 }
 
 fn walk(
@@ -336,14 +563,6 @@ fn hash_path(hasher: &mut Sha256, path: &Path) {
     hasher.update([0]);
 }
 
-fn digest_file(path: &Path) -> Result<Digest, WorkspaceError> {
-    digest_file_impl(path, None)
-}
-
-fn digest_file_cancel(path: &Path, cancelled: &AtomicBool) -> Result<Digest, WorkspaceError> {
-    digest_file_impl(path, Some(cancelled))
-}
-
 fn digest_file_impl(path: &Path, cancelled: Option<&AtomicBool>) -> Result<Digest, WorkspaceError> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
@@ -359,8 +578,174 @@ fn digest_file_impl(path: &Path, cancelled: Option<&AtomicBool>) -> Result<Diges
     Ok(Digest::from_sha256(hasher.finalize().into()))
 }
 
-fn digest_tree_cancel(root: &Path, cancelled: &AtomicBool) -> Result<Digest, WorkspaceError> {
-    digest_tree_with_size_cancel(root, cancelled).map(|(digest, _)| digest)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkspaceImageMetadata {
+    schema_version: u32,
+    source_digest: String,
+    image_digest: String,
+    image: WorkspaceImageFingerprint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkspaceImageFingerprint {
+    len: u64,
+    readonly: bool,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    mtime: i64,
+    #[cfg(unix)]
+    mtime_nsec: i64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+    #[cfg(not(unix))]
+    modified_secs: Option<u64>,
+    #[cfg(not(unix))]
+    modified_nanos: Option<u32>,
+}
+
+fn workspace_image_metadata_path(cache_root: &Path, source_digest: &Digest) -> PathBuf {
+    cache_root
+        .join("workspaces/metadata/sha256")
+        .join(format!("{}.json", source_digest.hex()))
+}
+
+fn workspace_image_digest(
+    image_path: &Path,
+    metadata_path: &Path,
+    source_digest: &Digest,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Digest, WorkspaceError> {
+    let before = workspace_image_fingerprint(image_path)?;
+    if let Some(metadata) = read_workspace_image_metadata(metadata_path)?
+        && metadata.schema_version == WORKSPACE_IMAGE_METADATA_SCHEMA_VERSION
+        && metadata.source_digest == source_digest.to_string()
+        && metadata.image == before
+        && let Ok(digest) = Digest::from_str(&metadata.image_digest)
+    {
+        return Ok(digest);
+    }
+
+    let image_digest = digest_file_impl(image_path, cancelled)?;
+    let after = workspace_image_fingerprint(image_path)?;
+    if after != before {
+        return Err(WorkspaceError::ImageChangedDuringHash(image_path.into()));
+    }
+    write_workspace_image_metadata(
+        metadata_path,
+        &WorkspaceImageMetadata {
+            schema_version: WORKSPACE_IMAGE_METADATA_SCHEMA_VERSION,
+            source_digest: source_digest.to_string(),
+            image_digest: image_digest.to_string(),
+            image: after,
+        },
+    )?;
+    Ok(image_digest)
+}
+
+fn read_workspace_image_metadata(
+    path: &Path,
+) -> Result<Option<WorkspaceImageMetadata>, WorkspaceError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes).ok())
+}
+
+fn workspace_image_fingerprint(path: &Path) -> Result<WorkspaceImageFingerprint, WorkspaceError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(WorkspaceError::InvalidWorkspaceImage(path.into()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(WorkspaceImageFingerprint {
+            len: metadata.len(),
+            readonly: metadata.permissions().readonly(),
+            mode: metadata.mode(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok());
+        Ok(WorkspaceImageFingerprint {
+            len: metadata.len(),
+            readonly: metadata.permissions().readonly(),
+            modified_secs: modified.map(|value| value.as_secs()),
+            modified_nanos: modified.map(|value| value.subsec_nanos()),
+        })
+    }
+}
+
+fn write_workspace_image_metadata(
+    path: &Path,
+    value: &WorkspaceImageMetadata,
+) -> Result<(), WorkspaceError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| WorkspaceError::InvalidWorkspaceMetadata(path.into()))?;
+    fs::create_dir_all(parent)?;
+    if fs::symlink_metadata(path)
+        .is_ok_and(|metadata| !metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        return Err(WorkspaceError::InvalidWorkspaceMetadata(path.into()));
+    }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| WorkspaceError::InvalidWorkspaceMetadata(path.into()))?;
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
+    let result = (|| -> Result<(), WorkspaceError> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        serde_json::to_writer_pretty(&file, value)?;
+        file.sync_all()?;
+        drop(file);
+        match fs::rename(&temporary, path) {
+            Ok(()) => {}
+            Err(_)
+                if fs::symlink_metadata(path).is_ok_and(|metadata| {
+                    metadata.is_file() && !metadata.file_type().is_symlink()
+                }) =>
+            {
+                fs::remove_file(path)?;
+                fs::rename(&temporary, path)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        sync_directory(parent)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), WorkspaceError> {
@@ -416,6 +801,29 @@ fn resolve_for_overlap(path: &Path) -> Result<PathBuf, WorkspaceError> {
         resolved.push(name);
     }
     Ok(resolved)
+}
+
+fn resolve_workspace_paths(
+    source: &Path,
+    cache_root: &Path,
+    managed_roots: &[PathBuf],
+) -> Result<(PathBuf, PathBuf), WorkspaceError> {
+    let source = source.canonicalize()?;
+    if !source.is_dir() {
+        return Err(WorkspaceError::NotDirectory(source));
+    }
+    let cache_root = resolve_for_overlap(cache_root)?;
+    ensure_disjoint(&source, &cache_root)?;
+    for managed_root in managed_roots {
+        let managed_root = resolve_for_overlap(managed_root)?;
+        if source.starts_with(&managed_root) || managed_root.starts_with(&source) {
+            return Err(WorkspaceError::OverlappingManagedPath {
+                workspace_source: source,
+                managed_path: managed_root,
+            });
+        }
+    }
+    Ok((source, cache_root))
 }
 
 fn ensure_disjoint(source: &Path, cache_root: &Path) -> Result<(), WorkspaceError> {
@@ -506,7 +914,7 @@ impl StagingImage {
     fn create(
         directory: &Path,
         source_digest: &Digest,
-        content_bytes: u64,
+        stats: SourceTreeStats,
     ) -> Result<Self, WorkspaceError> {
         for _ in 0..100 {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -519,7 +927,7 @@ impl StagingImage {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(file) => {
                     let staging = Self { path };
-                    file.set_len(image_size(content_bytes))?;
+                    file.set_len(image_size(stats))?;
                     return Ok(staging);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -562,11 +970,14 @@ async fn populate_ext4(
     mke2fs: &Path,
     source: &Path,
     image: &Path,
+    inode_count: u64,
     timeout: Option<Duration>,
 ) -> Result<(), WorkspaceError> {
     let mut command = tokio::process::Command::new(mke2fs);
     command
-        .args(["-q", "-t", "ext4", "-F", "-d"])
+        .args(["-q", "-t", "ext4", "-F", "-N"])
+        .arg(inode_count.to_string())
+        .arg("-d")
         .arg(source)
         .arg(image)
         .stdin(Stdio::null())
@@ -682,12 +1093,37 @@ async fn join_stderr(
         .map_err(WorkspaceError::Io)
 }
 
-fn image_size(content_bytes: u64) -> u64 {
-    let requested = content_bytes
+fn image_size(stats: SourceTreeStats) -> u64 {
+    let inode_table_bytes = provisioned_inode_count(stats).saturating_mul(EXT4_INODE_BYTES);
+    let estimated = stats
+        .estimated_payload_bytes
+        .max(stats.content_bytes)
+        .saturating_add(inode_table_bytes);
+    let requested = estimated
         .saturating_mul(2)
         .saturating_add(IMAGE_HEADROOM_BYTES)
         .max(MIN_IMAGE_BYTES);
-    requested.next_multiple_of(4 * 1024 * 1024)
+    align_up_saturating(requested, 4 * 1024 * 1024)
+}
+
+fn provisioned_inode_count(stats: SourceTreeStats) -> u64 {
+    let required = stats.entry_count.saturating_add(1);
+    required.saturating_add((required / 4).max(MIN_INODE_HEADROOM))
+}
+
+fn round_up_to_block(bytes: u64) -> u64 {
+    align_up_saturating(bytes, EXT4_BLOCK_BYTES)
+}
+
+fn align_up_saturating(bytes: u64, alignment: u64) -> u64 {
+    let remainder = bytes % alignment;
+    if remainder == 0 {
+        bytes
+    } else {
+        bytes
+            .checked_add(alignment - remainder)
+            .unwrap_or(u64::MAX - (u64::MAX % alignment))
+    }
 }
 
 fn set_read_only(path: &Path) -> Result<(), WorkspaceError> {
@@ -705,6 +1141,14 @@ pub enum WorkspaceError {
     UnsafePath(PathBuf),
     #[error("unsupported workspace file type: {}", .0.display())]
     UnsupportedFile(PathBuf),
+    #[error("workspace file changed while it was being scanned: {}", .0.display())]
+    SourceChangedDuringScan(PathBuf),
+    #[error("workspace image must be a regular non-symlink file: {}", .0.display())]
+    InvalidWorkspaceImage(PathBuf),
+    #[error("invalid workspace image metadata path: {}", .0.display())]
+    InvalidWorkspaceMetadata(PathBuf),
+    #[error("workspace image changed while it was being hashed: {}", .0.display())]
+    ImageChangedDuringHash(PathBuf),
     #[error(
         "workspace source and cache must not overlap: source={}, cache={}",
         workspace_source.display(),
@@ -713,6 +1157,15 @@ pub enum WorkspaceError {
     OverlappingPaths {
         workspace_source: PathBuf,
         cache: PathBuf,
+    },
+    #[error(
+        "workspace source and managed path must not overlap: source={}, managed={}",
+        workspace_source.display(),
+        managed_path.display()
+    )]
+    OverlappingManagedPath {
+        workspace_source: PathBuf,
+        managed_path: PathBuf,
     },
     #[error("workspace preparation timed out after {timeout:?} while {stage}")]
     TimedOut {
@@ -732,6 +1185,8 @@ pub enum WorkspaceError {
     SourceChanged { expected: Digest, actual: Digest },
     #[error("workspace snapshot I/O failed: {0}")]
     Io(#[from] io::Error),
+    #[error("workspace snapshot metadata is invalid: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 #[cfg(test)]
@@ -801,9 +1256,70 @@ mod tests {
     }
 
     #[test]
+    fn source_scan_collects_stats_and_metadata_verification_preserves_content_semantics() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        fs::write(&file, b"content").unwrap();
+        let first = scan_source(root.path()).unwrap();
+        assert_eq!(first.stats.content_bytes, 7);
+        assert_eq!(first.stats.entry_count, 1);
+
+        let replacement = root.path().join("replacement");
+        fs::write(&replacement, b"content").unwrap();
+        fs::rename(&replacement, &file).unwrap();
+        let verified = verify_source_state(
+            root.path(),
+            &first.content_digest,
+            &first.metadata_digest,
+            None,
+        )
+        .unwrap();
+        assert_ne!(verified, first.metadata_digest);
+        assert_eq!(digest_tree(root.path()).unwrap(), first.content_digest);
+
+        fs::write(&file, b"changed").unwrap();
+        assert!(matches!(
+            verify_source_state(root.path(), &first.content_digest, &verified, None,),
+            Err(WorkspaceError::SourceChanged { .. })
+        ));
+    }
+
+    #[test]
     fn image_has_headroom_and_alignment() {
-        assert_eq!(image_size(1), MIN_IMAGE_BYTES);
-        assert_eq!(image_size(100 * 1024 * 1024) % (4 * 1024 * 1024), 0);
+        assert_eq!(
+            image_size(SourceTreeStats {
+                content_bytes: 1,
+                entry_count: 1,
+                estimated_payload_bytes: EXT4_BLOCK_BYTES * 2,
+            }),
+            MIN_IMAGE_BYTES
+        );
+        assert_eq!(
+            image_size(SourceTreeStats {
+                content_bytes: 100 * 1024 * 1024,
+                entry_count: 1,
+                estimated_payload_bytes: 100 * 1024 * 1024,
+            }) % (4 * 1024 * 1024),
+            0
+        );
+    }
+
+    #[test]
+    fn entry_heavy_trees_increase_image_and_inode_capacity() {
+        let small = SourceTreeStats {
+            content_bytes: 1,
+            entry_count: 1,
+            estimated_payload_bytes: EXT4_BLOCK_BYTES * 2,
+        };
+        let many_tiny_files = SourceTreeStats {
+            content_bytes: 100_000,
+            entry_count: 100_000,
+            estimated_payload_bytes: EXT4_BLOCK_BYTES * 100_001,
+        };
+
+        assert!(image_size(many_tiny_files) > image_size(small));
+        assert_eq!(provisioned_inode_count(small), 130);
+        assert_eq!(provisioned_inode_count(many_tiny_files), 125_001);
     }
 
     #[test]
@@ -820,6 +1336,30 @@ mod tests {
         assert!(!cache.exists());
     }
 
+    #[test]
+    fn rejects_state_nested_inside_workspace_before_scanning_it() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let cache = root.path().join("cache");
+        let state = source.join(".moraebox/state");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), b"content").unwrap();
+
+        let error = WorkspaceSnapshot::validate_managed_roots(
+            &source,
+            &cache,
+            std::slice::from_ref(&state),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WorkspaceError::OverlappingManagedPath { .. }
+        ));
+        assert!(!cache.exists());
+        assert!(!state.exists());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn async_snapshot_reports_stages_and_publishes_read_only_image() {
@@ -828,7 +1368,10 @@ mod tests {
         let cache = root.path().join("cache");
         fs::create_dir(&source).unwrap();
         fs::write(source.join("file"), b"content").unwrap();
-        let mke2fs = executable_script(root.path(), "#!/bin/sh\nexit 0\n");
+        let mke2fs = executable_script(
+            root.path(),
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0}.args\"\nexit 0\n",
+        );
         let mut stages = Vec::new();
 
         let snapshot = WorkspaceSnapshot::create_async(
@@ -859,6 +1402,37 @@ mod tests {
                 .readonly()
         );
         assert!(staging_files(&cache).is_empty());
+        let arguments = fs::read_to_string(root.path().join("fake-mke2fs.args")).unwrap();
+        let arguments = arguments.lines().collect::<Vec<_>>();
+        assert!(arguments.windows(2).any(|pair| pair == ["-N", "130"]));
+        assert!(
+            workspace_image_metadata_path(&cache, &snapshot.source_digest).is_file(),
+            "workspace image digest metadata was not published"
+        );
+    }
+
+    #[test]
+    fn workspace_image_digest_metadata_is_reused_and_refreshed_after_change() {
+        let root = tempfile::tempdir().unwrap();
+        let image = root.path().join("image.ext4");
+        let metadata = root.path().join("metadata/image.json");
+        let source = Digest::from_bytes(b"source");
+        fs::write(&image, b"first").unwrap();
+
+        let first = workspace_image_digest(&image, &metadata, &source, None).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(
+            workspace_image_digest(&image, &metadata, &source, None).unwrap(),
+            first
+        );
+
+        fs::write(&image, b"second").unwrap();
+        let second = workspace_image_digest(&image, &metadata, &source, None).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(
+            workspace_image_digest(&image, &metadata, &source, None).unwrap(),
+            second
+        );
     }
 
     #[cfg(unix)]
