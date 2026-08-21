@@ -114,7 +114,7 @@
 
 ### Runtime와 API 일관성
 
-- [ ] `Supervisor`와 `SessionManager`의 실행·종료·I/O 로직을 하나의 lifecycle engine으로 통합한다.
+- [x] `Supervisor`와 `SessionManager`의 실행·종료·I/O 로직을 하나의 lifecycle engine으로 통합한다.
   - CLI one-shot, SDK session, MCP가 `prepare → start → ready → running → stop → dead`를 공유한다.
   - process backend와 libkrun backend에 같은 timeout·termination semantics를 적용한다.
 

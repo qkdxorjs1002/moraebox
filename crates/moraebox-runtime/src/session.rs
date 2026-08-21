@@ -1,13 +1,13 @@
 use std::{
     future::Future,
     process::ExitStatus,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
 use moraebox_core::{
-    OutputBuffer, OutputChannel, OutputRead, OutputReadError, RunSpec, SessionId, SessionState,
-    Signal, TerminationReason,
+    Lifecycle, LifecycleEvent, OutputBuffer, OutputChannel, OutputRead, OutputReadError, RunSpec,
+    SessionId, SessionState, Signal, TerminationReason,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -17,7 +17,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use crate::{Backend, BackendError};
+use crate::{Backend, BackendError, StartupMetrics, TraceEvent, TraceKind};
 
 const STDIN_QUEUE_ITEMS: usize = 32;
 const STDIN_QUEUE_BYTES: usize = 1024 * 1024;
@@ -32,74 +32,108 @@ impl SessionManager {
         Self { backend }
     }
 
-    pub async fn start(&self, mut spec: RunSpec) -> Result<SessionHandle, SessionError> {
-        spec.validate().map_err(BackendError::InvalidSpec)?;
-        let started = Instant::now();
-        let spawned = self.backend.spawn(&spec).await?;
-        let initial = SessionStatus {
-            session_id: spec.session_id,
-            backend: self.backend.name().into(),
-            state: SessionState::Running,
-            termination_reason: None,
-            exit_code: None,
-            signal: None,
-            timed_out: false,
-            elapsed_micros: 0,
-        };
-        let (status_sender, status_receiver) = watch::channel(initial);
-        let output = Arc::new(Mutex::new(OutputBuffer::new(spec.output_limit)));
-        let (output_cursor_sender, output_cursor_receiver) = watch::channel(0_u64);
-        let (command_sender, command_receiver) = mpsc::channel(32);
-        let (stdin_sender, stdin_receiver) = mpsc::channel(STDIN_QUEUE_ITEMS);
-        let stdin_bytes = Arc::new(Semaphore::new(STDIN_QUEUE_BYTES));
-        let (stdin_shutdown_sender, stdin_shutdown_receiver) = watch::channel(false);
-        let initial_stdin = std::mem::take(&mut spec.stdin);
-        let stdin_task = tokio::spawn(pump_stdin(
-            spawned.stdin,
-            initial_stdin,
-            stdin_receiver,
-            stdin_shutdown_receiver,
-            Arc::clone(&stdin_bytes),
-        ));
-        let stdout_task = tokio::spawn(pump_output(
-            spawned.stdout,
-            spawned.stdout_channel,
+    pub async fn start(&self, spec: RunSpec) -> Result<SessionHandle, SessionError> {
+        start_session(Arc::clone(&self.backend), spec).await
+    }
+}
+
+pub(crate) async fn start_session<B: Backend + ?Sized>(
+    backend: Arc<B>,
+    mut spec: RunSpec,
+) -> Result<SessionHandle, SessionError> {
+    spec.validate().map_err(BackendError::InvalidSpec)?;
+    let started = Instant::now();
+    let trace = Arc::new(StdMutex::new(TraceRecorder::new(started)));
+    let mut lifecycle = Lifecycle::default();
+    lifecycle.apply(LifecycleEvent::Prepare)?;
+    record_trace(&trace, TraceKind::PrepareStarted);
+    lifecycle.apply(LifecycleEvent::Start)?;
+    record_trace(&trace, TraceKind::BackendSpawnStarted);
+    let spawned = match backend.spawn(&spec).await {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            lifecycle.apply(LifecycleEvent::Fail)?;
+            lifecycle.apply(LifecycleEvent::CleanupComplete)?;
+            return Err(error.into());
+        }
+    };
+    lifecycle.apply(LifecycleEvent::AgentReady)?;
+    record_trace(&trace, TraceKind::BackendSpawned);
+    lifecycle.apply(LifecycleEvent::CommandStarted)?;
+    record_trace(&trace, TraceKind::CommandStarted);
+    let startup = spawned.startup.clone();
+    let initial = SessionStatus {
+        session_id: spec.session_id,
+        backend: backend.name().into(),
+        state: lifecycle.state(),
+        termination_reason: lifecycle.termination_reason(),
+        exit_code: None,
+        signal: None,
+        timed_out: false,
+        elapsed_micros: 0,
+    };
+    let (status_sender, status_receiver) = watch::channel(initial);
+    let output = Arc::new(Mutex::new(OutputBuffer::new(spec.output_limit)));
+    let (output_cursor_sender, output_cursor_receiver) = watch::channel(0_u64);
+    let (command_sender, command_receiver) = mpsc::channel(32);
+    let (stdin_sender, stdin_receiver) = mpsc::channel(STDIN_QUEUE_ITEMS);
+    let stdin_bytes = Arc::new(Semaphore::new(STDIN_QUEUE_BYTES));
+    let (stdin_shutdown_sender, stdin_shutdown_receiver) = watch::channel(false);
+    let terminal_errors = Arc::new(StdMutex::new(Vec::new()));
+    let initial_stdin = std::mem::take(&mut spec.stdin);
+    let stdin_task = tokio::spawn(pump_stdin(
+        spawned.stdin,
+        initial_stdin,
+        stdin_receiver,
+        stdin_shutdown_receiver,
+        Arc::clone(&stdin_bytes),
+    ));
+    let stdout_task = tokio::spawn(pump_output(
+        spawned.stdout,
+        spawned.stdout_channel,
+        Arc::clone(&output),
+        output_cursor_sender.clone(),
+        Arc::clone(&trace),
+    ));
+    let stderr_task = spawned.stderr.map(|stderr| {
+        tokio::spawn(pump_output(
+            stderr,
+            OutputChannel::Stderr,
             Arc::clone(&output),
             output_cursor_sender.clone(),
-        ));
-        let stderr_task = spawned.stderr.map(|stderr| {
-            tokio::spawn(pump_output(
-                stderr,
-                OutputChannel::Stderr,
-                Arc::clone(&output),
-                output_cursor_sender.clone(),
-            ))
-        });
-        drop(output_cursor_sender);
+            Arc::clone(&trace),
+        ))
+    });
+    drop(output_cursor_sender);
 
-        let session_id = spec.session_id;
-        tokio::spawn(drive_session(
-            spec,
-            started,
-            spawned.exit,
-            spawned.controller,
-            command_receiver,
-            stdin_shutdown_sender,
-            stdin_task,
-            status_sender,
-            stdout_task,
-            stderr_task,
-        ));
-        Ok(SessionHandle {
-            session_id,
-            output,
-            output_cursor: output_cursor_receiver,
-            status: status_receiver,
-            commands: command_sender,
-            stdin: stdin_sender,
-            stdin_bytes,
-        })
-    }
+    let session_id = spec.session_id;
+    tokio::spawn(drive_session(
+        spec,
+        started,
+        lifecycle,
+        spawned.exit,
+        spawned.controller,
+        command_receiver,
+        stdin_shutdown_sender,
+        stdin_task,
+        status_sender,
+        stdout_task,
+        stderr_task,
+        Arc::clone(&trace),
+        Arc::clone(&terminal_errors),
+    ));
+    Ok(SessionHandle {
+        session_id,
+        output,
+        output_cursor: output_cursor_receiver,
+        status: status_receiver,
+        commands: command_sender,
+        stdin: stdin_sender,
+        stdin_bytes,
+        startup,
+        trace,
+        terminal_errors,
+    })
 }
 
 #[derive(Clone)]
@@ -111,6 +145,9 @@ pub struct SessionHandle {
     commands: mpsc::Sender<SessionCommand>,
     stdin: mpsc::Sender<StdinRequest>,
     stdin_bytes: Arc<Semaphore>,
+    startup: StartupMetrics,
+    trace: Arc<StdMutex<TraceRecorder>>,
+    terminal_errors: Arc<StdMutex<Vec<String>>>,
 }
 
 impl SessionHandle {
@@ -227,6 +264,36 @@ impl SessionHandle {
         self.completion().await
     }
 
+    pub(crate) fn startup(&self) -> StartupMetrics {
+        self.startup.clone()
+    }
+
+    pub(crate) fn trace(&self) -> Vec<TraceEvent> {
+        self.trace
+            .lock()
+            .expect("session trace lock must not be poisoned")
+            .events
+            .clone()
+    }
+
+    pub(crate) fn terminal_error(&self) -> Option<String> {
+        let errors = self
+            .terminal_errors
+            .lock()
+            .expect("session error lock must not be poisoned");
+        (!errors.is_empty()).then(|| errors.join("; "))
+    }
+
+    pub(crate) async fn retained_output(&self) -> (OutputRead, u64, u64) {
+        let output = self.output.lock().await;
+        let earliest = output.earliest_cursor();
+        let next = output.next_cursor();
+        let retained = output
+            .read(earliest, usize::MAX)
+            .expect("earliest retained output cursor must be readable");
+        (retained, earliest, next)
+    }
+
     async fn request(
         &self,
         build: impl FnOnce(oneshot::Sender<Result<(), String>>) -> SessionCommand,
@@ -271,6 +338,7 @@ enum StdinRequest {
 async fn drive_session(
     spec: RunSpec,
     started: Instant,
+    mut lifecycle: Lifecycle,
     mut exit: crate::backend::ExitFuture,
     controller: Box<dyn crate::BackendController>,
     mut commands: mpsc::Receiver<SessionCommand>,
@@ -279,6 +347,8 @@ async fn drive_session(
     status_sender: watch::Sender<SessionStatus>,
     stdout_task: tokio::task::JoinHandle<std::io::Result<()>>,
     stderr_task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    trace: Arc<StdMutex<TraceRecorder>>,
+    terminal_errors: Arc<StdMutex<Vec<String>>>,
 ) {
     let mut controller = Some(controller);
     let mut deadline = spec
@@ -287,44 +357,57 @@ async fn drive_session(
         .map(|duration| Box::pin(sleep(duration)));
     let mut kill_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut cleanup_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
-    let mut reason = TerminationReason::Exited;
     let mut timed_out = false;
-    let mut cleanup_failed = false;
+    let mut errors = Vec::new();
     let mut commands_open = true;
     let mut shutdown_started = false;
     let mut stdin_open = true;
 
     let exit_status = loop {
         tokio::select! {
-            result = &mut exit => if let Ok(status) = result {
-                break Some(status);
-            } else {
-                cleanup_failed = true;
-                reason = TerminationReason::Failed;
-                publish_running_state(
-                    &status_sender,
-                    &spec,
-                    started,
-                    SessionState::Failed,
-                    reason,
-                    timed_out,
-                );
-                break None;
+            result = &mut exit => {
+                match result {
+                    Ok(status) => {
+                        if lifecycle.state() == SessionState::Running {
+                            apply_and_publish(
+                                &mut lifecycle,
+                                LifecycleEvent::CommandExited,
+                                &status_sender,
+                                &spec,
+                                started,
+                                timed_out,
+                            );
+                        }
+                        record_trace(&trace, TraceKind::ProcessExited);
+                        break Some(status);
+                    }
+                    Err(error) => {
+                        errors.push(format!("backend exit wait failed: {error}"));
+                        mark_failed(
+                            &mut lifecycle,
+                            &status_sender,
+                            &spec,
+                            started,
+                            timed_out,
+                        );
+                        break None;
+                    }
+                }
             },
             result = &mut stdin_task, if stdin_open => {
                 stdin_open = false;
-                if flatten_stdin_task(result).is_err() {
+                if let Err(error) = flatten_stdin_task(result) {
+                    errors.push(format!("stdin pump failed: {error}"));
                     shutdown_started = true;
-                    reason = TerminationReason::Failed;
-                    publish_running_state(
+                    mark_failed(
+                        &mut lifecycle,
                         &status_sender,
                         &spec,
                         started,
-                        SessionState::Failed,
-                        reason,
                         false,
                     );
                     deadline = None;
+                    stdin_shutdown.send_replace(true);
                     let term_result = bounded_session_control(
                         "TERM",
                         spec.kill_grace,
@@ -335,11 +418,16 @@ async fn drive_session(
                     )
                     .await;
                     if term_result.is_ok() {
+                        record_trace(&trace, TraceKind::GracefulStop);
                         kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
                     } else {
-                        cleanup_failed = true;
+                        errors.push(term_result.expect_err("TERM result was checked as an error"));
                         let force_result = force_and_release(&mut controller, spec.kill_grace).await;
-                        cleanup_failed |= force_result.is_err();
+                        if force_result.is_ok() {
+                            record_trace(&trace, TraceKind::ForcedStop);
+                        } else {
+                            errors.push(force_result.expect_err("force result was checked as an error"));
+                        }
                         cleanup_deadline = Some(Box::pin(sleep(spec.kill_grace)));
                     }
                 }
@@ -349,13 +437,12 @@ async fn drive_session(
                     commands_open = false;
                     if !shutdown_started {
                         shutdown_started = true;
-                        reason = TerminationReason::Cancelled;
-                        publish_running_state(
+                        apply_and_publish(
+                            &mut lifecycle,
+                            LifecycleEvent::StopRequested,
                             &status_sender,
                             &spec,
                             started,
-                            SessionState::Stopping,
-                            reason,
                             false,
                         );
                         stdin_shutdown.send_replace(true);
@@ -369,20 +456,23 @@ async fn drive_session(
                         )
                         .await;
                         if term_result.is_ok() {
+                            record_trace(&trace, TraceKind::GracefulStop);
                             kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
                         } else {
-                            cleanup_failed = true;
-                            reason = TerminationReason::Failed;
-                            publish_running_state(
+                            errors.push(term_result.expect_err("TERM result was checked as an error"));
+                            mark_failed(
+                                &mut lifecycle,
                                 &status_sender,
                                 &spec,
                                 started,
-                                SessionState::Failed,
-                                reason,
                                 false,
                             );
                             let force_result = force_and_release(&mut controller, spec.kill_grace).await;
-                            cleanup_failed |= force_result.is_err();
+                            if force_result.is_ok() {
+                                record_trace(&trace, TraceKind::ForcedStop);
+                            } else {
+                                errors.push(force_result.expect_err("force result was checked as an error"));
+                            }
                             cleanup_deadline = Some(Box::pin(sleep(spec.kill_grace)));
                         }
                         deadline = None;
@@ -391,7 +481,18 @@ async fn drive_session(
                         && controller.is_some()
                     {
                         let force_result = force_and_release(&mut controller, spec.kill_grace).await;
-                        cleanup_failed |= force_result.is_err();
+                        if force_result.is_ok() {
+                            record_trace(&trace, TraceKind::ForcedStop);
+                        } else {
+                            errors.push(force_result.expect_err("force result was checked as an error"));
+                            mark_failed(
+                                &mut lifecycle,
+                                &status_sender,
+                                &spec,
+                                started,
+                                timed_out,
+                            );
+                        }
                         cleanup_deadline = Some(Box::pin(sleep(spec.kill_grace)));
                     }
                     continue;
@@ -417,8 +518,14 @@ async fn drive_session(
                             continue;
                         }
                         shutdown_started = true;
-                        reason = TerminationReason::Cancelled;
-                        publish_running_state(&status_sender, &spec, started, SessionState::Stopping, reason, false);
+                        apply_and_publish(
+                            &mut lifecycle,
+                            LifecycleEvent::StopRequested,
+                            &status_sender,
+                            &spec,
+                            started,
+                            false,
+                        );
                         stdin_shutdown.send_replace(true);
                         let result = match controller.as_deref() {
                             Some(controller) => bounded_session_control(
@@ -430,21 +537,24 @@ async fn drive_session(
                             None => Err("session teardown is already forced".into()),
                         };
                         if result.is_ok() {
+                            record_trace(&trace, TraceKind::GracefulStop);
                             kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
                             deadline = None;
                         } else if controller.is_some() {
-                            cleanup_failed = true;
-                            reason = TerminationReason::Failed;
-                            publish_running_state(
+                            errors.push(result.clone().expect_err("TERM result was checked as an error"));
+                            mark_failed(
+                                &mut lifecycle,
                                 &status_sender,
                                 &spec,
                                 started,
-                                SessionState::Failed,
-                                reason,
                                 false,
                             );
                             let force_result = force_and_release(&mut controller, spec.kill_grace).await;
-                            cleanup_failed |= force_result.is_err();
+                            if force_result.is_ok() {
+                                record_trace(&trace, TraceKind::ForcedStop);
+                            } else {
+                                errors.push(force_result.expect_err("force result was checked as an error"));
+                            }
                             cleanup_deadline = Some(Box::pin(sleep(spec.kill_grace)));
                             deadline = None;
                         }
@@ -455,8 +565,15 @@ async fn drive_session(
             () = wait_timer(&mut deadline), if deadline.is_some() => {
                 shutdown_started = true;
                 timed_out = true;
-                reason = TerminationReason::TimedOut;
-                publish_running_state(&status_sender, &spec, started, SessionState::TimedOut, reason, true);
+                apply_and_publish(
+                    &mut lifecycle,
+                    LifecycleEvent::Timeout,
+                    &status_sender,
+                    &spec,
+                    started,
+                    true,
+                );
+                record_trace(&trace, TraceKind::Timeout);
                 stdin_shutdown.send_replace(true);
                 let term_result = bounded_session_control(
                     "TERM",
@@ -468,35 +585,38 @@ async fn drive_session(
                 )
                 .await;
                 if term_result.is_ok() {
+                    record_trace(&trace, TraceKind::GracefulStop);
                     kill_deadline = Some(Box::pin(sleep(spec.kill_grace)));
                 } else {
-                    cleanup_failed = true;
-                    reason = TerminationReason::Failed;
-                    publish_running_state(
+                    errors.push(term_result.expect_err("TERM result was checked as an error"));
+                    mark_failed(
+                        &mut lifecycle,
                         &status_sender,
                         &spec,
                         started,
-                        SessionState::Failed,
-                        reason,
                         true,
                     );
                     let force_result = force_and_release(&mut controller, spec.kill_grace).await;
-                    cleanup_failed |= force_result.is_err();
+                    if force_result.is_ok() {
+                        record_trace(&trace, TraceKind::ForcedStop);
+                    } else {
+                        errors.push(force_result.expect_err("force result was checked as an error"));
+                    }
                     cleanup_deadline = Some(Box::pin(sleep(spec.kill_grace)));
                 }
                 deadline = None;
             }
             () = wait_timer(&mut kill_deadline), if kill_deadline.is_some() => {
                 let force_result = force_and_release(&mut controller, spec.kill_grace).await;
-                if force_result.is_err() {
-                    cleanup_failed = true;
-                    reason = TerminationReason::Failed;
-                    publish_running_state(
+                if force_result.is_ok() {
+                    record_trace(&trace, TraceKind::ForcedStop);
+                } else {
+                    errors.push(force_result.expect_err("force result was checked as an error"));
+                    mark_failed(
+                        &mut lifecycle,
                         &status_sender,
                         &spec,
                         started,
-                        SessionState::Failed,
-                        reason,
                         timed_out,
                     );
                 }
@@ -504,14 +624,15 @@ async fn drive_session(
                 cleanup_deadline = Some(Box::pin(sleep(spec.kill_grace)));
             }
             () = wait_timer(&mut cleanup_deadline), if cleanup_deadline.is_some() => {
-                cleanup_failed = true;
-                reason = TerminationReason::Failed;
-                publish_running_state(
+                errors.push(format!(
+                    "backend exit did not complete within the {:?} hard cleanup deadline",
+                    spec.kill_grace
+                ));
+                mark_failed(
+                    &mut lifecycle,
                     &status_sender,
                     &spec,
                     started,
-                    SessionState::Failed,
-                    reason,
                     timed_out,
                 );
                 break None;
@@ -520,38 +641,31 @@ async fn drive_session(
     };
     stdin_shutdown.send_replace(true);
     if stdin_open {
-        cleanup_failed |= finish_session_io_task("stdin", stdin_task, spec.kill_grace)
-            .await
-            .is_err();
+        if let Err(error) = finish_session_io_task("stdin", stdin_task, spec.kill_grace).await {
+            errors.push(error);
+        }
     }
-    cleanup_failed |= !finish_session_output_tasks(stdout_task, stderr_task, spec.kill_grace)
-        .await
-        .is_empty();
+    errors.extend(finish_session_output_tasks(stdout_task, stderr_task, spec.kill_grace).await);
     drop(controller.take());
-    if cleanup_failed {
-        reason = TerminationReason::Failed;
-        publish_running_state(
+    if !errors.is_empty() {
+        mark_failed(&mut lifecycle, &status_sender, &spec, started, timed_out);
+    }
+    *terminal_errors
+        .lock()
+        .expect("session error lock must not be poisoned") = errors;
+    if let Some(status) = exit_status {
+        let (exit_code, signal) = decode_exit_status(status);
+        apply_lifecycle(&mut lifecycle, LifecycleEvent::CleanupComplete);
+        record_trace(&trace, TraceKind::CleanupComplete);
+        publish_status(
             &status_sender,
             &spec,
             started,
-            SessionState::Failed,
-            reason,
+            &lifecycle,
             timed_out,
-        );
-    }
-    if let Some(status) = exit_status {
-        let (exit_code, signal) = decode_exit_status(status);
-        let backend = status_sender.borrow().backend.clone();
-        let _ = status_sender.send(SessionStatus {
-            session_id: spec.session_id,
-            backend,
-            state: SessionState::Dead,
-            termination_reason: Some(reason),
             exit_code,
             signal,
-            timed_out,
-            elapsed_micros: duration_micros(started.elapsed()),
-        });
+        );
     }
 }
 
@@ -638,22 +752,55 @@ async fn wait_timer(timer: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>) 
     }
 }
 
-fn publish_running_state(
+fn apply_lifecycle(lifecycle: &mut Lifecycle, event: LifecycleEvent) {
+    lifecycle
+        .apply(event)
+        .expect("common lifecycle engine emitted an invalid transition");
+}
+
+fn apply_and_publish(
+    lifecycle: &mut Lifecycle,
+    event: LifecycleEvent,
     sender: &watch::Sender<SessionStatus>,
     spec: &RunSpec,
     started: Instant,
-    state: SessionState,
-    reason: TerminationReason,
     timed_out: bool,
+) {
+    apply_lifecycle(lifecycle, event);
+    publish_status(sender, spec, started, lifecycle, timed_out, None, None);
+}
+
+fn mark_failed(
+    lifecycle: &mut Lifecycle,
+    sender: &watch::Sender<SessionStatus>,
+    spec: &RunSpec,
+    started: Instant,
+    timed_out: bool,
+) {
+    if lifecycle.state() != SessionState::Failed {
+        apply_lifecycle(lifecycle, LifecycleEvent::Fail);
+    }
+    publish_status(sender, spec, started, lifecycle, timed_out, None, None);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_status(
+    sender: &watch::Sender<SessionStatus>,
+    spec: &RunSpec,
+    started: Instant,
+    lifecycle: &Lifecycle,
+    timed_out: bool,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
 ) {
     let backend = sender.borrow().backend.clone();
     let _ = sender.send(SessionStatus {
         session_id: spec.session_id,
         backend,
-        state,
-        termination_reason: Some(reason),
-        exit_code: None,
-        signal: None,
+        state: lifecycle.state(),
+        termination_reason: lifecycle.termination_reason(),
+        exit_code,
+        signal,
         timed_out,
         elapsed_micros: duration_micros(started.elapsed()),
     });
@@ -763,6 +910,7 @@ async fn pump_output<R>(
     channel: OutputChannel,
     output: Arc<Mutex<OutputBuffer>>,
     output_cursor: watch::Sender<u64>,
+    trace: Arc<StdMutex<TraceRecorder>>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -773,11 +921,15 @@ where
         if count == 0 {
             return Ok(());
         }
-        let next_cursor = {
+        let (next_cursor, first_output) = {
             let mut output = output.lock().await;
+            let first_output = output.next_cursor() == 0;
             output.push(channel, &buffer[..count]);
-            output.next_cursor()
+            (output.next_cursor(), first_output)
         };
+        if first_output {
+            record_trace(&trace, TraceKind::FirstOutput);
+        }
         output_cursor.send_replace(next_cursor);
     }
 }
@@ -795,6 +947,35 @@ fn decode_exit_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
 
 fn duration_micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+struct TraceRecorder {
+    started: Instant,
+    events: Vec<TraceEvent>,
+}
+
+impl TraceRecorder {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            events: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, kind: TraceKind) {
+        self.events.push(TraceEvent {
+            sequence: self.events.len() as u64,
+            elapsed_micros: duration_micros(self.started.elapsed()),
+            kind,
+        });
+    }
+}
+
+fn record_trace(trace: &Arc<StdMutex<TraceRecorder>>, kind: TraceKind) {
+    trace
+        .lock()
+        .expect("session trace lock must not be poisoned")
+        .push(kind);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -815,6 +996,8 @@ pub enum SessionError {
     Backend(#[from] BackendError),
     #[error(transparent)]
     Output(#[from] OutputReadError),
+    #[error(transparent)]
+    Lifecycle(#[from] moraebox_core::LifecycleError),
     #[error("session is no longer available")]
     SessionClosed,
     #[error("session control failed: {0}")]
@@ -860,6 +1043,23 @@ mod tests {
         assert!(output.chunks.iter().any(|chunk| {
             chunk.channel == OutputChannel::Stdout && chunk.data.starts_with(b"hello")
         }));
+        let trace = session
+            .trace()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &trace[..4],
+            &[
+                TraceKind::PrepareStarted,
+                TraceKind::BackendSpawnStarted,
+                TraceKind::BackendSpawned,
+                TraceKind::CommandStarted,
+            ]
+        );
+        assert!(trace.contains(&TraceKind::FirstOutput));
+        assert_eq!(trace[trace.len() - 2], TraceKind::ProcessExited);
+        assert_eq!(trace.last(), Some(&TraceKind::CleanupComplete));
     }
 
     #[tokio::test]
@@ -1006,6 +1206,11 @@ mod tests {
 
         assert_eq!(status.state, SessionState::Dead);
         assert_eq!(status.termination_reason, Some(TerminationReason::Failed));
+        assert!(
+            session
+                .terminal_error()
+                .is_some_and(|error| error.contains("injected read failure"))
+        );
     }
 
     #[tokio::test]

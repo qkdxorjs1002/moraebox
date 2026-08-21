@@ -91,7 +91,8 @@ impl Lifecycle {
                 | SessionState::Starting
                 | SessionState::Ready
                 | SessionState::Running
-                | SessionState::Stopping,
+                | SessionState::Stopping
+                | SessionState::TimedOut,
                 LifecycleEvent::Fail,
             ) => {
                 self.termination_reason = Some(TerminationReason::Failed);
@@ -152,6 +153,22 @@ mod tests {
         lifecycle.apply(LifecycleEvent::Prepare).unwrap();
         lifecycle.apply(LifecycleEvent::Timeout).unwrap();
         assert_eq!(lifecycle.state(), SessionState::TimedOut);
+        lifecycle.apply(LifecycleEvent::CleanupComplete).unwrap();
+        assert_eq!(lifecycle.state(), SessionState::Dead);
+    }
+
+    #[test]
+    fn cleanup_failure_overrides_a_timeout_reason() {
+        let mut lifecycle = Lifecycle::default();
+        lifecycle.apply(LifecycleEvent::Prepare).unwrap();
+        lifecycle.apply(LifecycleEvent::Timeout).unwrap();
+        lifecycle.apply(LifecycleEvent::Fail).unwrap();
+
+        assert_eq!(lifecycle.state(), SessionState::Failed);
+        assert_eq!(
+            lifecycle.termination_reason(),
+            Some(TerminationReason::Failed)
+        );
         lifecycle.apply(LifecycleEvent::CleanupComplete).unwrap();
         assert_eq!(lifecycle.state(), SessionState::Dead);
     }

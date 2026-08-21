@@ -1,27 +1,15 @@
-use std::{
-    future::Future,
-    pin::Pin,
-    process::ExitStatus,
-    time::{Duration, Instant},
-};
+use std::sync::Arc;
 
-use moraebox_core::{
-    Lifecycle, LifecycleEvent, OutputBuffer, OutputChannel, OutputChunk, RunSpec, SessionId,
-    SessionState, Signal, TerminationReason,
-};
+use moraebox_core::{OutputChunk, RunSpec, SessionId, SessionState, TerminationReason};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    sync::mpsc,
-    task::JoinHandle,
-    time::{Sleep, sleep, timeout},
+
+use crate::{
+    Backend, BackendError, SessionError, StartupMetrics, TraceEvent, session::start_session,
 };
 
-use crate::{Backend, BackendError, StartupMetrics, TraceEvent, TraceKind};
-
 pub struct Supervisor<B> {
-    backend: B,
+    backend: Arc<B>,
 }
 
 impl<B> Supervisor<B>
@@ -29,364 +17,60 @@ where
     B: Backend,
 {
     pub fn new(backend: B) -> Self {
-        Self { backend }
+        Self {
+            backend: Arc::new(backend),
+        }
     }
 
     pub fn backend_name(&self) -> &'static str {
         self.backend.name()
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn run(&self, spec: RunSpec) -> Result<RunReport, SupervisorError> {
-        spec.validate().map_err(BackendError::InvalidSpec)?;
-        let started = Instant::now();
-        let mut trace = TraceRecorder::new(started);
-        let mut lifecycle = Lifecycle::default();
-        lifecycle.apply(LifecycleEvent::Prepare)?;
-        trace.push(TraceKind::PrepareStarted);
-        lifecycle.apply(LifecycleEvent::Start)?;
-        trace.push(TraceKind::BackendSpawnStarted);
-
-        let spawned = match self.backend.spawn(&spec).await {
-            Ok(spawned) => spawned,
+        let session = start_session(Arc::clone(&self.backend), spec)
+            .await
+            .map_err(map_session_start)?;
+        let _ = session.close_stdin().await;
+        let status = match session.wait().await {
+            Ok(status) => status,
             Err(error) => {
-                lifecycle.apply(LifecycleEvent::Fail)?;
-                lifecycle.apply(LifecycleEvent::CleanupComplete)?;
+                if let Some(details) = session.terminal_error() {
+                    return Err(SupervisorError::Cleanup(details));
+                }
                 return Err(error.into());
             }
         };
-        lifecycle.apply(LifecycleEvent::AgentReady)?;
-        trace.push(TraceKind::BackendSpawned);
-        lifecycle.apply(LifecycleEvent::CommandStarted)?;
-        trace.push(TraceKind::CommandStarted);
-        let startup = spawned.startup;
-
-        let mut exit = spawned.exit;
-        let mut controller = Some(spawned.controller);
-        let (output_sender, mut output_receiver) = mpsc::channel(64);
-        let stdout_task = tokio::spawn(pump_output(
-            spawned.stdout,
-            spawned.stdout_channel,
-            output_sender.clone(),
-        ));
-        let stderr_task = spawned.stderr.map(|stderr| {
-            tokio::spawn(pump_output(
-                stderr,
-                OutputChannel::Stderr,
-                output_sender.clone(),
-            ))
-        });
-        drop(output_sender);
-        let input_task = spawned.stdin.map(|mut stdin| {
-            let input = spec.stdin.clone();
-            tokio::spawn(async move {
-                if !input.is_empty() {
-                    stdin.write_all(&input).await?;
-                }
-                stdin.shutdown().await
-            })
-        });
-
-        let mut output = OutputBuffer::new(spec.output_limit);
-        let timeout = spec.timeout.duration();
-        let mut timer = timeout.map(|duration| Box::pin(sleep(duration)));
-        let mut output_open = true;
-        let mut first_output_seen = false;
-        let mut timed_out = false;
-        let mut cleanup_errors = Vec::new();
-
-        let status = loop {
-            tokio::select! {
-                status = &mut exit => {
-                    break record_exit_result(status, &mut cleanup_errors);
-                },
-                chunk = output_receiver.recv(), if output_open => {
-                    match chunk {
-                        Some((channel, bytes)) => {
-                            if !first_output_seen {
-                                first_output_seen = true;
-                                trace.push(TraceKind::FirstOutput);
-                            }
-                            output.push(channel, bytes);
-                        }
-                        None => { output_open = false; }
-                    }
-                }
-                () = wait_for_timer(&mut timer), if timer.is_some() => {
-                    timed_out = true;
-                    lifecycle.apply(LifecycleEvent::Timeout)?;
-                    trace.push(TraceKind::Timeout);
-                    let term_result = bounded_control(
-                        "TERM",
-                        spec.kill_grace,
-                        controller
-                            .as_deref()
-                            .expect("controller must exist before teardown")
-                            .signal(Signal::Terminate),
-                    )
-                    .await;
-                    let mut graceful_exit = None;
-                    match term_result {
-                        Ok(()) => {
-                            trace.push(TraceKind::GracefulStop);
-                            graceful_exit = wait_for_exit(
-                                &mut exit,
-                                spec.kill_grace,
-                                &mut output_receiver,
-                                &mut output,
-                                &mut trace,
-                                &mut first_output_seen,
-                            )
-                            .await;
-                        }
-                        Err(error) => cleanup_errors.push(error),
-                    }
-                    if let Some(result) = graceful_exit {
-                        break record_exit_result(result, &mut cleanup_errors);
-                    }
-
-                    let force_result = bounded_control(
-                        "force-stop",
-                        spec.kill_grace,
-                        controller
-                            .as_deref()
-                            .expect("controller must exist before force-stop")
-                            .force_stop(),
-                    )
-                    .await;
-                    if force_result.is_ok() {
-                        trace.push(TraceKind::ForcedStop);
-                    } else if let Err(error) = force_result {
-                        cleanup_errors.push(error);
-                    }
-                    drop(controller.take());
-                    if let Some(result) = wait_for_exit(
-                        &mut exit,
-                        spec.kill_grace,
-                        &mut output_receiver,
-                        &mut output,
-                        &mut trace,
-                        &mut first_output_seen,
-                    )
-                    .await
-                    {
-                        break record_exit_result(result, &mut cleanup_errors);
-                    }
-                    cleanup_errors.push(format!(
-                        "backend exit did not complete within the {:?} hard cleanup deadline",
-                        spec.kill_grace
-                    ));
-                    break None;
-                }
-            }
-        };
-
-        if !timed_out && status.is_some() {
-            lifecycle.apply(LifecycleEvent::CommandExited)?;
+        if let Some(details) = session.terminal_error() {
+            return Err(SupervisorError::Cleanup(details));
         }
-        if status.is_some() {
-            trace.push(TraceKind::ProcessExited);
-        }
-
-        drop(controller.take());
-        if let Some(task) = input_task
-            && let Err(error) = abort_input_task(task).await
-        {
-            cleanup_errors.push(error);
-        }
-        cleanup_errors.extend(finish_output_tasks(stdout_task, stderr_task, spec.kill_grace).await);
-        while let Ok((channel, bytes)) = output_receiver.try_recv() {
-            if !first_output_seen {
-                first_output_seen = true;
-                trace.push(TraceKind::FirstOutput);
-            }
-            output.push(channel, bytes);
-        }
-
-        if !cleanup_errors.is_empty() {
-            return Err(SupervisorError::Cleanup(cleanup_errors.join("; ")));
-        }
-        let status = status.expect("successful cleanup must include an exit status");
-
-        lifecycle.apply(LifecycleEvent::CleanupComplete)?;
-        trace.push(TraceKind::CleanupComplete);
-        let all_output = output
-            .read(output.earliest_cursor(), usize::MAX)
-            .expect("earliest output cursor must be valid");
-        let (exit_code, signal) = decode_exit_status(status);
+        let (all_output, output_earliest_cursor, output_next_cursor) =
+            session.retained_output().await;
 
         Ok(RunReport {
-            session_id: spec.session_id,
-            backend: self.backend.name().to_owned(),
-            state: lifecycle.state(),
-            termination_reason: lifecycle.termination_reason(),
-            exit_code,
-            signal,
-            timed_out,
+            session_id: status.session_id,
+            backend: status.backend,
+            state: status.state,
+            termination_reason: status.termination_reason,
+            exit_code: status.exit_code,
+            signal: status.signal,
+            timed_out: status.timed_out,
             output: all_output.chunks,
-            output_earliest_cursor: output.earliest_cursor(),
-            output_next_cursor: output.next_cursor(),
+            output_earliest_cursor,
+            output_next_cursor,
             output_truncated: all_output.truncated,
-            elapsed_micros: duration_micros(started.elapsed()),
-            startup,
-            trace: trace.events,
+            elapsed_micros: status.elapsed_micros,
+            startup: session.startup(),
+            trace: session.trace(),
         })
     }
 }
 
-async fn wait_for_timer(timer: &mut Option<Pin<Box<Sleep>>>) {
-    if let Some(timer) = timer {
-        timer.as_mut().await;
+fn map_session_start(error: SessionError) -> SupervisorError {
+    match error {
+        SessionError::Backend(error) => SupervisorError::Backend(error),
+        SessionError::Lifecycle(error) => SupervisorError::Lifecycle(error),
+        error => SupervisorError::Session(error),
     }
-}
-
-async fn wait_for_exit(
-    exit: &mut crate::backend::ExitFuture,
-    deadline: Duration,
-    output_receiver: &mut mpsc::Receiver<(OutputChannel, Vec<u8>)>,
-    output: &mut OutputBuffer,
-    trace: &mut TraceRecorder,
-    first_output_seen: &mut bool,
-) -> Option<std::io::Result<ExitStatus>> {
-    let deadline = sleep(deadline);
-    tokio::pin!(deadline);
-    loop {
-        tokio::select! {
-            status = &mut *exit => return Some(status),
-            chunk = output_receiver.recv() => {
-                if let Some((channel, bytes)) = chunk {
-                    if !*first_output_seen {
-                        *first_output_seen = true;
-                        trace.push(TraceKind::FirstOutput);
-                    }
-                    output.push(channel, bytes);
-                }
-            }
-            () = &mut deadline => return None,
-        }
-    }
-}
-
-async fn bounded_control<F>(
-    operation: &'static str,
-    deadline: Duration,
-    future: F,
-) -> Result<(), String>
-where
-    F: Future<Output = Result<(), BackendError>>,
-{
-    match timeout(deadline, future).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(format!("backend {operation} failed: {error}")),
-        Err(_) => Err(format!(
-            "backend {operation} did not complete within {deadline:?}"
-        )),
-    }
-}
-
-fn record_exit_result(
-    result: std::io::Result<ExitStatus>,
-    errors: &mut Vec<String>,
-) -> Option<ExitStatus> {
-    match result {
-        Ok(status) => Some(status),
-        Err(error) => {
-            errors.push(format!("backend exit wait failed: {error}"));
-            None
-        }
-    }
-}
-
-async fn abort_input_task(task: JoinHandle<std::io::Result<()>>) -> Result<(), String> {
-    if task.is_finished() {
-        return flatten_io_task("stdin", task.await);
-    }
-    task.abort();
-    match task.await {
-        Err(error) if error.is_cancelled() => Ok(()),
-        result => flatten_io_task("stdin", result),
-    }
-}
-
-async fn finish_output_tasks(
-    stdout: JoinHandle<std::io::Result<()>>,
-    stderr: Option<JoinHandle<std::io::Result<()>>>,
-    deadline: Duration,
-) -> Vec<String> {
-    let stdout = finish_io_task("stdout", stdout, deadline);
-    let stderr = async {
-        match stderr {
-            Some(task) => finish_io_task("stderr", task, deadline).await,
-            None => Ok(()),
-        }
-    };
-    let (stdout, stderr) = tokio::join!(stdout, stderr);
-    [stdout, stderr]
-        .into_iter()
-        .filter_map(Result::err)
-        .collect()
-}
-
-async fn finish_io_task(
-    name: &'static str,
-    mut task: JoinHandle<std::io::Result<()>>,
-    deadline: Duration,
-) -> Result<(), String> {
-    if let Ok(result) = timeout(deadline, &mut task).await {
-        flatten_io_task(name, result)
-    } else {
-        task.abort();
-        let _ = task.await;
-        Err(format!(
-            "{name} pump did not stop within the {deadline:?} cleanup deadline"
-        ))
-    }
-}
-
-fn flatten_io_task(
-    name: &'static str,
-    result: Result<std::io::Result<()>, tokio::task::JoinError>,
-) -> Result<(), String> {
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(format!("{name} pump failed: {error}")),
-        Err(error) => Err(format!("{name} pump task failed: {error}")),
-    }
-}
-
-async fn pump_output<R>(
-    mut reader: R,
-    channel: OutputChannel,
-    sender: mpsc::Sender<(OutputChannel, Vec<u8>)>,
-) -> std::io::Result<()>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buffer = vec![0_u8; 16 * 1024];
-    loop {
-        let count = reader.read(&mut buffer).await?;
-        if count == 0 {
-            return Ok(());
-        }
-        if sender
-            .send((channel, buffer[..count].to_vec()))
-            .await
-            .is_err()
-        {
-            return Ok(());
-        }
-    }
-}
-
-#[cfg(unix)]
-fn decode_exit_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
-    use std::os::unix::process::ExitStatusExt;
-    (status.code(), status.signal())
-}
-
-#[cfg(not(unix))]
-fn decode_exit_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
-    (status.code(), None)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,32 +91,6 @@ pub struct RunReport {
     pub trace: Vec<TraceEvent>,
 }
 
-struct TraceRecorder {
-    started: Instant,
-    events: Vec<TraceEvent>,
-}
-
-impl TraceRecorder {
-    fn new(started: Instant) -> Self {
-        Self {
-            started,
-            events: Vec::new(),
-        }
-    }
-
-    fn push(&mut self, kind: TraceKind) {
-        self.events.push(TraceEvent {
-            sequence: self.events.len() as u64,
-            elapsed_micros: duration_micros(self.started.elapsed()),
-            kind,
-        });
-    }
-}
-
-fn duration_micros(duration: Duration) -> u64 {
-    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-}
-
 #[derive(Debug, Error)]
 pub enum SupervisorError {
     #[error(transparent)]
@@ -441,6 +99,8 @@ pub enum SupervisorError {
     Lifecycle(#[from] moraebox_core::LifecycleError),
     #[error("supervisor I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Session(#[from] SessionError),
     #[error("backend cleanup failed: {0}")]
     Cleanup(String),
 }
@@ -450,6 +110,7 @@ mod tests {
     use std::{
         io,
         pin::Pin,
+        process::ExitStatus,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -459,11 +120,14 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use moraebox_core::{RunSpec, TimeoutPolicy};
-    use tokio::{io::ReadBuf, sync::Notify};
+    use moraebox_core::{OutputChannel, RunSpec, Signal, TimeoutPolicy};
+    use tokio::{
+        io::{AsyncRead, ReadBuf},
+        sync::Notify,
+    };
 
     use super::*;
-    use crate::ProcessBackend;
+    use crate::{ProcessBackend, SessionManager, TraceKind};
 
     #[tokio::test]
     async fn captures_stdout_stderr_and_exit_code() {
@@ -495,6 +159,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_shot_and_session_share_exit_and_trace_semantics() {
+        let spec = RunSpec::command(output_and_exit_command());
+        let report = Supervisor::new(ProcessBackend)
+            .run(spec.clone())
+            .await
+            .unwrap();
+        let session = SessionManager::new(Arc::new(ProcessBackend))
+            .start(spec)
+            .await
+            .unwrap();
+        let _ = session.close_stdin().await;
+        let status = session.wait().await.unwrap();
+
+        assert_eq!(report.session_id, status.session_id);
+        assert_eq!(report.backend, status.backend);
+        assert_eq!(report.state, status.state);
+        assert_eq!(report.termination_reason, status.termination_reason);
+        assert_eq!(report.exit_code, status.exit_code);
+        assert_eq!(report.signal, status.signal);
+        assert_eq!(report.timed_out, status.timed_out);
+        for trace in [report.trace, session.trace()] {
+            let kinds = trace.iter().map(|event| event.kind).collect::<Vec<_>>();
+            assert_eq!(
+                &kinds[..4],
+                &[
+                    TraceKind::PrepareStarted,
+                    TraceKind::BackendSpawnStarted,
+                    TraceKind::BackendSpawned,
+                    TraceKind::CommandStarted,
+                ]
+            );
+            assert!(kinds.contains(&TraceKind::FirstOutput));
+            assert!(kinds.contains(&TraceKind::ProcessExited));
+            assert_eq!(kinds.last(), Some(&TraceKind::CleanupComplete));
+        }
+    }
+
+    #[tokio::test]
     async fn enforces_timeout_and_kills_the_process_group() {
         let supervisor = Supervisor::new(ProcessBackend);
         let mut spec = RunSpec::command(long_running_command());
@@ -503,6 +205,28 @@ mod tests {
         let report = supervisor.run(spec).await.unwrap();
         assert!(report.timed_out);
         assert_eq!(report.termination_reason, Some(TerminationReason::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn one_shot_and_session_share_timeout_semantics() {
+        let mut spec = RunSpec::command(long_running_command());
+        spec.timeout = TimeoutPolicy::Limited(30);
+        spec.kill_grace = Duration::from_millis(30);
+        let report = Supervisor::new(ProcessBackend)
+            .run(spec.clone())
+            .await
+            .unwrap();
+        let session = SessionManager::new(Arc::new(ProcessBackend))
+            .start(spec)
+            .await
+            .unwrap();
+        let status = session.wait().await.unwrap();
+
+        assert_eq!(report.state, status.state);
+        assert_eq!(report.termination_reason, status.termination_reason);
+        assert_eq!(report.exit_code, status.exit_code);
+        assert_eq!(report.signal, status.signal);
+        assert_eq!(report.timed_out, status.timed_out);
     }
 
     #[tokio::test]
