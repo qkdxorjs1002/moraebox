@@ -184,15 +184,12 @@ fn run(args: Args) -> Result<i32, HelperError> {
         spawn_parent_watchdog(parent_pid);
     }
 
-    let effective_command = if args.workspace_disk.is_some() {
-        workspace_command(
-            &args.command,
-            args.root_disk.is_some(),
-            args.workspace_writable,
-        )
-    } else {
-        args.command.clone()
-    };
+    if args.workspace_disk.is_some() && args.root_disk.is_none() {
+        return Err(HelperError::Unsupported(
+            "workspace mounting requires a block root and the guest control agent",
+        ));
+    }
+    let effective_command = args.command.clone();
     let environment = BTreeMap::from_iter(args.env);
     let environment = environment
         .iter()
@@ -258,14 +255,14 @@ fn run(args: Args) -> Result<i32, HelperError> {
         api.configure_workspace_disk(context.id, workspace)?;
     }
 
-    if control.is_none()
-        && let Some(cwd) = args.cwd.as_deref()
-    {
-        let cwd = CString::new(cwd)?;
-        KrunApi::check("krun_set_workdir", unsafe {
-            // SAFETY: `cwd` is NUL-terminated and remains alive during the call.
-            (api.set_workdir)(context.id, cwd.as_ptr())
-        })?;
+    if control.is_none() {
+        if let Some(cwd) = args.cwd.as_deref() {
+            let cwd = CString::new(cwd)?;
+            KrunApi::check("krun_set_workdir", unsafe {
+                // SAFETY: `cwd` is NUL-terminated and remains alive during the call.
+                (api.set_workdir)(context.id, cwd.as_ptr())
+            })?;
+        }
     }
 
     let (executable, command, guest_environment) = if control.is_some() {
@@ -273,14 +270,21 @@ fn run(args: Args) -> Result<i32, HelperError> {
             .session_id
             .as_deref()
             .expect("control endpoint requires a session ID");
+        let mut agent_arguments = vec![
+            "--port".to_owned(),
+            CONTROL_VSOCK_PORT.to_string(),
+            "--session".to_owned(),
+            session_id.to_owned(),
+        ];
+        if args.workspace_disk.is_some() {
+            agent_arguments.extend(["--workspace-device".to_owned(), "/dev/vdb".to_owned()]);
+            if args.workspace_writable {
+                agent_arguments.push("--workspace-writable".to_owned());
+            }
+        }
         (
             CString::new(GUEST_AGENT_PATH)?,
-            CStringArray::new([
-                "--port".to_owned(),
-                CONTROL_VSOCK_PORT.to_string(),
-                "--session".to_owned(),
-                session_id.to_owned(),
-            ])?,
+            CStringArray::new(agent_arguments)?,
             CStringArray::new(std::iter::empty::<&str>())?,
         )
     } else {
@@ -309,7 +313,11 @@ fn run(args: Args) -> Result<i32, HelperError> {
                     .session_id
                     .expect("control endpoint requires a session ID"),
                 command: effective_command,
-                cwd: args.cwd.unwrap_or_default(),
+                cwd: args.cwd.unwrap_or_else(|| {
+                    args.workspace_disk
+                        .as_ref()
+                        .map_or_else(String::new, |_| "/workspace".to_owned())
+                }),
                 environment,
                 tty: args.tty,
                 rows: args.tty_rows,
@@ -1426,10 +1434,10 @@ fn spawn_signal_forwarder(
                     }),
                     _ => None,
                 };
-                if let Some(payload) = payload
-                    && send_host_frame(&sender, payload).is_err()
-                {
-                    return;
+                if let Some(payload) = payload {
+                    if send_host_frame(&sender, payload).is_err() {
+                        return;
+                    }
                 }
             }
         })?;
@@ -1727,27 +1735,6 @@ fn validate_copy_arguments(args: &Args) -> Result<ValidatedTransfers, HelperErro
     })
 }
 
-fn workspace_command(command: &[String], block_root: bool, writable: bool) -> Vec<String> {
-    let device = if block_root { "/dev/vdb" } else { "/dev/vda" };
-    let setup = if writable {
-        format!(
-            "mkdir -p /workspace.lower /workspace /run/moraebox-workspace && mount -t ext4 -o ro {device} /workspace.lower && mount -t tmpfs -o mode=0700,nosuid,nodev tmpfs /run/moraebox-workspace && mkdir -p /run/moraebox-workspace/upper /run/moraebox-workspace/work && mount -t overlay overlay -o lowerdir=/workspace.lower,upperdir=/run/moraebox-workspace/upper,workdir=/run/moraebox-workspace/work /workspace && cd /workspace && exec \"$@\""
-        )
-    } else {
-        format!(
-            "mkdir -p /workspace && mount -t ext4 -o ro {device} /workspace && cd /workspace && exec \"$@\""
-        )
-    };
-    let mut wrapped = vec![
-        "/bin/sh".into(),
-        "-c".into(),
-        setup,
-        "moraebox-workspace".into(),
-    ];
-    wrapped.extend_from_slice(command);
-    wrapped
-}
-
 #[cfg(unix)]
 fn spawn_parent_watchdog(parent_pid: u32) {
     std::thread::spawn(move || {
@@ -1790,7 +1777,6 @@ enum HelperError {
     MissingNetworkApi,
     #[error("libkrun does not provide krun_add_vsock_port required for guest control")]
     MissingVsockPortApi,
-    #[cfg(not(unix))]
     #[error("host platform is unsupported: {0}")]
     Unsupported(&'static str),
     #[error("helper I/O failed: {0}")]
@@ -1921,29 +1907,6 @@ mod tests {
     fn rejects_invalid_environment() {
         assert!(parse_env("MISSING").is_err());
         assert!(parse_env("=value").is_err());
-    }
-
-    #[test]
-    fn workspace_wrapper_preserves_argv() {
-        let wrapped = workspace_command(&["/bin/echo".into(), "hello".into()], false, false);
-        assert_eq!(&wrapped[4..], ["/bin/echo", "hello"]);
-        assert!(wrapped[2].contains("-o ro"));
-        assert!(wrapped[2].contains("/dev/vda"));
-    }
-
-    #[test]
-    fn workspace_uses_the_second_disk_with_a_block_root() {
-        let wrapped = workspace_command(&["/bin/true".into()], true, false);
-        assert!(wrapped[2].contains("/dev/vdb"));
-    }
-
-    #[test]
-    fn writable_workspace_uses_an_immutable_lower_and_disposable_upper() {
-        let wrapped = workspace_command(&["/bin/true".into()], true, true);
-        assert!(wrapped[2].contains("mount -t ext4 -o ro /dev/vdb /workspace.lower"));
-        assert!(wrapped[2].contains("mount -t tmpfs"));
-        assert!(wrapped[2].contains("lowerdir=/workspace.lower"));
-        assert!(wrapped[2].contains("upperdir=/run/moraebox-workspace/upper"));
     }
 
     static ROOT_DISK_TEST_LOCK: Mutex<()> = Mutex::new(());

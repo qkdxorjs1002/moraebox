@@ -282,6 +282,14 @@ impl Backend for LibkrunBackend {
                 "copy-in/out with a directory root; use a managed or explicit root disk",
             ));
         }
+        if self.config.workspace_disk.is_some()
+            && self.box_runtime.is_none()
+            && self.config.root_disk.is_none()
+        {
+            return Err(BackendError::Unsupported(
+                "workspace mounting with a directory root; use a managed or explicit root disk",
+            ));
+        }
         if spec.workspace_mode == WorkspaceMode::Overlay && self.config.workspace_disk.is_none() {
             return Err(BackendError::Unsupported(
                 "writable workspace overlay without an immutable workspace disk",
@@ -896,6 +904,12 @@ mod tests {
     #[cfg(unix)]
     use std::{fs, os::unix::fs::PermissionsExt};
 
+    fn cow_clone_unavailable(error: &impl std::fmt::Display) -> bool {
+        error
+            .to_string()
+            .contains("copy-on-write cloning is unavailable")
+    }
+
     #[test]
     fn rejects_missing_native_paths() {
         let config = LibkrunConfig::new("missing-helper", "missing-lib", "missing-root");
@@ -1374,10 +1388,11 @@ mod tests {
         let backend = fixture.backend(Some((source, runtime_root.clone())));
 
         let supervisor = crate::Supervisor::new(backend);
-        let cold = supervisor
-            .run(RunSpec::command(["/usr/bin/true"]))
-            .await
-            .unwrap();
+        let cold = match supervisor.run(RunSpec::command(["/usr/bin/true"])).await {
+            Ok(report) => report,
+            Err(error) if cow_clone_unavailable(&error) => return,
+            Err(error) => panic!("ephemeral root run failed: {error}"),
+        };
         assert_eq!(cold.startup.root_mode, Some(RootMode::Ephemeral));
         assert!(cold.startup.cache_lookup_micros.is_some());
         assert!(cold.startup.base_prepare_micros.is_some());
@@ -1426,10 +1441,11 @@ mod tests {
             .with_prepared_pool(Arc::clone(&pool));
         let supervisor = crate::Supervisor::new(backend);
 
-        let cold = supervisor
-            .run(RunSpec::command(["/usr/bin/true"]))
-            .await
-            .unwrap();
+        let cold = match supervisor.run(RunSpec::command(["/usr/bin/true"])).await {
+            Ok(report) => report,
+            Err(error) if cow_clone_unavailable(&error) => return,
+            Err(error) => panic!("prepared root run failed: {error}"),
+        };
         assert_eq!(cold.startup.prepared_pool_hit, Some(false));
         assert!(cold.startup.prepared_lease_micros.is_some());
         assert!(cold.startup.disk_clone_micros.is_some());
@@ -1812,7 +1828,14 @@ mod tests {
         let session_id = spec.session_id;
         let endpoint = spawn_fake_vfkit_endpoint(gvproxy.with_extension("socket"));
 
-        let session = manager.start(spec).await.unwrap();
+        let session = match manager.start(spec).await {
+            Ok(session) => session,
+            Err(error) if cow_clone_unavailable(&error) => {
+                endpoint.abort();
+                return;
+            }
+            Err(error) => panic!("managed session start failed: {error}"),
+        };
         let endpoint = endpoint.await.unwrap();
         let helper_pid_path = fixture.helper.with_extension("pid");
         let proxy_pid_path = gvproxy.with_extension("pid");

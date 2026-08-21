@@ -15,9 +15,87 @@ import (
 const (
 	workspaceRuntime  = "/run/moraebox-workspace"
 	workspaceUpper    = workspaceRuntime + "/upper"
+	workspaceWork     = workspaceRuntime + "/work"
 	workspaceLower    = "/workspace.lower"
 	workspaceDiffPath = workspaceRuntime + "/diff.json"
 )
+
+func setupWorkspace(device string, writable bool) error {
+	if device == "" {
+		return nil
+	}
+	if writable {
+		return setupWritableWorkspace(device)
+	}
+	if err := ensureRealDirectory("/workspace", 0o755); err != nil {
+		return err
+	}
+	if err := syscall.Mount(device, "/workspace", "ext4", syscall.MS_RDONLY|syscall.MS_NOSUID|syscall.MS_NODEV, ""); err != nil {
+		return fmt.Errorf("mount immutable workspace: %w", err)
+	}
+	return nil
+}
+
+func setupWritableWorkspace(device string) error {
+	for _, directory := range []string{workspaceLower, "/workspace"} {
+		if err := ensureRealDirectory(directory, 0o755); err != nil {
+			return err
+		}
+	}
+	if err := ensureRealDirectory("/run", 0o755); err != nil {
+		return err
+	}
+	if err := ensureRealDirectory(workspaceRuntime, 0o700); err != nil {
+		return err
+	}
+	if err := syscall.Mount(device, workspaceLower, "ext4", syscall.MS_RDONLY|syscall.MS_NOSUID|syscall.MS_NODEV, ""); err != nil {
+		return fmt.Errorf("mount immutable workspace lower: %w", err)
+	}
+	if err := syscall.Mount("tmpfs", workspaceRuntime, "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=0700"); err != nil {
+		return fmt.Errorf("mount workspace tmpfs: %w", err)
+	}
+	for _, directory := range []string{workspaceUpper, workspaceWork} {
+		if err := ensureEmptyMountDirectory(directory, 0o700); err != nil {
+			return err
+		}
+	}
+	options := "lowerdir=" + workspaceLower + ",upperdir=" + workspaceUpper + ",workdir=" + workspaceWork
+	if err := syscall.Mount("overlay", "/workspace", "overlay", syscall.MS_NOSUID|syscall.MS_NODEV, options); err != nil {
+		return fmt.Errorf("mount writable workspace overlay: %w", err)
+	}
+	return nil
+}
+
+func ensureRealDirectory(path string, mode os.FileMode) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(path, mode); err != nil {
+			return fmt.Errorf("create workspace directory %q: %w", path, err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect workspace directory %q: %w", path, err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("workspace path %q is not a real directory", path)
+	}
+	return nil
+}
+
+func ensureEmptyMountDirectory(path string, mode os.FileMode) error {
+	if err := ensureRealDirectory(path, mode); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return fmt.Errorf("inspect workspace mount point %q: %w", path, err)
+	}
+	if len(entries) != 0 {
+		return fmt.Errorf("workspace mount point %q is not empty", path)
+	}
+	return nil
+}
 
 type workspaceDiff struct {
 	Version uint64               `json:"version"`

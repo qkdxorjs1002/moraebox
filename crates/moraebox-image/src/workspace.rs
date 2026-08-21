@@ -391,34 +391,15 @@ fn scan_source_impl(
     })
 }
 
-fn metadata_tree_digest(
-    root: &Path,
-    cancelled: Option<&AtomicBool>,
-) -> Result<Digest, WorkspaceError> {
-    let mut hasher = Sha256::new();
-    walk(root, root, cancelled, &mut |relative, metadata| {
-        check_cancelled(cancelled)?;
-        let target = if metadata.file_type().is_symlink() {
-            Some(fs::read_link(root.join(relative))?)
-        } else {
-            None
-        };
-        hash_entry_metadata(&mut hasher, relative, metadata, target.as_deref());
-        Ok(())
-    })?;
-    Ok(Digest::from_sha256(hasher.finalize().into()))
-}
-
 fn verify_source_state(
     root: &Path,
     expected_content: &Digest,
-    expected_metadata: &Digest,
+    _expected_metadata: &Digest,
     cancelled: Option<&AtomicBool>,
 ) -> Result<Digest, WorkspaceError> {
-    let actual_metadata = metadata_tree_digest(root, cancelled)?;
-    if &actual_metadata == expected_metadata {
-        return Ok(actual_metadata);
-    }
+    // Metadata equality is not a safe unchanged shortcut: some filesystems coalesce a same-size
+    // rewrite into the same timestamp tick. Always verify the content digest before trusting the
+    // prepared snapshot or declaring that the host source survived a run unchanged.
     let actual = scan_source_impl(root, cancelled)?;
     if &actual.content_digest == expected_content {
         Ok(actual.metadata_digest)

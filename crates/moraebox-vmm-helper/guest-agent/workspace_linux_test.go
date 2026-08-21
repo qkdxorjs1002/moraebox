@@ -48,3 +48,25 @@ func TestWorkspaceDiffReportsAddModifyDelete(t *testing.T) {
 		t.Fatalf("diff = %#v, want %#v", got, want)
 	}
 }
+
+func TestWorkspaceMountPointMustBeARealDirectory(t *testing.T) {
+	state := t.TempDir()
+	mountPoint := filepath.Join(state, "mount-point")
+	if err := ensureRealDirectory(mountPoint, 0o700); err != nil {
+		t.Fatalf("create mount point: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mountPoint, "payload"), []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureRealDirectory(mountPoint, 0o700); err != nil {
+		t.Fatalf("reuse non-empty mount point: %v", err)
+	}
+
+	link := filepath.Join(state, "link")
+	if err := os.Symlink(mountPoint, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureRealDirectory(link, 0o700); err == nil {
+		t.Fatal("symlink mount point was accepted")
+	}
+}

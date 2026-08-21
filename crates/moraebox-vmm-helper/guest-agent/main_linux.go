@@ -29,9 +29,20 @@ type rawSockaddrVM struct {
 func main() {
 	port := flag.Uint("port", 0, "host control vsock port")
 	sessionID := flag.String("session", "", "moraebox session ID")
+	workspaceDevice := flag.String("workspace-device", "", "read-only workspace block device")
+	workspaceWritable := flag.Bool("workspace-writable", false, "mount a disposable writable workspace overlay")
 	flag.Parse()
 	if *port == 0 || *port > uint(^uint32(0)) || *sessionID == "" {
 		fmt.Fprintln(os.Stderr, "morae guest agent: port and session are required")
+		os.Exit(125)
+	}
+	if (*workspaceDevice != "" && *workspaceDevice != "/dev/vdb") ||
+		(*workspaceWritable && *workspaceDevice == "") {
+		fmt.Fprintln(os.Stderr, "morae guest agent: invalid workspace mount configuration")
+		os.Exit(125)
+	}
+	if err := setupWorkspace(*workspaceDevice, *workspaceWritable); err != nil {
+		fmt.Fprintf(os.Stderr, "morae guest agent: workspace setup: %v\n", err)
 		os.Exit(125)
 	}
 	connection, err := connectVsock(uint32(*port))
@@ -64,18 +75,15 @@ func serve(connection *os.File, sessionID string) (int, error) {
 		_ = writer.send(payloadOutput, encodeOutput(1, []byte(err.Error()+"\n")))
 		if diffErr := writeWorkspaceDiffIfRequested(copyOut); diffErr != nil {
 			_ = writer.send(payloadOutput, encodeOutput(1, []byte(diffErr.Error()+"\n")))
-			_ = writer.send(payloadExit, encodeExit(125, nil))
-			return 125, nil
+			return sendExitAndWait(writer, 125, nil)
 		}
 		for _, copyRequest := range copyOut {
 			if copyErr := sendCopyOut(writer, copyRequest); copyErr != nil {
 				_ = writer.send(payloadOutput, encodeOutput(1, []byte(copyErr.Error()+"\n")))
-				_ = writer.send(payloadExit, encodeExit(125, nil))
-				return 125, nil
+				return sendExitAndWait(writer, 125, nil)
 			}
 		}
-		_ = writer.send(payloadExit, encodeExit(127, nil))
-		return 127, nil
+		return sendExitAndWait(writer, 127, nil)
 	}
 
 	frames := make(chan wireFrame)
@@ -139,26 +147,31 @@ func serve(connection *os.File, sessionID string) (int, error) {
 			if err := writeWorkspaceDiffIfRequested(copyOut); err != nil {
 				message := []byte("morae guest agent: workspace diff failed: " + err.Error() + "\n")
 				_ = writer.send(payloadOutput, encodeOutput(1, message))
-				_ = writer.send(payloadExit, encodeExit(125, nil))
-				return 125, nil
+				return sendExitAndWait(writer, 125, nil)
 			}
 			for _, copyRequest := range copyOut {
 				if err := sendCopyOut(writer, copyRequest); err != nil {
 					message := []byte("morae guest agent: copy-out failed: " + err.Error() + "\n")
 					_ = writer.send(payloadOutput, encodeOutput(1, message))
-					_ = writer.send(payloadExit, encodeExit(125, nil))
-					return 125, nil
+					return sendExitAndWait(writer, 125, nil)
 				}
 			}
-			if err := writer.send(payloadExit, encodeExit(result.code, result.signal)); err != nil {
-				return 125, err
-			}
-			return result.shellCode(), nil
+			return sendExitAndWait(writer, result.code, result.signal)
 		case err := <-readErrors:
 			process.kill(syscall.SIGKILL)
 			return 125, fmt.Errorf("control connection failed: %w", err)
 		}
 	}
+}
+
+func sendExitAndWait(writer *frameWriter, code int32, signal *int32) (int, error) {
+	if err := writer.send(payloadExit, encodeExit(code, signal)); err != nil {
+		return 125, err
+	}
+	// The host bridge owns final process termination. Keeping the guest agent alive after
+	// Exit prevents libkrun from terminating the helper before it has durably extracted every
+	// copy-out frame and written all buffered output.
+	select {}
 }
 
 func readInitialRequest(connection *os.File, sessionID string) (execRequest, []copyOutRequest, uint64, error) {
