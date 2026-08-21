@@ -218,7 +218,7 @@
 
 - [x] writable Box 실행 전 `Dirty` 상태를 durable하게 기록하고 clean shutdown/e2fsck 이후에만 `Ready`로 전환한다.
 
-- [ ] gvproxy readiness를 경로 존재가 아닌 socket handshake로 확인하고 bounded stderr diagnostics를 보존한다.
+- [x] gvproxy readiness를 경로 존재가 아닌 socket handshake로 확인하고 bounded stderr diagnostics를 보존한다.
 
 - [ ] root disk 준비가 끝난 뒤 network proxy를 시작하고 중간 실패에도 proxy process를 reap한다.
 

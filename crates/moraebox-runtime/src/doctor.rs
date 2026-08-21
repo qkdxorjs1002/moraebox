@@ -1,12 +1,18 @@
 use std::{
     env, fs,
+    io::Read,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
+
+use crate::libkrun::{
+    NETWORK_PROXY_STDERR_LIMIT, append_bounded_tail, probe_vfkit_endpoint, stderr_diagnostics,
+};
 
 const REQUIRED_LIBKRUN_SYMBOLS: &[&str] = &[
     "krun_create_ctx",
@@ -53,6 +59,7 @@ const EXPECTED_LIBKRUNFW_VERSION: &str = "5.5.0";
 const MIN_RECOMMENDED_CACHE_FREE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const NETWORK_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const NETWORK_SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const NETWORK_STDERR_FINISH_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -646,15 +653,17 @@ fn probe_network_socket(executable: &Path, directory: &Path) -> (Option<bool>, O
         .arg(socket_uri)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .env_clear()
         .spawn();
     let Ok(mut child) = child else {
         return (None, Some("failed to start gvproxy".into()));
     };
+    let stderr = child.stderr.take().map(start_bounded_stderr_capture);
     let result = wait_for_network_socket(&mut child, &socket_path);
     stop_child(&mut child);
-    result
+    let diagnostics = stderr.map_or_else(Vec::new, finish_bounded_stderr_capture);
+    with_stderr_diagnostics(result, &diagnostics)
 }
 
 fn wait_for_network_socket(
@@ -663,16 +672,16 @@ fn wait_for_network_socket(
 ) -> (Option<bool>, Option<String>) {
     let started = Instant::now();
     loop {
-        if socket_path.exists() {
-            return if path_is_socket(socket_path) {
-                (Some(true), None)
-            } else {
-                (
-                    Some(false),
-                    Some("gvproxy created a non-socket path".into()),
-                )
-            };
+        if socket_path.exists() && !path_is_socket(socket_path) {
+            return (
+                Some(false),
+                Some("gvproxy created a non-socket path".into()),
+            );
         }
+        let probe_error = match probe_vfkit_endpoint(socket_path) {
+            Ok(()) => return (Some(true), None),
+            Err(error) => error,
+        };
         match child.try_wait() {
             Ok(Some(status)) => {
                 return (
@@ -686,11 +695,66 @@ fn wait_for_network_socket(
         if started.elapsed() >= NETWORK_SOCKET_TIMEOUT {
             return (
                 Some(false),
-                Some("gvproxy socket was not ready within 5s".into()),
+                Some(format!(
+                    "gvproxy socket was not connectable within 5s; last socket error: {probe_error}"
+                )),
             );
         }
         thread::sleep(NETWORK_SOCKET_POLL_INTERVAL);
     }
+}
+
+type StderrCapture = (Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>);
+
+fn start_bounded_stderr_capture(mut stderr: impl Read + Send + 'static) -> StderrCapture {
+    let retained = Arc::new(Mutex::new(Vec::with_capacity(NETWORK_PROXY_STDERR_LIMIT)));
+    let output = retained.clone();
+    let task = thread::spawn(move || {
+        let mut chunk = [0_u8; 4096];
+        while let Ok(read) = stderr.read(&mut chunk) {
+            if read == 0 {
+                break;
+            }
+            if let Ok(mut retained) = output.lock() {
+                append_bounded_tail(&mut retained, &chunk[..read], NETWORK_PROXY_STDERR_LIMIT);
+            } else {
+                break;
+            }
+        }
+    });
+    (retained, task)
+}
+
+fn finish_bounded_stderr_capture((retained, task): StderrCapture) -> Vec<u8> {
+    let started = Instant::now();
+    while !task.is_finished() && started.elapsed() < NETWORK_STDERR_FINISH_TIMEOUT {
+        thread::sleep(Duration::from_millis(1));
+    }
+    if task.is_finished() {
+        let _ = task.join();
+    }
+    retained
+        .lock()
+        .map_or_else(|_| Vec::new(), |bytes| bytes.clone())
+}
+
+fn with_stderr_diagnostics(
+    result: (Option<bool>, Option<String>),
+    stderr: &[u8],
+) -> (Option<bool>, Option<String>) {
+    let (ready, error) = result;
+    if ready == Some(true) || stderr.is_empty() {
+        return (ready, error);
+    }
+    let suffix = stderr_diagnostics(stderr);
+    (
+        ready,
+        Some(format!(
+            "{}{}",
+            error.unwrap_or_else(|| "gvproxy probe failed".into()),
+            suffix
+        )),
+    )
 }
 
 fn stop_child(child: &mut Child) {
@@ -854,7 +918,7 @@ fn build_checks(
             "network_socket",
             status_for(&[network.socket_created]),
             format!(
-                "gvproxy socket creation is {}",
+                "gvproxy endpoint handshake is {}",
                 probe_state(network.socket_created)
             ),
             "Check gvproxy compatibility and cache path permissions/length, then retry doctor.",
@@ -1033,6 +1097,60 @@ fn binary_has_hypervisor_entitlement(executable: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn network_readiness_requires_a_connectable_datagram_endpoint() {
+        let state = tempfile::tempdir().unwrap();
+        let socket_path = state.path().join("gvproxy.sock");
+        let _listener = std::os::unix::net::UnixDatagram::bind(&socket_path).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 10"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        assert_eq!(
+            wait_for_network_socket(&mut child, &socket_path),
+            (Some(true), None)
+        );
+        stop_child(&mut child);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn network_readiness_rejects_a_path_without_a_socket() {
+        let state = tempfile::tempdir().unwrap();
+        let socket_path = state.path().join("gvproxy.sock");
+        fs::write(&socket_path, []).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 10"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let (ready, error) = wait_for_network_socket(&mut child, &socket_path);
+        assert_eq!(ready, Some(false));
+        assert!(error.is_some_and(|message| message.contains("non-socket")));
+        stop_child(&mut child);
+    }
+
+    #[test]
+    fn doctor_failure_appends_bounded_stderr_diagnostics() {
+        let (ready, error) = with_stderr_diagnostics(
+            (Some(false), Some("probe failed".into())),
+            b"diagnostic-tail",
+        );
+
+        assert_eq!(ready, Some(false));
+        let error = error.unwrap();
+        assert!(error.contains("probe failed"));
+        assert!(error.contains("diagnostic-tail"));
+    }
 
     #[test]
     fn doctor_never_claims_ready_without_libraries() {

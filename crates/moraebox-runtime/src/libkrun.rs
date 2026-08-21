@@ -14,7 +14,9 @@ use moraebox_box::{
 use moraebox_core::{OutputChannel, RunSpec, Signal};
 use tempfile::TempDir;
 use tokio::{
-    process::{Child, Command},
+    io::{AsyncRead, AsyncReadExt},
+    process::{Child, ChildStderr, Command},
+    task::JoinHandle,
     time::{Instant, sleep},
 };
 
@@ -26,6 +28,8 @@ use crate::{
 
 const NETWORK_PROXY_START_TIMEOUT: Duration = Duration::from_secs(5);
 const NETWORK_PROXY_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const NETWORK_PROXY_STDERR_FINISH_TIMEOUT: Duration = Duration::from_millis(100);
+pub(crate) const NETWORK_PROXY_STDERR_LIMIT: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct LibkrunConfig {
@@ -659,6 +663,7 @@ fn elapsed_micros(started: Instant) -> u64 {
 #[derive(Debug)]
 struct NetworkProxy {
     child: Child,
+    stderr: BoundedStderr,
     state: TempDir,
     socket_path: PathBuf,
 }
@@ -676,7 +681,7 @@ impl NetworkProxy {
             .arg(socket)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .env_clear()
             .kill_on_drop(true);
         #[cfg(unix)]
@@ -688,28 +693,39 @@ impl NetworkProxy {
         let mut child = command
             .spawn()
             .map_err(|error| BackendError::Control(format!("failed to start gvproxy: {error}")))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| BackendError::Control("gvproxy stderr pipe was not created".into()))?;
+        let stderr = BoundedStderr::spawn(stderr);
         let started = Instant::now();
         loop {
-            if socket_path.exists() {
-                break;
-            }
             if let Some(status) = child.try_wait()? {
+                let diagnostics = stderr.finish().await.map_err(BackendError::Io)?;
                 return Err(BackendError::Control(format!(
-                    "gvproxy exited before creating its vfkit socket: {status}"
+                    "gvproxy exited before its vfkit endpoint was ready: {status}{}",
+                    stderr_diagnostics(&diagnostics)
                 )));
             }
+            let probe_error = match probe_vfkit_endpoint(&socket_path) {
+                Ok(()) => break,
+                Err(error) => error.to_string(),
+            };
             if started.elapsed() >= NETWORK_PROXY_START_TIMEOUT {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
-                return Err(BackendError::Control(
-                    "gvproxy did not create its vfkit socket within 5 seconds".into(),
-                ));
+                let diagnostics = stderr.finish().await.map_err(BackendError::Io)?;
+                return Err(BackendError::Control(format!(
+                    "gvproxy vfkit endpoint was not connectable within 5 seconds; last socket error: {probe_error}{}",
+                    stderr_diagnostics(&diagnostics)
+                )));
             }
             sleep(NETWORK_PROXY_POLL_INTERVAL).await;
         }
 
         Ok(Self {
             child,
+            stderr,
             state,
             socket_path,
         })
@@ -723,8 +739,99 @@ impl NetworkProxy {
             return Err(error);
         }
         let _ = self.child.wait().await?;
+        self.stderr.abort();
         self.state.close()
     }
+}
+
+#[derive(Debug)]
+struct BoundedStderr {
+    task: JoinHandle<io::Result<Vec<u8>>>,
+}
+
+impl BoundedStderr {
+    fn spawn(stderr: ChildStderr) -> Self {
+        Self {
+            task: tokio::spawn(read_bounded_tail(stderr, NETWORK_PROXY_STDERR_LIMIT)),
+        }
+    }
+
+    async fn finish(mut self) -> io::Result<Vec<u8>> {
+        if let Ok(result) =
+            tokio::time::timeout(NETWORK_PROXY_STDERR_FINISH_TIMEOUT, &mut self.task).await
+        {
+            result
+                .map_err(|error| io::Error::other(format!("gvproxy stderr task failed: {error}")))?
+        } else {
+            self.task.abort();
+            Ok(Vec::new())
+        }
+    }
+
+    fn abort(self) {
+        self.task.abort();
+    }
+}
+
+async fn read_bounded_tail(
+    mut reader: impl AsyncRead + Unpin,
+    limit: usize,
+) -> io::Result<Vec<u8>> {
+    let mut retained = Vec::with_capacity(limit);
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        append_bounded_tail(&mut retained, &chunk[..read], limit);
+    }
+}
+
+pub(crate) fn append_bounded_tail(retained: &mut Vec<u8>, bytes: &[u8], limit: usize) {
+    if limit == 0 {
+        retained.clear();
+        return;
+    }
+    if bytes.len() >= limit {
+        retained.clear();
+        retained.extend_from_slice(&bytes[bytes.len() - limit..]);
+        return;
+    }
+    let overflow = retained
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(limit);
+    if overflow > 0 {
+        retained.drain(..overflow);
+    }
+    retained.extend_from_slice(bytes);
+}
+
+pub(crate) fn stderr_diagnostics(stderr: &[u8]) -> String {
+    if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; stderr (last {} bytes): {}",
+            stderr.len(),
+            String::from_utf8_lossy(stderr).trim()
+        )
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn probe_vfkit_endpoint(path: &Path) -> io::Result<()> {
+    let socket = std::os::unix::net::UnixDatagram::unbound()?;
+    socket.connect(path)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn probe_vfkit_endpoint(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Unix datagram endpoints are unavailable on this platform",
+    ))
 }
 
 fn create_network_state(config: &LibkrunConfig) -> Result<TempDir, BackendError> {
@@ -853,6 +960,64 @@ mod tests {
             let overlong = PathBuf::from(format!("/private/tmp/{}", "x".repeat(104)));
             assert!(vfkit_socket_uri(&overlong).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vfkit_probe_requires_a_bound_datagram_endpoint() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("gvproxy.sock");
+        fs::write(&path, []).unwrap();
+        assert!(probe_vfkit_endpoint(&path).is_err());
+
+        fs::remove_file(&path).unwrap();
+        let _listener = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        probe_vfkit_endpoint(&path).unwrap();
+    }
+
+    #[test]
+    fn stderr_tail_never_exceeds_its_byte_limit() {
+        let mut retained = b"old".to_vec();
+        append_bounded_tail(&mut retained, b"0123456789", 6);
+        assert_eq!(retained, b"456789");
+
+        append_bounded_tail(&mut retained, b"ab", 6);
+        assert_eq!(retained, b"6789ab");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gvproxy_early_exit_reports_only_bounded_stderr_tail() {
+        let state = tempfile::tempdir().unwrap();
+        let helper = state.path().join("helper");
+        let gvproxy = state.path().join("gvproxy");
+        let library = state.path().join("libkrun");
+        let root = state.path().join("root");
+        write_executable(&helper, "#!/bin/sh\nexit 0\n");
+        write_executable(
+            &gvproxy,
+            "#!/bin/sh\ndd if=/dev/zero bs=32768 count=1 2>/dev/null >&2\nprintf diagnostic-tail >&2\nexit 7\n",
+        );
+        fs::write(&library, []).unwrap();
+        fs::create_dir(&root).unwrap();
+        let mut config = LibkrunConfig::new(helper, library, root);
+        config.gvproxy_path = Some(gvproxy.clone());
+        config.network_runtime_dir = state.path().join("network");
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.network = true;
+
+        let result = LibkrunBackend::new(config)
+            .spawn(&spec, &RunBudget::new(spec.timeout))
+            .await;
+        let Err(error) = result else {
+            panic!("expected gvproxy startup to fail");
+        };
+        let BackendError::Control(message) = error else {
+            panic!("expected a control error");
+        };
+        assert!(message.contains("diagnostic-tail"));
+        assert!(message.contains("exit status: 7"));
+        assert!(message.len() <= NETWORK_PROXY_STDERR_LIMIT.saturating_mul(3));
     }
 
     #[tokio::test]
@@ -1219,21 +1384,23 @@ mod tests {
         write_executable(&helper, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
         write_executable(
             &gvproxy,
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nsocket=${2#unixgram://}\n: > \"$socket\"\nwhile :; do /bin/sleep 1; done\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nprintf '%s' \"${2#unixgram://}\" > \"$0.socket\"\nwhile :; do /bin/sleep 1; done\n",
         );
         fs::write(&library, []).unwrap();
         fs::create_dir(&root).unwrap();
 
         let mut config = LibkrunConfig::new(helper, library, root);
-        config.gvproxy_path = Some(gvproxy);
+        config.gvproxy_path = Some(gvproxy.clone());
         config.network_runtime_dir = network_runtime_dir.clone();
         let mut spec = RunSpec::command(["/usr/bin/true"]);
         spec.network = true;
+        let endpoint = spawn_fake_vfkit_endpoint(gvproxy.with_extension("socket"));
 
         let report = crate::Supervisor::new(LibkrunBackend::new(config))
             .run(spec)
             .await
             .unwrap();
+        let _endpoint = endpoint.await.unwrap();
         let output = report
             .output
             .iter()
@@ -1266,23 +1433,25 @@ mod tests {
         write_executable(&helper, "#!/bin/sh\nwhile :; do /bin/sleep 1; done\n");
         write_executable(
             &gvproxy,
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nsocket=${2#unixgram://}\n: > \"$socket\"\nwhile :; do /bin/sleep 1; done\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nprintf '%s' \"${2#unixgram://}\" > \"$0.socket\"\nwhile :; do /bin/sleep 1; done\n",
         );
         fs::write(&library, []).unwrap();
         fs::create_dir(&root).unwrap();
 
         let mut config = LibkrunConfig::new(helper, library, root);
-        config.gvproxy_path = Some(gvproxy);
+        config.gvproxy_path = Some(gvproxy.clone());
         config.network_runtime_dir = network_runtime_dir.clone();
         let mut spec = RunSpec::command(["/usr/bin/true"]);
         spec.network = true;
         spec.timeout = moraebox_core::TimeoutPolicy::Limited(5_000);
         spec.kill_grace = Duration::from_millis(20);
+        let endpoint = spawn_fake_vfkit_endpoint(gvproxy.with_extension("socket"));
 
         let report = crate::Supervisor::new(LibkrunBackend::new(config))
             .run(spec)
             .await
             .unwrap();
+        let _endpoint = endpoint.await.unwrap();
 
         assert!(report.timed_out);
         let pid = fs::read_to_string(proxy_pid)
@@ -1309,22 +1478,24 @@ mod tests {
         write_executable(&helper, "#!/bin/sh\nwhile :; do /bin/sleep 1; done\n");
         write_executable(
             &gvproxy,
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nsocket=${2#unixgram://}\n: > \"$socket\"\nwhile :; do /bin/sleep 1; done\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nprintf '%s' \"${2#unixgram://}\" > \"$0.socket\"\nwhile :; do /bin/sleep 1; done\n",
         );
         fs::write(&library, []).unwrap();
         fs::create_dir(&root).unwrap();
 
         let mut config = LibkrunConfig::new(helper, library, root);
-        config.gvproxy_path = Some(gvproxy);
+        config.gvproxy_path = Some(gvproxy.clone());
         config.network_runtime_dir = network_runtime_dir.clone();
         let backend = LibkrunBackend::new(config);
         let mut spec = RunSpec::command(["/usr/bin/true"]);
         spec.network = true;
+        let endpoint = spawn_fake_vfkit_endpoint(gvproxy.with_extension("socket"));
 
         let spawned = backend
             .spawn(&spec, &RunBudget::new(spec.timeout))
             .await
             .unwrap();
+        let endpoint = endpoint.await.unwrap();
         let pid = fs::read_to_string(proxy_pid)
             .unwrap()
             .trim()
@@ -1341,6 +1512,7 @@ mod tests {
         }
         assert_eq!(kill(pid, None), Err(Errno::ESRCH));
         assert_eq!(fs::read_dir(network_runtime_dir).unwrap().count(), 0);
+        drop(endpoint);
     }
 
     #[cfg(unix)]
@@ -1349,7 +1521,7 @@ mod tests {
         use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
 
         let fixture = ManagedFixture::new(
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nwhile :; do /bin/sleep 1; done\n",
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nprintf '%s' \"${2#unixgram://}\" > \"$0.socket\"\nwhile :; do /bin/sleep 1; done\n",
             "#!/bin/sh\nexit 0\n",
         );
         let rootfs = fixture.state.path().join("rootfs");
@@ -1369,7 +1541,7 @@ mod tests {
         let gvproxy = fixture.state.path().join("gvproxy");
         write_executable(
             &gvproxy,
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nsocket=${2#unixgram://}\n: > \"$socket\"\nwhile :; do /bin/sleep 1; done\n",
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nprintf '%s' \"${2#unixgram://}\" > \"$0.socket\"\nwhile :; do /bin/sleep 1; done\n",
         );
         let mut backend = fixture.backend(Some((source, runtime_root.clone())));
         backend.config.gvproxy_path = Some(gvproxy.clone());
@@ -1379,8 +1551,10 @@ mod tests {
         spec.network = true;
         spec.kill_grace = Duration::from_millis(20);
         let session_id = spec.session_id;
+        let endpoint = spawn_fake_vfkit_endpoint(gvproxy.with_extension("socket"));
 
         let session = manager.start(spec).await.unwrap();
+        let endpoint = endpoint.await.unwrap();
         let helper_pid_path = fixture.helper.with_extension("pid");
         let proxy_pid_path = gvproxy.with_extension("pid");
         wait_for_paths([&helper_pid_path, &proxy_pid_path]).await;
@@ -1409,6 +1583,24 @@ mod tests {
         })
         .await
         .expect("owner loss must reap helper, proxy, disk, and socket state");
+        drop(endpoint);
+    }
+
+    #[cfg(unix)]
+    fn spawn_fake_vfkit_endpoint(
+        socket_path_file: PathBuf,
+    ) -> JoinHandle<std::os::unix::net::UnixDatagram> {
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..500 {
+                if let Ok(socket_path) = fs::read_to_string(&socket_path_file)
+                    && let Ok(socket) = std::os::unix::net::UnixDatagram::bind(socket_path)
+                {
+                    return socket;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("fake network proxy did not publish a bindable socket path")
+        })
     }
 
     #[cfg(unix)]
@@ -1479,9 +1671,11 @@ mod tests {
                     &source,
                 )
                 .unwrap();
-            let disk = self.boxes.try_acquire(metadata.box_id).unwrap();
-            let path = disk.disk_path().to_path_buf();
-            drop(disk);
+            let path = self
+                .boxes
+                .boxes_directory()
+                .join(metadata.box_id.to_string())
+                .join("root.ext4");
             (metadata.box_id, path)
         }
 
