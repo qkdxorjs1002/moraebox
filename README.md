@@ -114,7 +114,7 @@ morae image default debian:bookworm
 morae image default --unset
 ```
 
-Registry manifests and blobs are digest-verified before layers are materialized. Private registries accept an explicit username/password pair through CLI options or `MORAE_REGISTRY_USERNAME` and `MORAE_REGISTRY_PASSWORD`.
+Registry manifests and blobs are digest-verified before layers are materialized. Private registries accept an explicit username/password pair through CLI options or `MORAE_REGISTRY_USERNAME` and `MORAE_REGISTRY_PASSWORD`. Bearer token realms must use HTTPS; credentials are sent only to the registry origin, its child auth origins, Docker Hub's token service, or an HTTPS origin explicitly trusted with the Rust SDK's `RegistryClient::with_allowed_credential_realm_origin` builder.
 
 `--rootfs /path/to/rootfs` is an advanced alternative for an already materialized guest root directory. It bypasses image resolution and is mutually exclusive with `--image`.
 

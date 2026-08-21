@@ -98,7 +98,7 @@
   - descriptor size와 실제 body size 불일치를 거부한다.
   - free-space preflight와 decompression-bomb 회귀 테스트를 추가한다.
 
-- [ ] Bearer auth realm으로 registry credential을 전달하는 정책을 제한한다.
+- [x] Bearer auth realm으로 registry credential을 전달하는 정책을 제한한다.
   - HTTPS를 강제하고 credential을 전달할 수 있는 registry/realm 관계를 검증한다.
   - 정상적인 cross-host token service는 지원하되 arbitrary realm에는 Basic credential을 보내지 않는다.
 

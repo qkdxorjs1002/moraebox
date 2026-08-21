@@ -1,7 +1,7 @@
-use std::{fs, str::FromStr};
+use std::{collections::BTreeSet, fs, str::FromStr};
 
 use futures_util::StreamExt;
-use reqwest::{StatusCode, header};
+use reqwest::{StatusCode, Url, header, redirect};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -18,6 +18,7 @@ const ACCEPT_MANIFESTS: &str = concat!(
     "application/vnd.docker.distribution.manifest.list.v2+json,",
     "application/vnd.docker.distribution.manifest.v2+json"
 );
+const MAX_TOKEN_RESPONSE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credentials {
@@ -150,20 +151,56 @@ impl PulledImage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RealmOrigin {
+    host: String,
+    port: u16,
+}
+
+impl RealmOrigin {
+    fn from_url(url: &Url) -> Result<Self, RegistryError> {
+        let host = url
+            .host_str()
+            .ok_or(RegistryError::InvalidTokenRealm)?
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        let port = url
+            .port_or_known_default()
+            .ok_or(RegistryError::InvalidTokenRealm)?;
+        Ok(Self { host, port })
+    }
+
+    fn from_registry(reference: &RegistryReference) -> Result<Self, RegistryError> {
+        let endpoint = Url::parse(&format!("https://{}/", reference.endpoint_registry()))
+            .map_err(|_| RegistryError::InvalidRegistryEndpoint)?;
+        Self::from_url(&endpoint).map_err(|_| RegistryError::InvalidRegistryEndpoint)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RegistryClient {
     client: reqwest::Client,
+    token_client: reqwest::Client,
     credentials: Option<Credentials>,
+    allowed_credential_realms: BTreeSet<RealmOrigin>,
     limits: ImagePullLimits,
 }
 
 impl RegistryClient {
     pub fn new(credentials: Option<Credentials>) -> Result<Self, RegistryError> {
+        let user_agent = concat!("moraebox/", env!("CARGO_PKG_VERSION"));
         Ok(Self {
             client: reqwest::Client::builder()
-                .user_agent(concat!("moraebox/", env!("CARGO_PKG_VERSION")))
+                .user_agent(user_agent)
+                .https_only(true)
+                .build()?,
+            token_client: reqwest::Client::builder()
+                .user_agent(user_agent)
+                .https_only(true)
+                .redirect(redirect::Policy::none())
                 .build()?,
             credentials,
+            allowed_credential_realms: BTreeSet::new(),
             limits: ImagePullLimits::default(),
         })
     }
@@ -172,6 +209,16 @@ impl RegistryClient {
     pub fn with_limits(mut self, limits: ImagePullLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    pub fn with_allowed_credential_realm_origin(
+        mut self,
+        realm: &str,
+    ) -> Result<Self, RegistryError> {
+        let realm = validate_token_realm(realm)?;
+        self.allowed_credential_realms
+            .insert(RealmOrigin::from_url(&realm)?);
+        Ok(self)
     }
 
     pub async fn pull(
@@ -347,42 +394,52 @@ impl RegistryClient {
         challenge: &str,
         reference: &RegistryReference,
     ) -> Result<String, RegistryError> {
-        let challenge = challenge
-            .strip_prefix("Bearer ")
-            .or_else(|| challenge.strip_prefix("bearer "))
-            .ok_or_else(|| RegistryError::UnsupportedChallenge(challenge.into()))?;
-        let values = parse_challenge(challenge);
-        let realm = values
-            .iter()
-            .find(|(key, _)| key == "realm")
-            .map(|(_, value)| value.as_str())
-            .ok_or(RegistryError::MissingChallenge)?;
-        let mut request = self.client.get(realm);
-        let service = values
-            .iter()
-            .find(|(key, _)| key == "service")
-            .map(|(_, value)| value.as_str());
-        let scope = values
-            .iter()
-            .find(|(key, _)| key == "scope")
-            .map_or_else(|| reference.scope(), |(_, value)| value.clone());
+        let response = self.token_request(challenge, reference)?.send().await?;
+        if response.status().is_redirection() {
+            return Err(RegistryError::TokenRedirectDisallowed(response.status()));
+        }
+        if !response.status().is_success() {
+            return Err(RegistryError::TokenStatus(response.status()));
+        }
+        let bytes = read_bounded_response(
+            response,
+            "registry token response",
+            MAX_TOKEN_RESPONSE_BYTES,
+        )
+        .await?;
+        let token: TokenResponse = serde_json::from_slice(&bytes)?;
+        token
+            .token
+            .or(token.access_token)
+            .filter(|token| !token.is_empty())
+            .ok_or(RegistryError::MissingToken)
+    }
+
+    fn token_request(
+        &self,
+        challenge: &str,
+        reference: &RegistryReference,
+    ) -> Result<reqwest::RequestBuilder, RegistryError> {
+        let challenge = parse_bearer_challenge(challenge)?;
+        let realm = validate_token_realm(&challenge.realm)?;
+        let mut request = self.token_client.get(realm.clone());
+        let scope = challenge.scope.unwrap_or_else(|| reference.scope());
         let mut query = vec![("scope", scope.as_str())];
-        if let Some(service) = service {
+        if let Some(service) = challenge.service.as_deref() {
             query.push(("service", service));
         }
         request = request.query(&query);
         if let Some(credentials) = &self.credentials {
+            if !credential_realm_is_trusted(reference, &realm, &self.allowed_credential_realms)? {
+                let origin = RealmOrigin::from_url(&realm)?;
+                return Err(RegistryError::UntrustedCredentialRealm {
+                    host: origin.host,
+                    port: origin.port,
+                });
+            }
             request = request.basic_auth(&credentials.username, Some(&credentials.password));
         }
-        let response = request.send().await?;
-        if !response.status().is_success() {
-            return Err(RegistryError::TokenStatus(response.status()));
-        }
-        let token: TokenResponse = response.json().await?;
-        token
-            .token
-            .or(token.access_token)
-            .ok_or(RegistryError::MissingToken)
+        Ok(request)
     }
 }
 
@@ -579,17 +636,167 @@ fn verify_descriptor_size_u64(descriptor: &Descriptor, actual: u64) -> Result<()
     Ok(())
 }
 
-fn parse_challenge(value: &str) -> Vec<(String, String)> {
-    value
-        .split(',')
-        .filter_map(|part| {
-            let (key, value) = part.trim().split_once('=')?;
-            Some((
-                key.trim().to_ascii_lowercase(),
-                value.trim().trim_matches('"').to_owned(),
-            ))
-        })
-        .collect()
+#[derive(Debug, PartialEq, Eq)]
+struct BearerChallenge {
+    realm: String,
+    service: Option<String>,
+    scope: Option<String>,
+}
+
+fn parse_bearer_challenge(value: &str) -> Result<BearerChallenge, RegistryError> {
+    let value = value.trim();
+    let scheme_end = value
+        .find(char::is_whitespace)
+        .ok_or_else(|| RegistryError::UnsupportedChallenge(value.into()))?;
+    if !value[..scheme_end].eq_ignore_ascii_case("bearer") {
+        return Err(RegistryError::UnsupportedChallenge(value.into()));
+    }
+    let parameters = parse_auth_parameters(value[scheme_end..].trim())?;
+    let realm = unique_parameter(&parameters, "realm")?.ok_or(RegistryError::MissingChallenge)?;
+    Ok(BearerChallenge {
+        realm,
+        service: unique_parameter(&parameters, "service")?,
+        scope: unique_parameter(&parameters, "scope")?,
+    })
+}
+
+fn parse_auth_parameters(value: &str) -> Result<Vec<(String, String)>, RegistryError> {
+    let bytes = value.as_bytes();
+    let mut offset = 0;
+    let mut parameters = Vec::new();
+    while offset < bytes.len() {
+        while offset < bytes.len() && (bytes[offset].is_ascii_whitespace() || bytes[offset] == b',')
+        {
+            offset += 1;
+        }
+        if offset == bytes.len() {
+            break;
+        }
+
+        let key_start = offset;
+        while offset < bytes.len() && is_auth_token_byte(bytes[offset]) {
+            offset += 1;
+        }
+        if key_start == offset {
+            return Err(RegistryError::InvalidChallenge);
+        }
+        let key = value[key_start..offset].to_ascii_lowercase();
+        while offset < bytes.len() && bytes[offset].is_ascii_whitespace() {
+            offset += 1;
+        }
+        if bytes.get(offset) != Some(&b'=') {
+            return Err(RegistryError::InvalidChallenge);
+        }
+        offset += 1;
+        while offset < bytes.len() && bytes[offset].is_ascii_whitespace() {
+            offset += 1;
+        }
+
+        let parsed = if bytes.get(offset) == Some(&b'"') {
+            offset += 1;
+            let mut decoded = Vec::new();
+            let mut closed = false;
+            while offset < bytes.len() {
+                match bytes[offset] {
+                    b'\\' => {
+                        offset += 1;
+                        let escaped = bytes.get(offset).ok_or(RegistryError::InvalidChallenge)?;
+                        decoded.push(*escaped);
+                        offset += 1;
+                    }
+                    b'"' => {
+                        offset += 1;
+                        closed = true;
+                        break;
+                    }
+                    b'\r' | b'\n' => return Err(RegistryError::InvalidChallenge),
+                    byte => {
+                        decoded.push(byte);
+                        offset += 1;
+                    }
+                }
+            }
+            if !closed {
+                return Err(RegistryError::InvalidChallenge);
+            }
+            while offset < bytes.len() && bytes[offset].is_ascii_whitespace() {
+                offset += 1;
+            }
+            if offset < bytes.len() && bytes[offset] != b',' {
+                return Err(RegistryError::InvalidChallenge);
+            }
+            String::from_utf8(decoded).map_err(|_| RegistryError::InvalidChallenge)?
+        } else {
+            let value_start = offset;
+            while offset < bytes.len() && bytes[offset] != b',' {
+                offset += 1;
+            }
+            let parsed = value[value_start..offset].trim();
+            if parsed.is_empty() {
+                return Err(RegistryError::InvalidChallenge);
+            }
+            parsed.to_owned()
+        };
+        parameters.push((key, parsed));
+        if offset < bytes.len() {
+            offset += 1;
+        }
+    }
+    Ok(parameters)
+}
+
+fn is_auth_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+fn unique_parameter(
+    parameters: &[(String, String)],
+    key: &str,
+) -> Result<Option<String>, RegistryError> {
+    let mut matches = parameters
+        .iter()
+        .filter(|(candidate, _)| candidate == key)
+        .map(|(_, value)| value.clone());
+    let first = matches.next();
+    if matches.next().is_some() {
+        return Err(RegistryError::InvalidChallenge);
+    }
+    Ok(first)
+}
+
+fn validate_token_realm(value: &str) -> Result<Url, RegistryError> {
+    let url = Url::parse(value).map_err(|_| RegistryError::InvalidTokenRealm)?;
+    if url.scheme() != "https" {
+        return Err(RegistryError::InsecureTokenRealm);
+    }
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(RegistryError::InvalidTokenRealm);
+    }
+    Ok(url)
+}
+
+fn credential_realm_is_trusted(
+    reference: &RegistryReference,
+    realm: &Url,
+    explicitly_allowed: &BTreeSet<RealmOrigin>,
+) -> Result<bool, RegistryError> {
+    let registry = RealmOrigin::from_registry(reference)?;
+    let realm = RealmOrigin::from_url(realm)?;
+    let same_or_child = registry.port == realm.port
+        && (registry.host == realm.host
+            || realm
+                .host
+                .strip_suffix(&registry.host)
+                .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1));
+    let docker_hub = registry.host == "registry-1.docker.io"
+        && registry.port == 443
+        && realm.host == "auth.docker.io"
+        && realm.port == 443;
+    Ok(same_or_child || docker_hub || explicitly_allowed.contains(&realm))
 }
 
 #[derive(Debug, Deserialize)]
@@ -620,10 +827,22 @@ pub enum RegistryError {
     HttpStatus { status: StatusCode, url: String },
     #[error("registry token exchange returned {0}")]
     TokenStatus(StatusCode),
+    #[error("registry token endpoint redirect is not allowed: {0}")]
+    TokenRedirectDisallowed(StatusCode),
     #[error("registry did not provide a bearer challenge")]
     MissingChallenge,
     #[error("unsupported registry authentication challenge: {0}")]
     UnsupportedChallenge(String),
+    #[error("registry bearer challenge is malformed or ambiguous")]
+    InvalidChallenge,
+    #[error("registry bearer token realm is not a valid absolute URL")]
+    InvalidTokenRealm,
+    #[error("registry bearer token realm must use HTTPS")]
+    InsecureTokenRealm,
+    #[error("registry endpoint cannot be represented as a secure origin")]
+    InvalidRegistryEndpoint,
+    #[error("refusing to send registry credentials to untrusted token realm {host}:{port}")]
+    UntrustedCredentialRealm { host: String, port: u16 },
     #[error("registry token response did not contain a token")]
     MissingToken,
     #[error("no manifest exists for platform {0:?}")]
@@ -718,16 +937,133 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn credentials() -> Credentials {
+        Credentials {
+            username: "user".into(),
+            password: "secret".into(),
+        }
+    }
+
+    fn bearer_challenge(realm: &str) -> String {
+        format!(r#"Bearer realm="{realm}",service="registry.example",scope="repository:a/b:pull""#)
+    }
+
     #[test]
     fn parses_bearer_challenge() {
-        let values = parse_challenge(
-            r#"realm="https://auth.example/token",service="registry.example",scope="repository:a/b:pull""#,
-        );
-        assert_eq!(
-            values[0],
-            ("realm".into(), "https://auth.example/token".into())
-        );
-        assert_eq!(values[2].1, "repository:a/b:pull");
+        let challenge = parse_bearer_challenge(
+            r#"bEaReR realm="https://auth.example/token?labels=a,b",service="registry.example",scope="repository:a/b:pull,push",note="quoted\"value""#,
+        )
+        .unwrap();
+        assert_eq!(challenge.realm, "https://auth.example/token?labels=a,b");
+        assert_eq!(challenge.service.as_deref(), Some("registry.example"));
+        assert_eq!(challenge.scope.as_deref(), Some("repository:a/b:pull,push"));
+    }
+
+    #[test]
+    fn rejects_malformed_or_ambiguous_bearer_challenges() {
+        assert!(matches!(
+            parse_bearer_challenge(
+                r#"Bearer realm="https://one.example/token",realm="https://two.example/token""#
+            ),
+            Err(RegistryError::InvalidChallenge)
+        ));
+        assert!(matches!(
+            parse_bearer_challenge(r#"Bearer realm="https://auth.example/token"#),
+            Err(RegistryError::InvalidChallenge)
+        ));
+        assert!(matches!(
+            parse_bearer_challenge("Basic realm=registry"),
+            Err(RegistryError::UnsupportedChallenge(_))
+        ));
+    }
+
+    #[test]
+    fn token_realm_requires_a_clean_https_url() {
+        validate_token_realm("https://auth.example/token?client=moraebox").unwrap();
+        assert!(matches!(
+            validate_token_realm("http://auth.example/token"),
+            Err(RegistryError::InsecureTokenRealm)
+        ));
+        assert!(matches!(
+            validate_token_realm("https://user:password@auth.example/token"),
+            Err(RegistryError::InvalidTokenRealm)
+        ));
+        assert!(matches!(
+            validate_token_realm("https://auth.example/token#fragment"),
+            Err(RegistryError::InvalidTokenRealm)
+        ));
+    }
+
+    #[test]
+    fn credentials_are_added_only_for_trusted_realm_origins() {
+        let reference: RegistryReference = "registry.example/a/b:latest".parse().unwrap();
+        let client = RegistryClient::new(Some(credentials())).unwrap();
+        for realm in [
+            "https://registry.example/token",
+            "https://auth.registry.example/token",
+        ] {
+            let request = client
+                .token_request(&bearer_challenge(realm), &reference)
+                .unwrap()
+                .build()
+                .unwrap();
+            assert!(request.headers().contains_key(header::AUTHORIZATION));
+        }
+
+        assert!(matches!(
+            client.token_request(&bearer_challenge("https://auth.example/token"), &reference),
+            Err(RegistryError::UntrustedCredentialRealm { .. })
+        ));
+        assert!(matches!(
+            client.token_request(
+                &bearer_challenge("https://registry.example:444/token"),
+                &reference
+            ),
+            Err(RegistryError::UntrustedCredentialRealm { .. })
+        ));
+    }
+
+    #[test]
+    fn docker_hub_and_explicit_cross_host_realms_can_receive_credentials() {
+        let docker: RegistryReference = "python:3.12".parse().unwrap();
+        let client = RegistryClient::new(Some(credentials())).unwrap();
+        let request = client
+            .token_request(&bearer_challenge("https://auth.docker.io/token"), &docker)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(request.headers().contains_key(header::AUTHORIZATION));
+
+        let private: RegistryReference = "registry.example/a/b:latest".parse().unwrap();
+        let client = RegistryClient::new(Some(credentials()))
+            .unwrap()
+            .with_allowed_credential_realm_origin("https://identity.example/token")
+            .unwrap();
+        let request = client
+            .token_request(
+                &bearer_challenge("https://identity.example/registry-token"),
+                &private,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(request.headers().contains_key(header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn anonymous_cross_host_token_requests_remain_supported() {
+        let reference: RegistryReference = "registry.example/a/b:latest".parse().unwrap();
+        let client = RegistryClient::new(None).unwrap();
+        let request = client
+            .token_request(
+                &bearer_challenge("https://identity.unrelated/token"),
+                &reference,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert!(!request.headers().contains_key(header::AUTHORIZATION));
     }
 
     #[test]
