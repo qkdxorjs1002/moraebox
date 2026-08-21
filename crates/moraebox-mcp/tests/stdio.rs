@@ -1,9 +1,9 @@
 use std::{
     io::{BufRead, BufReader, Read, Write},
-    process::{Command, Stdio},
+    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::{Value, json};
@@ -135,6 +135,95 @@ fn controls_remain_responsive_during_a_waiting_exec() {
     assert!(responses.try_iter().next().is_none());
 }
 
+#[cfg(unix)]
+#[test]
+fn cancelled_waiting_exec_is_cleaned_before_response() {
+    let temporary = tempfile::tempdir().unwrap();
+    let pid_path = temporary.path().join("cancelled.pid");
+    let (mut child, mut stdin, responses, reader) = spawn_server();
+
+    initialize(&mut stdin, &responses);
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"sandbox_exec","arguments":{
+                "argv":pid_command(&pid_path),"wait":true
+            }}
+        }),
+    );
+    let pid = wait_for_pid(&pid_path);
+    assert!(process_is_alive(pid));
+
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":2,"reason":"integration test"}
+        }),
+    );
+    let cancelled = read_response(&responses);
+    assert_eq!(cancelled.get("id"), Some(&json!(2)));
+    assert_eq!(cancelled.pointer("/error/code"), Some(&json!(-32800)));
+    assert!(
+        !process_is_alive(pid),
+        "request-owned process {pid} outlived its cancellation response"
+    );
+
+    write_request(&mut stdin, &json!({"jsonrpc":"2.0","id":3,"method":"ping"}));
+    assert_eq!(read_response(&responses).get("id"), Some(&json!(3)));
+
+    drop(stdin);
+    assert!(wait_for_child(&mut child).success());
+    reader.join().unwrap();
+    assert!(responses.try_iter().next().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn async_session_survives_request_completion_and_is_cleaned_on_eof() {
+    let temporary = tempfile::tempdir().unwrap();
+    let pid_path = temporary.path().join("connection-owned.pid");
+    let (mut child, mut stdin, responses, reader) = spawn_server();
+
+    initialize(&mut stdin, &responses);
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"sandbox_exec","arguments":{
+                "argv":pid_command(&pid_path),"wait":false
+            }}
+        }),
+    );
+    let started = read_response(&responses);
+    assert_eq!(started.get("id"), Some(&json!(2)));
+    let pid = wait_for_pid(&pid_path);
+    assert!(process_is_alive(pid));
+
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":2,"reason":"request already completed"}
+        }),
+    );
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        process_is_alive(pid),
+        "completed wait=false request lost its connection-owned session"
+    );
+
+    drop(stdin);
+    assert!(wait_for_child(&mut child).success());
+    assert!(
+        !process_is_alive(pid),
+        "connection-owned process {pid} outlived client EOF"
+    );
+    reader.join().unwrap();
+    assert!(responses.try_iter().next().is_none());
+}
+
 fn write_request(stdin: &mut impl Write, request: &Value) {
     writeln!(stdin, "{request}").unwrap();
     stdin.flush().unwrap();
@@ -145,6 +234,91 @@ fn read_response(responses: &mpsc::Receiver<String>) -> Value {
         .recv_timeout(Duration::from_secs(5))
         .expect("MCP response timed out");
     serde_json::from_str(&line).expect("stdout line must be one JSON response")
+}
+
+fn spawn_server() -> (
+    Child,
+    ChildStdin,
+    mpsc::Receiver<String>,
+    thread::JoinHandle<()>,
+) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_morae-mcp"))
+        .args(["--backend", "process"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (lines, responses) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            lines.send(line.unwrap()).unwrap();
+        }
+    });
+    (child, stdin, responses, reader)
+}
+
+fn initialize(stdin: &mut impl Write, responses: &mpsc::Receiver<String>) {
+    write_request(
+        stdin,
+        &json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-11-25"}
+        }),
+    );
+    assert_eq!(read_response(responses).get("id"), Some(&json!(1)));
+}
+
+fn wait_for_child(child: &mut Child) -> ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("MCP server did not exit after client EOF");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn pid_command(pid_path: &std::path::Path) -> Vec<String> {
+    vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf '%s' $$ > \"$1\"; exec /bin/sleep 30".into(),
+        "moraebox-pid-writer".into(),
+        pid_path.to_string_lossy().into_owned(),
+    ]
+}
+
+#[cfg(unix)]
+fn wait_for_pid(pid_path: &std::path::Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(pid_path)
+            && let Ok(pid) = contents.parse()
+        {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "process PID was not published");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(unix)]

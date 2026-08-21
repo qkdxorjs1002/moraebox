@@ -80,7 +80,7 @@
   - 긴 `sandbox_exec(wait=true)` 중에도 `sandbox_io`, `sandbox_stop`, `ping`을 처리해야 한다.
   - response 순서는 달라도 ID 대응과 stdout protocol 무오염을 보장한다.
 
-- [ ] JSON-RPC cancellation과 client EOF를 session cleanup에 연결한다.
+- [x] JSON-RPC cancellation과 client EOF를 session cleanup에 연결한다.
   - cancelled request와 연결 종료가 소유한 session을 정리한다.
   - 비동기 session을 의도적으로 유지할 수 있는 ownership 규칙을 명시한다.
 

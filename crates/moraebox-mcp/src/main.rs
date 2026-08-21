@@ -2,7 +2,15 @@
 
 mod registration;
 
-use std::{ffi::OsString, io, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    io,
+    path::PathBuf,
+    process::ExitCode,
+    str::FromStr,
+    sync::{Arc, Mutex as StdMutex},
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand};
@@ -16,24 +24,28 @@ use moraebox_runtime::{
     Backend, BoxRootSource, BoxRuntimeConfig, LibkrunBackend, LibkrunConfig, NativeRuntimePaths,
     ProcessBackend,
 };
-use moraebox_sdk::{ExecutionResult, IoRequest, IoResult, SandboxSdk};
+use moraebox_sdk::{ExecutionResult, IoRequest, IoResult, SandboxSdk, SdkError};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
-    sync::{Semaphore, mpsc},
+    sync::{Semaphore, mpsc, oneshot},
     task::JoinSet,
 };
 
 const PROTOCOL_VERSION: &str = "2026-07-28";
 const MAX_CONCURRENT_REQUESTS: usize = 32;
 const RESPONSE_QUEUE_CAPACITY: usize = 128;
+type InflightRequests = Arc<StdMutex<HashMap<String, Option<oneshot::Sender<()>>>>>;
 const SERVER_INSTRUCTIONS: &str = concat!(
     "Use sandbox_exec when a command benefits from a disposable execution environment, ",
     "including untrusted code, dependency installation, isolated experiments, reproducible ",
     "Linux checks, or long-running sessions. Use wait=true for one-shot commands and ",
     "wait=false to start sessions; use sandbox_io for cursor-based I/O and sandbox_stop to ",
-    "terminate and clean up sessions. Pass box_id to continue from a persistent Box while ",
+    "terminate and clean up sessions. wait=true sessions belong to their request and are ",
+    "cleaned when that request is cancelled. wait=false sessions belong to this stdio ",
+    "connection and remain available until sandbox_stop or client disconnect. Pass box_id ",
+    "to continue from a persistent Box while ",
     "still receiving a new microVM and SessionId for every run. Use the sandbox_box_* tools ",
     "to create and manage persistent root filesystems. Only the libkrun backend provides VM isolation; the ",
     "process backend is for deterministic development and is not isolated. Host workspace ",
@@ -269,6 +281,7 @@ async fn serve(server: McpServer) -> Result<(), Box<dyn std::error::Error>> {
     let (responses, response_receiver) = mpsc::channel(RESPONSE_QUEUE_CAPACITY);
     let writer = tokio::spawn(write_responses(response_receiver));
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
+    let inflight: InflightRequests = Arc::new(StdMutex::new(HashMap::new()));
     let mut requests = JoinSet::new();
     let input_error = loop {
         let line = match input.next_line().await {
@@ -295,21 +308,30 @@ async fn serve(server: McpServer) -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
+        if request.get("method").and_then(Value::as_str) == Some("notifications/cancelled") {
+            if let Some(request_id) = request.pointer("/params/requestId") {
+                cancel_request(&inflight, request_id);
+            }
+            continue;
+        }
         if request.get("id").is_none() {
             continue;
         }
-        let permit = Arc::clone(&permits)
-            .acquire_owned()
-            .await
-            .expect("request semaphore remains open");
-        let server = server.clone();
-        let responses = responses.clone();
-        requests.spawn(async move {
-            let _permit = permit;
-            let response = handle_request(&server, request).await;
-            let _ = responses.send(response).await;
-        });
+        if let Err(error) = dispatch_request(
+            &server,
+            request,
+            &responses,
+            &permits,
+            &inflight,
+            &mut requests,
+        )
+        .await
+        {
+            break Some(error);
+        }
     };
+
+    cancel_all_requests(&inflight);
     drop(responses);
 
     let mut request_error = None;
@@ -322,6 +344,12 @@ async fn serve(server: McpServer) -> Result<(), Box<dyn std::error::Error>> {
             )));
         }
     }
+    let cleanup_error = server
+        .sdk
+        .shutdown()
+        .await
+        .err()
+        .map(|error| io::Error::other(format!("MCP session cleanup failed: {error}")));
     let writer_result = writer
         .await
         .map_err(|error| io::Error::other(format!("MCP writer task failed: {error}")))?;
@@ -331,8 +359,107 @@ async fn serve(server: McpServer) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(error) = request_error {
         return Err(error.into());
     }
+    if let Some(error) = cleanup_error {
+        return Err(error.into());
+    }
     writer_result?;
     Ok(())
+}
+
+async fn dispatch_request(
+    server: &McpServer,
+    request: Value,
+    responses: &mpsc::Sender<Value>,
+    permits: &Arc<Semaphore>,
+    inflight: &InflightRequests,
+    requests: &mut JoinSet<()>,
+) -> io::Result<()> {
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let key = request_key(&id);
+    let (cancel, cancellation) = oneshot::channel();
+    if !register_request(inflight, &key, cancel) {
+        responses
+            .send(protocol_error(id, -32600, "duplicate in-flight request id"))
+            .await
+            .map_err(|_| response_writer_stopped())?;
+        return Ok(());
+    }
+    let server = server.clone();
+    let responses = responses.clone();
+    let inflight = Arc::clone(inflight);
+    let permits = Arc::clone(permits);
+    requests.spawn(async move {
+        let mut cancellation = cancellation;
+        let permit = tokio::select! {
+            permit = permits.acquire_owned() => {
+                permit.expect("request semaphore remains open")
+            }
+            _ = &mut cancellation => {
+                inflight
+                    .lock()
+                    .expect("in-flight request lock is not poisoned")
+                    .remove(&key);
+                let _ = responses
+                    .send(protocol_error(id, -32800, "request cancelled"))
+                    .await;
+                return;
+            }
+        };
+        let _permit = permit;
+        let response = handle_cancellable_request(&server, request, cancellation).await;
+        inflight
+            .lock()
+            .expect("in-flight request lock is not poisoned")
+            .remove(&key);
+        let _ = responses.send(response).await;
+    });
+    Ok(())
+}
+
+fn register_request(
+    inflight: &InflightRequests,
+    key: &str,
+    cancellation: oneshot::Sender<()>,
+) -> bool {
+    let mut inflight = inflight
+        .lock()
+        .expect("in-flight request lock is not poisoned");
+    if inflight.contains_key(key) {
+        false
+    } else {
+        inflight.insert(key.to_owned(), Some(cancellation));
+        true
+    }
+}
+
+fn cancel_request(inflight: &InflightRequests, request_id: &Value) {
+    let cancellation = inflight
+        .lock()
+        .expect("in-flight request lock is not poisoned")
+        .get_mut(&request_key(request_id))
+        .and_then(Option::take);
+    if let Some(cancellation) = cancellation {
+        let _ = cancellation.send(());
+    }
+}
+
+fn cancel_all_requests(inflight: &InflightRequests) {
+    let cancellations = std::mem::take(
+        &mut *inflight
+            .lock()
+            .expect("in-flight request lock is not poisoned"),
+    );
+    for cancellation in cancellations.into_values().flatten() {
+        let _ = cancellation.send(());
+    }
+}
+
+fn response_writer_stopped() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "MCP response writer stopped")
+}
+
+fn request_key(id: &Value) -> String {
+    serde_json::to_string(id).expect("JSON-RPC request id is serializable")
 }
 
 async fn write_responses(mut responses: mpsc::Receiver<Value>) -> io::Result<()> {
@@ -354,7 +481,24 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 async fn handle_request(server: &McpServer, request: Value) -> Value {
+    handle_request_inner(server, request, None).await
+}
+
+async fn handle_cancellable_request(
+    server: &McpServer,
+    request: Value,
+    cancellation: oneshot::Receiver<()>,
+) -> Value {
+    handle_request_inner(server, request, Some(cancellation)).await
+}
+
+async fn handle_request_inner(
+    server: &McpServer,
+    request: Value,
+    cancellation: Option<oneshot::Receiver<()>>,
+) -> Value {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     match method {
@@ -374,6 +518,7 @@ async fn handle_request(server: &McpServer, request: Value) -> Value {
                 server,
                 id,
                 request.get("params").cloned().unwrap_or_default(),
+                cancellation,
             )
             .await
         }
@@ -381,7 +526,12 @@ async fn handle_request(server: &McpServer, request: Value) -> Value {
     }
 }
 
-async fn call_tool(server: &McpServer, id: Value, params: Value) -> Value {
+async fn call_tool(
+    server: &McpServer,
+    id: Value,
+    params: Value,
+    cancellation: Option<oneshot::Receiver<()>>,
+) -> Value {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return protocol_error(id, -32602, "tool name is required");
     };
@@ -390,7 +540,13 @@ async fn call_tool(server: &McpServer, id: Value, params: Value) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
     let result = match name {
-        "sandbox_exec" => sandbox_exec(&server.sdk, arguments).await,
+        "sandbox_exec" => match sandbox_exec(&server.sdk, arguments, cancellation).await {
+            Ok(value) => Ok(value),
+            Err(ExecError::Cancelled) => {
+                return protocol_error(id, -32800, "request cancelled");
+            }
+            Err(ExecError::Failed(error)) => Err(error),
+        },
         "sandbox_io" => sandbox_io(&server.sdk, arguments).await,
         "sandbox_stop" => sandbox_stop(&server.sdk, arguments).await,
         "sandbox_box_create" => sandbox_box_create(server, arguments).await,
@@ -407,10 +563,29 @@ async fn call_tool(server: &McpServer, id: Value, params: Value) -> Value {
     }
 }
 
-async fn sandbox_exec(sdk: &SandboxSdk, arguments: Value) -> Result<Value, String> {
-    let args: ExecArgs = serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+enum ExecError {
+    Cancelled,
+    Failed(String),
+}
+
+impl From<SdkError> for ExecError {
+    fn from(error: SdkError) -> Self {
+        match error {
+            SdkError::RequestCancelled => Self::Cancelled,
+            error => Self::Failed(error.to_string()),
+        }
+    }
+}
+
+async fn sandbox_exec(
+    sdk: &SandboxSdk,
+    arguments: Value,
+    cancellation: Option<oneshot::Receiver<()>>,
+) -> Result<Value, ExecError> {
+    let args: ExecArgs =
+        serde_json::from_value(arguments).map_err(|error| ExecError::Failed(error.to_string()))?;
     if args.argv.is_empty() {
-        return Err("argv must contain an executable".into());
+        return Err(ExecError::Failed("argv must contain an executable".into()));
     }
     let mut spec = RunSpec::command(args.argv);
     spec.box_id = args.box_id;
@@ -419,17 +594,29 @@ async fn sandbox_exec(sdk: &SandboxSdk, arguments: Value) -> Result<Value, Strin
     spec.timeout = match (args.unlimited, args.timeout_ms) {
         (true, _) => TimeoutPolicy::Unlimited,
         (false, Some(milliseconds)) if milliseconds > 0 => TimeoutPolicy::Limited(milliseconds),
-        (false, Some(_)) => return Err("timeout_ms must be greater than zero".into()),
+        (false, Some(_)) => {
+            return Err(ExecError::Failed(
+                "timeout_ms must be greater than zero".into(),
+            ));
+        }
         (false, None) => TimeoutPolicy::default(),
     };
     if let Some(input) = args.stdin_base64 {
-        spec.stdin = STANDARD.decode(input).map_err(|error| error.to_string())?;
+        spec.stdin = STANDARD
+            .decode(input)
+            .map_err(|error| ExecError::Failed(error.to_string()))?;
     }
     if args.wait {
-        let result = sdk.exec(spec).await.map_err(|error| error.to_string())?;
+        let result = match cancellation {
+            Some(cancellation) => sdk.exec_cancellable(spec, cancellation).await,
+            None => sdk.exec(spec).await,
+        }?;
         Ok(execution_json(&result))
     } else {
-        let status = sdk.start(spec).await.map_err(|error| error.to_string())?;
+        let status = match cancellation {
+            Some(cancellation) => sdk.start_cancellable(spec, cancellation).await,
+            None => sdk.start(spec).await,
+        }?;
         Ok(json!({ "status": status, "next_cursor": 0 }))
     }
 }
@@ -677,7 +864,7 @@ fn tools_list() -> Value {
             {
                 "name": "sandbox_exec",
                 "title": "Execute in configured runtime",
-                "description": "Start a command in the configured runtime. Every call receives a new SessionId and, with libkrun, a new microVM. Pass box_id only when the command should reuse that Box's persistent root filesystem. Prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. Set wait=false to start a session. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
+                "description": "Start a command in the configured runtime. Every call receives a new SessionId and, with libkrun, a new microVM. Pass box_id only when the command should reuse that Box's persistent root filesystem. Prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. wait=true runs are cleaned when their request is cancelled. wait=false starts a session owned by this stdio connection until sandbox_stop or disconnect. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

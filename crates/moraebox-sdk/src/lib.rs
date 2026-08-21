@@ -9,7 +9,10 @@ use moraebox_core::{BoxId, OutputChunk, OutputReadError, RunSpec, SessionId, Sig
 use moraebox_runtime::{Backend, SessionError, SessionHandle, SessionManager, SessionStatus};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::{
+    sync::{RwLock, oneshot},
+    task::JoinSet,
+};
 
 #[derive(Clone)]
 pub struct SandboxSdk {
@@ -40,8 +43,58 @@ impl SandboxSdk {
         Ok(status)
     }
 
+    /// Starts a connection-owned session unless its creating request is cancelled first.
+    ///
+    /// Once this returns successfully, the session remains owned by this SDK until it is
+    /// explicitly removed or [`Self::shutdown`] is called.
+    pub async fn start_cancellable(
+        &self,
+        spec: RunSpec,
+        cancellation: oneshot::Receiver<()>,
+    ) -> Result<SessionStatus, SdkError> {
+        let handle = self.start_handle_cancellable(spec, cancellation).await?;
+        let status = handle.status();
+        self.sessions.write().await.insert(handle.id(), handle);
+        Ok(status)
+    }
+
     pub async fn exec(&self, spec: RunSpec) -> Result<ExecutionResult, SdkError> {
         let handle = self.manager.start(spec).await?;
+        Self::finish_execution(&handle).await
+    }
+
+    /// Runs a request-owned one-shot session and completes cleanup before reporting cancellation.
+    pub async fn exec_cancellable(
+        &self,
+        spec: RunSpec,
+        mut cancellation: oneshot::Receiver<()>,
+    ) -> Result<ExecutionResult, SdkError> {
+        if cancellation.try_recv().is_ok() {
+            return Err(SdkError::RequestCancelled);
+        }
+        let mut start = Box::pin(self.manager.start(spec));
+        let handle = tokio::select! {
+            result = &mut start => result?,
+            _ = &mut cancellation => {
+                let handle = start.await?;
+                Self::stop_handle(&handle).await?;
+                return Err(SdkError::RequestCancelled);
+            }
+        };
+        if cancellation.try_recv().is_ok() {
+            Self::stop_handle(&handle).await?;
+            return Err(SdkError::RequestCancelled);
+        }
+        tokio::select! {
+            result = Self::finish_execution(&handle) => result,
+            _ = &mut cancellation => {
+                Self::stop_handle(&handle).await?;
+                Err(SdkError::RequestCancelled)
+            }
+        }
+    }
+
+    async fn finish_execution(handle: &SessionHandle) -> Result<ExecutionResult, SdkError> {
         if let Err(error) = handle.close_stdin().await
             && handle.status().state != moraebox_core::SessionState::Dead
         {
@@ -61,6 +114,40 @@ impl SandboxSdk {
             next_cursor: output.next_cursor,
             truncated: output.truncated,
         })
+    }
+
+    async fn start_handle_cancellable(
+        &self,
+        spec: RunSpec,
+        mut cancellation: oneshot::Receiver<()>,
+    ) -> Result<SessionHandle, SdkError> {
+        if cancellation.try_recv().is_ok() {
+            return Err(SdkError::RequestCancelled);
+        }
+        let mut start = Box::pin(self.manager.start(spec));
+        let handle = tokio::select! {
+            result = &mut start => result?,
+            _ = &mut cancellation => {
+                let handle = start.await?;
+                Self::stop_handle(&handle).await?;
+                return Err(SdkError::RequestCancelled);
+            }
+        };
+        if cancellation.try_recv().is_ok() {
+            Self::stop_handle(&handle).await?;
+            return Err(SdkError::RequestCancelled);
+        }
+        Ok(handle)
+    }
+
+    async fn stop_handle(handle: &SessionHandle) -> Result<SessionStatus, SdkError> {
+        let stop_error = handle.stop().await.err();
+        let status = handle.wait().await?;
+        if let Some(error) = stop_error {
+            Err(error.into())
+        } else {
+            Ok(status)
+        }
     }
 
     pub async fn io(
@@ -108,6 +195,28 @@ impl SandboxSdk {
 
     pub async fn remove(&self, session_id: SessionId) -> bool {
         self.sessions.write().await.remove(&session_id).is_some()
+    }
+
+    /// Stops and forgets every connection-owned session, continuing after individual failures.
+    pub async fn shutdown(&self) -> Result<(), SdkError> {
+        let sessions = std::mem::take(&mut *self.sessions.write().await);
+        let mut cleanup = JoinSet::new();
+        for handle in sessions.into_values() {
+            cleanup.spawn(async move { Self::stop_handle(&handle).await });
+        }
+
+        let mut first_error = None;
+        while let Some(result) = cleanup.join_next().await {
+            let result = result
+                .map_err(|error| SdkError::SessionTask(error.to_string()))
+                .and_then(|result| result.map(|_| ()));
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub async fn create_box(
@@ -227,6 +336,10 @@ pub enum SdkError {
     Session(#[from] SessionError),
     #[error("unknown sandbox session {0}")]
     UnknownSession(SessionId),
+    #[error("sandbox request was cancelled")]
+    RequestCancelled,
+    #[error("session cleanup task failed: {0}")]
+    SessionTask(String),
     #[error("Box store is not configured for this SDK instance")]
     BoxStoreNotConfigured,
     #[error("Box background task failed: {0}")]
@@ -353,6 +466,64 @@ mod tests {
                 .iter()
                 .any(|chunk| chunk.channel == moraebox_core::OutputChannel::Stderr)
         );
+    }
+
+    #[tokio::test]
+    async fn cancellable_exec_waits_for_session_cleanup() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let mut spec = RunSpec::command(long_running_command());
+        spec.kill_grace = Duration::from_millis(20);
+        let (cancel, cancellation) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = cancel.send(());
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            sdk.exec_cancellable(spec, cancellation),
+        )
+        .await
+        .expect("cancelled execution cleanup timed out");
+
+        assert!(matches!(result, Err(SdkError::RequestCancelled)));
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_start_does_not_create_a_session() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let (cancel, cancellation) = oneshot::channel();
+        cancel.send(()).unwrap();
+
+        let result = sdk
+            .start_cancellable(RunSpec::command(long_running_command()), cancellation)
+            .await;
+
+        assert!(matches!(result, Err(SdkError::RequestCancelled)));
+        sdk.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_and_forgets_connection_owned_sessions() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let mut spec = RunSpec::command(long_running_command());
+        spec.kill_grace = Duration::from_millis(20);
+        let first = sdk.start(spec.clone()).await.unwrap();
+        let second = sdk.start(spec).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), sdk.shutdown())
+            .await
+            .expect("SDK shutdown timed out")
+            .unwrap();
+
+        assert!(matches!(
+            sdk.wait(first.session_id).await,
+            Err(SdkError::UnknownSession(id)) if id == first.session_id
+        ));
+        assert!(matches!(
+            sdk.wait(second.session_id).await,
+            Err(SdkError::UnknownSession(id)) if id == second.session_id
+        ));
     }
 
     #[cfg(unix)]
