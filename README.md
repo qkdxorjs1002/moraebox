@@ -313,11 +313,11 @@ prepare → start → ready → running → stop → dead
 | --- | --- |
 | `moraebox-core` | Run specification, lifecycle states, signals, and bounded output |
 | `moraebox-box` | Persistent Box metadata, leases, immutable base disks, and ephemeral CoW disks |
-| `moraebox-image` | OCI registry access, digest verification, cache, and workspace snapshots |
-| `moraebox-runtime` | Backends, supervision, sessions, diagnostics, and traces |
+| `moraebox-image` | OCI registry access, digest verification, cache orchestration, metadata/storage, and workspace snapshots |
+| `moraebox-runtime` | Backends with separated native root/network lifecycles, supervision, sessions, diagnostics, and traces |
 | `moraebox-sdk` | Async embedding API |
-| `moraebox-cli` | The `morae` command-line interface |
-| `moraebox-mcp` | Stdio MCP server and agent registration |
+| `moraebox-cli` | The `morae` interface with separated command and interactive I/O modules |
+| `moraebox-mcp` | MCP tool protocol, stdio transport, and agent registration |
 | `moraebox-vmm-helper` | Signed native boundary around libkrun |
 | `moraebox-protocol` | Bounded host/guest protocol types |
 

@@ -280,11 +280,11 @@ prepare → start → ready → running → stop → dead
 | --- | --- |
 | `moraebox-core` | 실행 명세, 수명주기 상태, 시그널, 제한된 출력 |
 | `moraebox-box` | persistent Box metadata, lease, immutable base disk, ephemeral CoW disk |
-| `moraebox-image` | OCI 레지스트리, digest 검증, 캐시, 워크스페이스 스냅샷 |
-| `moraebox-runtime` | 백엔드, supervision, 세션, 진단, trace |
+| `moraebox-image` | OCI 레지스트리, digest 검증, 캐시 orchestration, metadata/storage, 워크스페이스 스냅샷 |
+| `moraebox-runtime` | native root/network 수명주기를 분리한 백엔드, supervision, 세션, 진단, trace |
 | `moraebox-sdk` | 비동기 임베딩 API |
-| `moraebox-cli` | `morae` 명령줄 인터페이스 |
-| `moraebox-mcp` | stdio MCP 서버와 에이전트 등록 |
+| `moraebox-cli` | command와 interactive I/O 모듈을 분리한 `morae` 명령줄 인터페이스 |
+| `moraebox-mcp` | MCP tool protocol, stdio transport, 에이전트 등록 |
 | `moraebox-vmm-helper` | libkrun을 감싸는 서명된 네이티브 경계 |
 | `moraebox-protocol` | 제한된 host/guest 프로토콜 타입 |
 
