@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -57,6 +58,48 @@ pub struct BoxMetadata {
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     pub owner_uid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoxEntryErrorCode {
+    InvalidName,
+    InvalidMetadata,
+    UnsupportedSchema,
+    UnsafeFileType,
+    MissingData,
+    Busy,
+    Io,
+    CorruptStore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoxEntryError {
+    pub entry_name: String,
+    pub box_id: Option<BoxId>,
+    pub code: BoxEntryErrorCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoxListReport {
+    pub boxes: Vec<BoxMetadata>,
+    pub errors: Vec<BoxEntryError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantinedBoxEntry {
+    pub entry_name: String,
+    pub box_id: Option<BoxId>,
+    pub destination: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoxRepairReport {
+    pub applied: bool,
+    pub detected: Vec<BoxEntryError>,
+    pub quarantined: Vec<QuarantinedBoxEntry>,
+    pub failures: Vec<BoxEntryError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,32 +219,132 @@ impl BoxStore {
         read_metadata(&paths.metadata, box_id)
     }
 
-    pub fn list(&self) -> Result<Vec<BoxMetadata>, BoxStoreError> {
+    pub fn list(&self) -> Result<BoxListReport, BoxStoreError> {
+        Ok(self.scan()?.report)
+    }
+
+    pub fn repair(&self, apply: bool) -> Result<BoxRepairReport, BoxStoreError> {
+        let scan = self.scan()?;
+        let mut report = BoxRepairReport {
+            applied: apply,
+            detected: scan.report.errors,
+            quarantined: Vec::new(),
+            failures: scan.unaddressable,
+        };
+        if !apply || scan.corrupt.is_empty() {
+            return Ok(report);
+        }
+
+        let quarantine_root = self.state_root.join("quarantine");
+        secure_directory(&quarantine_root)?;
+        let batch = quarantine_root.join(format!(
+            "boxes-{}-{}-{}",
+            now_unix_millis()?,
+            std::process::id(),
+            TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        secure_directory(&batch)?;
+
+        for entry in scan.corrupt {
+            match Self::quarantine_entry(&entry, &batch) {
+                Ok(destination) => report.quarantined.push(QuarantinedBoxEntry {
+                    entry_name: entry.error.entry_name,
+                    box_id: entry.error.box_id,
+                    destination,
+                }),
+                Err(error) => report.failures.push(BoxEntryError::from_store_error(
+                    entry.error.entry_name,
+                    entry.error.box_id,
+                    &error,
+                )),
+            }
+        }
+        Ok(report)
+    }
+
+    fn scan(&self) -> Result<BoxScan, BoxStoreError> {
         self.ensure_root()?;
         let directory = self.boxes_directory();
         if !directory.exists() {
-            return Ok(Vec::new());
+            return Ok(BoxScan::default());
         }
         validate_directory(&directory, "box store")?;
-        let mut values = Vec::new();
+        let mut scan = BoxScan::default();
         for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                return Err(BoxStoreError::CorruptStore(
-                    "box directory name is not valid UTF-8".into(),
-                ));
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    scan.push_unaddressable(BoxEntryError {
+                        entry_name: "<unreadable>".into(),
+                        box_id: None,
+                        code: BoxEntryErrorCode::Io,
+                        message: error.to_string(),
+                    });
+                    continue;
+                }
             };
-            if name.starts_with('.') {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
                 continue;
             }
-            let box_id = BoxId::from_str(name).map_err(|_| {
-                BoxStoreError::CorruptStore(format!("invalid box directory name: {name}"))
-            })?;
-            values.push(self.get(box_id)?);
+            let Some(name) = name.to_str() else {
+                scan.push_corrupt(
+                    entry.path(),
+                    entry.file_name(),
+                    BoxEntryError {
+                        entry_name: entry.file_name().to_string_lossy().into_owned(),
+                        box_id: None,
+                        code: BoxEntryErrorCode::InvalidName,
+                        message: "box directory name is not valid UTF-8".into(),
+                    },
+                );
+                continue;
+            };
+            let Ok(box_id) = BoxId::from_str(name) else {
+                scan.push_corrupt(
+                    entry.path(),
+                    entry.file_name(),
+                    BoxEntryError {
+                        entry_name: name.into(),
+                        box_id: None,
+                        code: BoxEntryErrorCode::InvalidName,
+                        message: format!("invalid box directory name: {name}"),
+                    },
+                );
+                continue;
+            };
+            match self.get(box_id) {
+                Ok(metadata) => scan.report.boxes.push(metadata),
+                Err(error) => scan.push_corrupt(
+                    entry.path(),
+                    entry.file_name(),
+                    BoxEntryError::from_store_error(name.into(), Some(box_id), &error),
+                ),
+            }
         }
-        values.sort_by_key(|metadata| metadata.box_id.to_string());
-        Ok(values)
+        scan.report
+            .boxes
+            .sort_by_key(|metadata| metadata.box_id.to_string());
+        scan.report
+            .errors
+            .sort_by(|left, right| left.entry_name.cmp(&right.entry_name));
+        Ok(scan)
+    }
+
+    fn quarantine_entry(entry: &CorruptBoxEntry, batch: &Path) -> Result<PathBuf, BoxStoreError> {
+        let _lock = if let Some(box_id) = entry.error.box_id {
+            lock_for_quarantine(&entry.source, box_id)?
+        } else {
+            None
+        };
+        let destination = batch.join(&entry.name);
+        if destination.symlink_metadata().is_ok() {
+            return Err(BoxStoreError::InvalidPath(destination));
+        }
+        fs::rename(&entry.source, &destination)?;
+        sync_parent(&entry.source)?;
+        sync_parent(&destination)?;
+        Ok(destination)
     }
 
     pub fn try_acquire(&self, box_id: BoxId) -> Result<BoxLease, BoxStoreError> {
@@ -386,6 +529,95 @@ struct BoxPaths {
     metadata: PathBuf,
     disk: PathBuf,
     lock: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct BoxScan {
+    report: BoxListReport,
+    corrupt: Vec<CorruptBoxEntry>,
+    unaddressable: Vec<BoxEntryError>,
+}
+
+impl BoxScan {
+    fn push_corrupt(&mut self, source: PathBuf, name: OsString, error: BoxEntryError) {
+        self.report.errors.push(error.clone());
+        self.corrupt.push(CorruptBoxEntry {
+            source,
+            name,
+            error,
+        });
+    }
+
+    fn push_unaddressable(&mut self, error: BoxEntryError) {
+        self.report.errors.push(error.clone());
+        self.unaddressable.push(error);
+    }
+}
+
+#[derive(Debug)]
+struct CorruptBoxEntry {
+    source: PathBuf,
+    name: OsString,
+    error: BoxEntryError,
+}
+
+impl BoxEntryError {
+    fn from_store_error(entry_name: String, box_id: Option<BoxId>, error: &BoxStoreError) -> Self {
+        let code = match error {
+            BoxStoreError::Busy { .. } => BoxEntryErrorCode::Busy,
+            BoxStoreError::UnsupportedSchema { .. } => BoxEntryErrorCode::UnsupportedSchema,
+            BoxStoreError::InvalidMetadata(_) => BoxEntryErrorCode::InvalidMetadata,
+            BoxStoreError::UnsafeFileType { .. } | BoxStoreError::InvalidPath(_) => {
+                BoxEntryErrorCode::UnsafeFileType
+            }
+            BoxStoreError::NotFound(_) => BoxEntryErrorCode::MissingData,
+            BoxStoreError::Io(source) if source.kind() == io::ErrorKind::NotFound => {
+                BoxEntryErrorCode::MissingData
+            }
+            BoxStoreError::CorruptStore(_) => BoxEntryErrorCode::CorruptStore,
+            BoxStoreError::NeedsRepair(_)
+            | BoxStoreError::BaseDiskBusy { .. }
+            | BoxStoreError::Mke2fs { .. }
+            | BoxStoreError::CowCloneUnavailable { .. }
+            | BoxStoreError::EphemeralExists(_)
+            | BoxStoreError::StorageRoot(_)
+            | BoxStoreError::ClockBeforeUnixEpoch
+            | BoxStoreError::ClockOverflow
+            | BoxStoreError::Io(_)
+            | BoxStoreError::Json(_) => BoxEntryErrorCode::Io,
+        };
+        Self {
+            entry_name,
+            box_id,
+            code,
+            message: error.to_string(),
+        }
+    }
+}
+
+fn lock_for_quarantine(directory: &Path, box_id: BoxId) -> Result<Option<File>, BoxStoreError> {
+    let metadata = fs::symlink_metadata(directory)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(None);
+    }
+    let path = directory.join(LOCK_FILE);
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(BoxStoreError::UnsafeFileType {
+                label: "box lock".into(),
+                path,
+            });
+        }
+    }
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    set_file_permissions(&path)?;
+    FileExt::try_lock_exclusive(&lock).map_err(|source| BoxStoreError::Busy { box_id, source })?;
+    Ok(Some(lock))
 }
 
 fn read_metadata(path: &Path, expected_id: BoxId) -> Result<BoxMetadata, BoxStoreError> {
@@ -702,7 +934,9 @@ mod tests {
         fs::set_permissions(&state, fs::Permissions::from_mode(0o777)).unwrap();
         let store = BoxStore::new(&state);
 
-        assert!(store.list().unwrap().is_empty());
+        let report = store.list().unwrap();
+        assert!(report.boxes.is_empty());
+        assert!(report.errors.is_empty());
         assert_eq!(
             fs::metadata(state).unwrap().permissions().mode() & 0o777,
             0o700
@@ -726,6 +960,80 @@ mod tests {
             Err(BoxStoreError::StorageRoot(StorageRootError::UnsafeFileType(path)))
                 if path == state
         ));
+    }
+
+    #[test]
+    fn list_preserves_healthy_boxes_and_reports_each_corrupt_entry() {
+        let fixture = Fixture::new();
+        let healthy = fixture.create();
+        let corrupt = fixture.create();
+        fs::write(
+            fixture
+                .store
+                .box_directory(corrupt.box_id)
+                .join(METADATA_FILE),
+            b"not-json",
+        )
+        .unwrap();
+        fs::create_dir(fixture.store.boxes_directory().join("not-a-box")).unwrap();
+
+        let report = fixture.store.list().unwrap();
+
+        assert_eq!(report.boxes, [healthy]);
+        assert_eq!(report.errors.len(), 2);
+        assert!(report.errors.iter().any(|error| {
+            error.box_id == Some(corrupt.box_id) && error.code == BoxEntryErrorCode::InvalidMetadata
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.entry_name == "not-a-box" && error.code == BoxEntryErrorCode::InvalidName
+        }));
+    }
+
+    #[test]
+    fn repair_previews_then_quarantines_without_deleting_data() {
+        let fixture = Fixture::new();
+        let healthy = fixture.create();
+        let corrupt = fixture.create();
+        let corrupt_directory = fixture.store.box_directory(corrupt.box_id);
+        fs::write(corrupt_directory.join(METADATA_FILE), b"not-json").unwrap();
+
+        let preview = fixture.store.repair(false).unwrap();
+        assert!(!preview.applied);
+        assert_eq!(preview.detected.len(), 1);
+        assert!(preview.quarantined.is_empty());
+        assert!(corrupt_directory.exists());
+
+        let applied = fixture.store.repair(true).unwrap();
+        assert!(applied.applied);
+        assert_eq!(applied.quarantined.len(), 1);
+        assert!(applied.failures.is_empty());
+        assert!(!corrupt_directory.exists());
+        assert!(
+            applied.quarantined[0]
+                .destination
+                .join(ROOT_DISK_FILE)
+                .is_file()
+        );
+
+        let report = fixture.store.list().unwrap();
+        assert_eq!(report.boxes, [healthy]);
+        assert!(report.errors.is_empty());
+    }
+
+    #[test]
+    fn repair_does_not_quarantine_a_busy_corrupt_box() {
+        let fixture = Fixture::new();
+        let corrupt = fixture.create();
+        let directory = fixture.store.box_directory(corrupt.box_id);
+        let _lease = fixture.store.try_acquire(corrupt.box_id).unwrap();
+        fs::write(directory.join(METADATA_FILE), b"not-json").unwrap();
+
+        let report = fixture.store.repair(true).unwrap();
+
+        assert!(report.quarantined.is_empty());
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].code, BoxEntryErrorCode::Busy);
+        assert!(directory.exists());
     }
 
     #[test]
@@ -784,7 +1092,7 @@ mod tests {
         assert_ne!(source.box_id, cloned.box_id);
         assert_eq!(source.manifest_digest, cloned.manifest_digest);
         assert_eq!(source.virtual_size_bytes, cloned.virtual_size_bytes);
-        assert_eq!(fixture.store.list().unwrap().len(), 2);
+        assert_eq!(fixture.store.list().unwrap().boxes.len(), 2);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use moraebox_box::{BoxMetadata, BoxStore, BoxStoreError, CreateBox};
+use moraebox_box::{BoxListReport, BoxMetadata, BoxStore, BoxStoreError, CreateBox};
 use moraebox_core::{
     BoxId, OutputChunk, OutputRead, OutputReadError, RunSpec, SessionId, SessionState, Signal,
 };
@@ -555,7 +555,7 @@ impl SandboxSdk {
             .map_err(Into::into)
     }
 
-    pub async fn list_boxes(&self) -> Result<Vec<BoxMetadata>, SdkError> {
+    pub async fn list_boxes(&self) -> Result<BoxListReport, SdkError> {
         let store = self.box_store()?;
         tokio::task::spawn_blocking(move || store.list())
             .await
@@ -809,9 +809,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(sdk.get_box(created.box_id).await.unwrap(), created);
-        assert_eq!(sdk.list_boxes().await.unwrap(), vec![created.clone()]);
+        let listed = sdk.list_boxes().await.unwrap();
+        assert_eq!(listed.boxes.as_slice(), std::slice::from_ref(&created));
+        assert!(listed.errors.is_empty());
         sdk.delete_box(created.box_id).await.unwrap();
-        assert!(sdk.list_boxes().await.unwrap().is_empty());
+        assert!(sdk.list_boxes().await.unwrap().boxes.is_empty());
     }
 
     #[tokio::test]

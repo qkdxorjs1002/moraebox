@@ -14,7 +14,8 @@ use std::{
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use moraebox_box::{
-    BaseDiskSpec, BaseDiskStore, BoxMetadata, BoxStore, CreateBox, EphemeralDiskStore,
+    BaseDiskSpec, BaseDiskStore, BoxMetadata, BoxRepairReport, BoxStore, CreateBox,
+    EphemeralDiskStore,
 };
 use moraebox_core::{
     BoxId, OutputChannel, OutputReadError, RunSpec, SessionState, Signal, StoragePaths,
@@ -147,6 +148,9 @@ enum BoxCommand {
     Reset(BoxResetArgs),
     /// Clone one idle Box into a new independent Box.
     Clone(BoxCloneArgs),
+    /// Preview or quarantine corrupt Box entries without deleting their data.
+    #[command(visible_alias = "quarantine")]
+    Repair(BoxRepairArgs),
 }
 
 #[derive(Debug, Args)]
@@ -261,6 +265,16 @@ struct BoxCloneArgs {
     box_id: BoxId,
     /// Confirm creation of a new durable Box disk.
     #[arg(long, required = true)]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct BoxRepairArgs {
+    /// Report corrupt entries without changing the store.
+    #[arg(long, conflicts_with = "yes")]
+    dry_run: bool,
+    /// Move corrupt entries into the private quarantine directory.
+    #[arg(long)]
     yes: bool,
 }
 
@@ -452,6 +466,9 @@ async fn execute(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         Command::Box {
             command: BoxCommand::Clone(args),
         } => box_clone(&args, &global),
+        Command::Box {
+            command: BoxCommand::Repair(args),
+        } => box_repair(&args, &global),
         Command::Benchmark(args) => benchmark(*args, &global).await,
         Command::Completion(args) => {
             completion(&args);
@@ -1302,12 +1319,12 @@ fn box_list(
     global: &GlobalOptions,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
-    let boxes = BoxStore::new(state_dir).list()?;
+    let report = BoxStore::new(state_dir).list()?;
     if global.json {
-        println!("{}", serde_json::to_string_pretty(&boxes)?);
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("BOX ID\tSTATE\tIMAGE DIGEST\tPLATFORM\tSIZE\tGENERATION");
-        for metadata in boxes {
+        for metadata in report.boxes {
             println!(
                 "{}\t{:?}\t{}\t{}\t{}\t{}",
                 metadata.box_id,
@@ -1317,6 +1334,16 @@ fn box_list(
                 format_bytes(metadata.virtual_size_bytes),
                 metadata.generation
             );
+        }
+        let has_errors = !report.errors.is_empty();
+        for error in report.errors {
+            eprintln!(
+                "warning: Box entry {} ({:?}): {}",
+                error.entry_name, error.code, error.message
+            );
+        }
+        if has_errors {
+            eprintln!("warning: run `morae box repair --dry-run` to preview quarantine actions");
         }
     }
     Ok(0)
@@ -1387,6 +1414,47 @@ fn box_clone(
     let metadata = BoxStore::new(state_dir).clone_box(args.box_id)?;
     print_box_result(&metadata, global.json)?;
     Ok(0)
+}
+
+fn box_repair(
+    args: &BoxRepairArgs,
+    global: &GlobalOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let apply = destructive_mode(args.dry_run, args.yes, "box repair")?;
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
+    let report = BoxStore::new(state_dir).repair(apply)?;
+    if global.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_box_repair_report(&report);
+    }
+    Ok(i32::from(!report.failures.is_empty()))
+}
+
+fn print_box_repair_report(report: &BoxRepairReport) {
+    println!("corrupt entries detected: {}", report.detected.len());
+    if !report.applied {
+        for error in &report.detected {
+            println!(
+                "would quarantine {} ({:?}): {}",
+                error.entry_name, error.code, error.message
+            );
+        }
+        return;
+    }
+    for entry in &report.quarantined {
+        println!(
+            "quarantined {} at {}",
+            entry.entry_name,
+            entry.destination.display()
+        );
+    }
+    for error in &report.failures {
+        eprintln!(
+            "warning: could not quarantine {} ({:?}): {}",
+            error.entry_name, error.code, error.message
+        );
+    }
 }
 
 fn print_box_result(metadata: &BoxMetadata, json: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -2477,6 +2545,17 @@ mod tests {
             panic!("expected box create command");
         };
         assert_eq!(create.disk_size, 512 * 1024 * 1024);
+
+        let repair = Cli::try_parse_from(["morae", "box", "repair", "--dry-run"]).unwrap();
+        let Command::Box {
+            command: BoxCommand::Repair(repair),
+        } = repair.command
+        else {
+            panic!("expected box repair command");
+        };
+        assert!(repair.dry_run);
+        assert!(!repair.yes);
+        assert!(Cli::try_parse_from(["morae", "box", "repair", "--dry-run", "--yes"]).is_err());
 
         let box_id = BoxId::new();
         let run = Cli::try_parse_from([

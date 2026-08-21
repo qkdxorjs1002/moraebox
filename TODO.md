@@ -196,7 +196,7 @@
 
 - [x] project-local `.moraebox`가 발견되면 자동 이동 없이 기존 데이터 사용 방법만 경고한다.
 
-- [ ] Box list가 손상된 한 entry 때문에 전체 실패하지 않도록 healthy entry와 per-entry error를 함께 반환하고 repair/quarantine 명령을 제공한다.
+- [x] Box list가 손상된 한 entry 때문에 전체 실패하지 않도록 healthy entry와 per-entry error를 함께 반환하고 repair/quarantine 명령을 제공한다.
 
 - [ ] `--output-limit`과 `--kill-grace`를 CLI/MCP에서 명시적으로 설정할 수 있게 한다.
 

@@ -185,6 +185,8 @@ morae box show BOX_ID
 morae box clone BOX_ID --yes
 morae box reset BOX_ID --yes
 morae box delete BOX_ID --yes
+morae box repair --dry-run
+morae box repair --yes
 
 morae cache info
 morae cache reconcile --dry-run
@@ -200,6 +202,8 @@ By default, every command uses the user-wide `~/.moraebox/cache` and `~/.moraebo
 Cache size output distinguishes logical bytes from filesystem-allocated bytes. Rootfs sizes come from publish-time indexed metadata, so `image list` and `cache info` do not rescan every tree. Use `cache reconcile --dry-run` to detect missing, invalid, stale, or orphan metadata and `cache reconcile --yes` (also available as `cache repair --yes`) to repair it.
 
 Mutating cache operations require either `--dry-run` or `--yes`; durable Box mutations require `--yes`. `morae cache clean` removes rebuildable image, immutable base-disk, and ephemeral data, but never persistent Box disks under `~/.moraebox/state`. Image, Box, and cache commands support `--json` where structured output is useful.
+
+`morae box list` keeps returning healthy Boxes when another entry is corrupt and includes an `errors` array in JSON output. `morae box repair --dry-run` previews those entries; `--yes` acquires each valid Box lock and moves corrupt entries into a private `state/quarantine` batch directory. Quarantine never deletes or reconstructs disk data, and busy entries remain in place with a per-entry failure.
 
 ### Exercise the lifecycle without isolation
 

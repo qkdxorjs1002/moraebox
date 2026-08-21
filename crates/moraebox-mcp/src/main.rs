@@ -1340,8 +1340,9 @@ async fn sandbox_box_create(server: &McpServer, arguments: Value) -> Result<Valu
 async fn sandbox_box_list(server: &McpServer, arguments: Value) -> Result<Value, ToolError> {
     let _: EmptyArgs = serde_json::from_value(arguments)
         .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
-    let boxes = server.sdk.list_boxes().await?;
-    Ok(json!({ "boxes": boxes }))
+    let report = server.sdk.list_boxes().await?;
+    serde_json::to_value(report)
+        .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
 }
 
 async fn sandbox_box_get(server: &McpServer, arguments: Value) -> Result<Value, ToolError> {
@@ -1663,8 +1664,35 @@ fn box_metadata_schema() -> Value {
 fn box_list_output_schema() -> Value {
     json!({
         "type": "object",
-        "properties": { "boxes": { "type": "array", "items": box_metadata_schema() } },
-        "required": ["boxes"],
+        "properties": {
+            "boxes": { "type": "array", "items": box_metadata_schema() },
+            "errors": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "entry_name": { "type": "string" },
+                        "box_id": {
+                            "anyOf": [
+                                { "type": "string", "format": "uuid" },
+                                { "type": "null" }
+                            ]
+                        },
+                        "code": {
+                            "type": "string",
+                            "enum": [
+                                "invalid_name", "invalid_metadata", "unsupported_schema",
+                                "unsafe_file_type", "missing_data", "busy", "io", "corrupt_store"
+                            ]
+                        },
+                        "message": { "type": "string" }
+                    },
+                    "required": ["entry_name", "box_id", "code", "message"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["boxes", "errors"],
         "additionalProperties": false
     })
 }
@@ -2577,12 +2605,17 @@ mod tests {
                 &source,
             )
             .unwrap();
+        std::fs::create_dir(store.boxes_directory().join("broken-entry")).unwrap();
         let server = test_server(SandboxSdk::new(Arc::new(ProcessBackend)).with_box_store(store));
 
         let list = call(&server, "sandbox_box_list", json!({})).await;
         assert_eq!(
             list.pointer("/result/structuredContent/boxes/0/box_id"),
             Some(&json!(metadata.box_id))
+        );
+        assert_eq!(
+            list.pointer("/result/structuredContent/errors/0/code"),
+            Some(&json!("invalid_name"))
         );
         let get = call(
             &server,
