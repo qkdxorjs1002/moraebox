@@ -1,20 +1,24 @@
 use super::{
-    Arc, Backend, BackendCapabilities, BaseDiskSpec, BaseDiskStore, BenchmarkArgs, BoxCloneArgs,
-    BoxCommand, BoxCreateArgs, BoxDeleteArgs, BoxId, BoxListArgs, BoxMetadata, BoxRepairArgs,
-    BoxRepairReport, BoxResetArgs, BoxShowArgs, BoxStore, CacheCleanArgs, CacheCommand,
-    CacheInfoArgs, CachePruneArgs, CacheReconcileArgs, CacheReconcileReport, CacheUsage,
-    CachedImage, CleanReport, Cli, CliError, CliErrorSource, Command, CommandFactory,
-    CompletionArgs, CreateBox, Credentials, DiskToolPaths, DoctorArgs, DoctorReport, Duration,
-    ExitCode, GlobalOptions, ImageCache, ImageCommand, ImageDefaultArgs, ImageListArgs,
-    ImageProgressStage, ImagePullArgs, ImagePullPolicy, ImageRemoveArgs, IsTerminal,
+    Arc, Backend, BackendCapabilities, BaseDiskSpec, BaseDiskStore, BenchmarkArgs,
+    BenchmarkModeArg, BoxCloneArgs, BoxCommand, BoxCreateArgs, BoxDeleteArgs, BoxExportArgs, BoxId,
+    BoxImportArgs, BoxListArgs, BoxMetadata, BoxQuery, BoxRenameArgs, BoxRepairArgs,
+    BoxRepairReport, BoxResetArgs, BoxShowArgs, BoxStore, BoxUpdateArgs, CacheCleanArgs,
+    CacheCommand, CacheInfoArgs, CachePruneArgs, CacheReconcileArgs, CacheReconcileReport,
+    CacheUsage, CachedImage, CleanReport, Cli, CliError, CliErrorSource, Command, CommandFactory,
+    CompletionArgs, CopyInSpec, CopyOutSpec, CreateBox, Credentials, DiskToolPaths, DoctorArgs,
+    DoctorReport, Duration, ExitCode, GlobalOptions, ImageCache, ImageCommand, ImageDefaultArgs,
+    ImageListArgs, ImageProgressStage, ImagePullArgs, ImagePullPolicy, ImageRemoveArgs, IsTerminal,
     IsolationLevel, LibkrunBackend, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, ManagedStorage,
     NativeRuntimeOverrides, NativeRuntimePaths, NativeSandboxConfig, OutputChannel, Path, Platform,
     PoolConfig, PreparedImage, PreparedRootPool, ProcessBackend, PruneReport, Read, RemoveReport,
     RootfsMetadataIssueKind, RunArgs, RunBudget, RunSpec, RunStage, Serialize, StoragePaths,
-    Supervisor, TimeoutPolicy, WorkspaceSnapshot, WorkspaceStage, Write, command_stage, fs, io,
-    resolve_cache_dir, resolve_state_dir, run_interactive,
+    Supervisor, TimeoutPolicy, UpdateBox, WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode,
+    WorkspaceSnapshot, WorkspaceStage, Write, command_stage, fs, io, resolve_cache_dir,
+    resolve_state_dir, run_interactive,
 };
+use futures_util::{StreamExt, stream};
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 pub(super) async fn execute(cli: Cli) -> Result<i32, CliError> {
     let Cli { global, command } = cli;
@@ -65,6 +69,18 @@ pub(super) async fn execute(cli: Cli) -> Result<i32, CliError> {
         Command::Box {
             command: BoxCommand::Clone(args),
         } => box_clone(&args, &global),
+        Command::Box {
+            command: BoxCommand::Rename(args),
+        } => box_rename(&args, &global),
+        Command::Box {
+            command: BoxCommand::Update(args),
+        } => box_update(&args, &global),
+        Command::Box {
+            command: BoxCommand::Export(args),
+        } => box_export(&args, &global),
+        Command::Box {
+            command: BoxCommand::Import(args),
+        } => box_import(&args, &global),
         Command::Box {
             command: BoxCommand::Repair(args),
         } => box_repair(&args, &global),
@@ -251,7 +267,41 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, CliErrorSourc
     spec.network = args.network;
     spec.cwd = args.cwd;
     spec.env = args.env.into_iter().collect::<BTreeMap<_, _>>();
+    spec.workspace_mode = if args.workspace_writable {
+        WorkspaceMode::Overlay
+    } else {
+        WorkspaceMode::ReadOnly
+    };
+    spec.copy_limit_bytes =
+        u64::try_from(args.copy_limit).map_err(|_| "copy limit exceeds the supported range")?;
+    spec.copy_in = args
+        .copy_in
+        .into_iter()
+        .map(absolutize_copy_in)
+        .collect::<Result<_, _>>()?;
+    spec.copy_out = args
+        .copy_out
+        .into_iter()
+        .map(absolutize_copy_out)
+        .collect::<Result<_, _>>()?;
+    if let Some(destination) = args.workspace_copy_out {
+        spec.copy_out.push(CopyOutSpec {
+            source: "/workspace".into(),
+            destination: absolutize_host_path(destination)?,
+        });
+    }
+    if let Some(destination) = args.workspace_diff {
+        spec.copy_out.push(CopyOutSpec {
+            source: WORKSPACE_DIFF_GUEST_PATH.into(),
+            destination: absolutize_host_path(destination)?,
+        });
+    }
     let capabilities = selected_backend_capabilities(&args.backend);
+    if (!spec.copy_in.is_empty() || !spec.copy_out.is_empty())
+        && !capabilities.file_transfer.is_supported()
+    {
+        return Err("--copy-in/--copy-out require --backend libkrun".into());
+    }
     if !args.interactive && !io::stdin().is_terminal() {
         io::stdin().read_to_end(&mut spec.stdin)?;
     }
@@ -428,7 +478,11 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, CliErrorSourc
                 backend = backend.with_workspace_digest(workspace.image_digest.to_string());
             }
             if workspace.is_some() {
-                progress.workspace_message("attaching read-only image");
+                progress.workspace_message(if spec.workspace_mode == WorkspaceMode::Overlay {
+                    "attaching immutable lower with disposable writable overlay"
+                } else {
+                    "attaching read-only image"
+                });
             }
             if args.interactive {
                 return run_interactive(backend, spec, budget).await;
@@ -596,34 +650,49 @@ async fn box_create(args: BoxCreateArgs, global: &GlobalOptions) -> Result<i32, 
         )
         .mke2fs_command(),
     )?;
-    let metadata = BoxStore::new(state_dir).create(
-        &CreateBox::new(
-            prepared.manifest_digest,
-            platform_name(&platform),
-            args.disk_size,
-        ),
-        base.disk_path(),
-    )?;
+    let request = CreateBox::new(
+        prepared.manifest_digest,
+        platform_name(&platform),
+        args.disk_size,
+    )
+    .with_labels(args.labels.into_iter().collect())
+    .with_tags(args.tags.into_iter().collect());
+    let request = if let Some(name) = args.name {
+        request.with_name(name)
+    } else {
+        request
+    };
+    let metadata = BoxStore::new(state_dir).create(&request, base.disk_path())?;
     print_box_result(&metadata, global.json)?;
     Ok(0)
 }
 
-fn box_list(_args: &BoxListArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
+fn box_list(args: &BoxListArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
-    let report = BoxStore::new(state_dir).list()?;
+    let report = BoxStore::new(state_dir).list_with(&BoxQuery {
+        name: args.name.clone(),
+        labels: args.labels.iter().cloned().collect(),
+        tags: args.tags.iter().cloned().collect(),
+        state: args.state.map(Into::into),
+        sort_by: args.sort.into(),
+        descending: args.reverse,
+    })?;
     if global.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("BOX ID\tSTATE\tIMAGE DIGEST\tPLATFORM\tSIZE\tGENERATION");
+        println!("BOX ID\tNAME\tSTATE\tIMAGE DIGEST\tVIRTUAL\tPHYSICAL\tLAST USED");
         for metadata in report.boxes {
             println!(
-                "{}\t{:?}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{:?}\t{}\t{}\t{}\t{}",
                 metadata.box_id,
+                metadata.name.as_deref().unwrap_or("-"),
                 metadata.state,
                 metadata.manifest_digest,
-                metadata.platform,
                 format_bytes(metadata.virtual_size_bytes),
-                metadata.generation
+                format_bytes(metadata.physical_size_bytes),
+                metadata
+                    .last_used_at_unix_ms
+                    .map_or_else(|| "-".into(), |value| value.to_string())
             );
         }
         let has_errors = !report.errors.is_empty();
@@ -698,6 +767,53 @@ fn box_clone(args: &BoxCloneArgs, global: &GlobalOptions) -> Result<i32, CliErro
     Ok(0)
 }
 
+fn box_rename(args: &BoxRenameArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
+    let metadata = BoxStore::new(state_dir).rename(args.box_id, args.name.clone())?;
+    print_box_result(&metadata, global.json)?;
+    Ok(0)
+}
+
+fn box_update(args: &BoxUpdateArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
+    let metadata = BoxStore::new(state_dir).update(
+        args.box_id,
+        &UpdateBox {
+            set_labels: args.set_labels.iter().cloned().collect(),
+            remove_labels: args.remove_labels.iter().cloned().collect(),
+            add_tags: args.add_tags.iter().cloned().collect(),
+            remove_tags: args.remove_tags.iter().cloned().collect(),
+            ..UpdateBox::default()
+        },
+    )?;
+    print_box_result(&metadata, global.json)?;
+    Ok(0)
+}
+
+fn box_export(args: &BoxExportArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
+    let report = BoxStore::new(state_dir).export_bundle(args.box_id, &args.destination)?;
+    if global.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "exported Box {} to {} ({}; {})",
+            report.box_id,
+            report.path.display(),
+            format_bytes(report.size_bytes),
+            report.sha256
+        );
+    }
+    Ok(0)
+}
+
+fn box_import(args: &BoxImportArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
+    let metadata = BoxStore::new(state_dir).import_bundle(&args.source)?;
+    print_box_result(&metadata, global.json)?;
+    Ok(0)
+}
+
 fn box_repair(args: &BoxRepairArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     let apply = destructive_mode(args.dry_run, args.yes, "box repair")?;
     let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
@@ -741,13 +857,45 @@ fn print_box_result(metadata: &BoxMetadata, json: bool) -> Result<(), CliErrorSo
         println!("{}", serde_json::to_string_pretty(metadata)?);
     } else {
         println!("Box ID: {}", metadata.box_id);
+        println!("name: {}", metadata.name.as_deref().unwrap_or("-"));
         println!("state: {:?}", metadata.state);
         println!("manifest: {}", metadata.manifest_digest);
         println!("platform: {}", metadata.platform);
         println!("disk size: {}", format_bytes(metadata.virtual_size_bytes));
+        println!(
+            "physical size: {}",
+            format_bytes(metadata.physical_size_bytes)
+        );
         println!("generation: {}", metadata.generation);
+        println!(
+            "last used: {}",
+            metadata
+                .last_used_at_unix_ms
+                .map_or_else(|| "-".into(), |value| value.to_string())
+        );
+        println!("labels: {}", format_key_values(&metadata.labels));
+        println!(
+            "tags: {}",
+            if metadata.tags.is_empty() {
+                "-".into()
+            } else {
+                metadata.tags.iter().cloned().collect::<Vec<_>>().join(",")
+            }
+        );
     }
     Ok(())
+}
+
+fn format_key_values(values: &BTreeMap<String, String>) -> String {
+    if values.is_empty() {
+        "-".into()
+    } else {
+        values
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 async fn image_pull(args: ImagePullArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
@@ -1056,100 +1204,108 @@ fn credentials(username: Option<String>, password: Option<String>) -> Option<Cre
 
 async fn benchmark(args: BenchmarkArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     validate_benchmark_pull_policy(&args)?;
-    let command = args.command;
+    if args.box_id.is_some() && args.concurrency > 1 {
+        return Err("persistent Box benchmarks require --concurrency 1".into());
+    }
     let report = match args.backend.as_str() {
-        "process" => {
-            if args.box_id.is_some() || args.image.is_some() || args.rootfs.is_some() {
-                return Err("--box, --image, and --rootfs require --backend libkrun".into());
-            }
-            run_benchmark(
-                &Supervisor::new(ProcessBackend),
-                command,
-                args.iterations,
-                None,
-                args.output_limit,
-                args.kill_grace,
-            )
-            .await?
-        }
-        "libkrun" => {
-            let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
-            let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
-            let platform = Platform::host_linux();
-            let prepared_image = if args.box_id.is_none() && args.rootfs.is_none() {
-                Some(
-                    prepare_benchmark_image(
-                        &cache_dir,
-                        &platform,
-                        args.image,
-                        credentials(args.registry_username, args.registry_password),
-                        args.pull_policy,
-                    )
-                    .await?,
-                )
-            } else {
-                None
-            };
-            let disk_tools = DiskToolPaths::discover_with_debugfs(
-                global.mke2fs.clone(),
-                global.e2fsck.clone(),
-                global.debugfs.clone(),
-            );
-            let storage = ManagedStorage::open(&cache_dir, &state_dir)?;
-            let native = NativeSandboxConfig::discover(
-                NativeRuntimeOverrides {
-                    helper: global.helper.clone(),
-                    libkrun: global.libkrun.clone(),
-                    library_search_path: global.lib_dir.clone(),
-                    gvproxy: None,
-                },
-                disk_tools,
-                args.disk_size,
-                args.cpus,
-                args.memory_mib,
-            );
-            let digest = prepared_digest(prepared_image.as_ref());
-            let root_source = if args.box_id.is_some() {
-                None
-            } else if let Some(prepared) = prepared_image {
-                Some(native.prepared_image_source(prepared, &platform))
-            } else if let Some(rootfs) = args.rootfs {
-                Some(native.rootfs_source(rootfs, &platform)?)
-            } else {
-                return Err("libkrun benchmark requires an image, rootfs, or BoxId".into());
-            };
-            let config = native.libkrun_config(
-                root_source
-                    .as_ref()
-                    .map(|source| source.rootfs_path.clone()),
-                &storage,
-                None,
-            )?;
-            let runtime = native.box_runtime(&storage, root_source);
-            let prepared_roots = Arc::new(
-                PreparedRootPool::new(PoolConfig::default())
-                    .expect("default prepared pool config is valid"),
-            );
-            let mut report = run_benchmark(
-                &Supervisor::new(
-                    LibkrunBackend::new(config)
-                        .with_box_runtime(runtime)
-                        .with_prepared_pool(prepared_roots),
-                ),
-                command,
-                args.iterations,
-                args.box_id,
-                args.output_limit,
-                args.kill_grace,
-            )
-            .await?;
-            report.resolved_image_digest = digest;
-            report
-        }
+        "process" => run_process_benchmark(&args).await?,
+        "libkrun" => run_native_benchmark(args, global).await?,
         _ => unreachable!("clap validates backend values"),
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(i32::from(report.failures > 0))
+}
+
+async fn run_process_benchmark(args: &BenchmarkArgs) -> Result<BenchmarkReport, CliErrorSource> {
+    if args.box_id.is_some() || args.image.is_some() || args.rootfs.is_some() {
+        return Err("--box, --image, and --rootfs require --backend libkrun".into());
+    }
+    run_benchmark(
+        &Supervisor::new(ProcessBackend),
+        BenchmarkRunConfig::from_args(args, None),
+    )
+    .await
+}
+
+async fn run_native_benchmark(
+    args: BenchmarkArgs,
+    global: &GlobalOptions,
+) -> Result<BenchmarkReport, CliErrorSource> {
+    let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
+    let platform = Platform::host_linux();
+    let prepared_image = if args.box_id.is_none() && args.rootfs.is_none() {
+        Some(
+            prepare_benchmark_image(
+                &cache_dir,
+                &platform,
+                args.image.clone(),
+                credentials(
+                    args.registry_username.clone(),
+                    args.registry_password.clone(),
+                ),
+                args.pull_policy,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let disk_tools = DiskToolPaths::discover_with_debugfs(
+        global.mke2fs.clone(),
+        global.e2fsck.clone(),
+        global.debugfs.clone(),
+    );
+    let storage = ManagedStorage::open(&cache_dir, &state_dir)?;
+    let native = NativeSandboxConfig::discover(
+        NativeRuntimeOverrides {
+            helper: global.helper.clone(),
+            libkrun: global.libkrun.clone(),
+            library_search_path: global.lib_dir.clone(),
+            gvproxy: None,
+        },
+        disk_tools,
+        args.disk_size,
+        args.cpus,
+        args.memory_mib,
+    );
+    let digest = prepared_digest(prepared_image.as_ref());
+    let root_source = if args.box_id.is_some() {
+        None
+    } else if let Some(prepared) = prepared_image {
+        Some(native.prepared_image_source(prepared, &platform))
+    } else if let Some(rootfs) = &args.rootfs {
+        Some(native.rootfs_source(rootfs, &platform)?)
+    } else {
+        return Err("libkrun benchmark requires an image, rootfs, or BoxId".into());
+    };
+    let config = native.libkrun_config(
+        root_source
+            .as_ref()
+            .map(|source| source.rootfs_path.clone()),
+        &storage,
+        None,
+    )?;
+    let native_metadata = BenchmarkNativeMetadata::from_config(&config, args.mode);
+    let runtime = native.box_runtime(&storage, root_source);
+    let backend = LibkrunBackend::new(config).with_box_runtime(runtime);
+    let backend = if args.mode == BenchmarkModeArg::Cold {
+        backend
+    } else {
+        let prepared_roots = Arc::new(
+            PreparedRootPool::new(PoolConfig::default())
+                .expect("default prepared pool config is valid"),
+        );
+        backend.with_prepared_pool(prepared_roots)
+    };
+    let mut report = run_benchmark(
+        &Supervisor::new(backend),
+        BenchmarkRunConfig::from_args(&args, args.box_id),
+    )
+    .await?;
+    report.resolved_image_digest = digest;
+    report.native = Some(native_metadata);
+    Ok(report)
 }
 
 fn validate_benchmark_pull_policy(args: &BenchmarkArgs) -> Result<(), CliErrorSource> {
@@ -1182,108 +1338,273 @@ fn prepared_digest(image: Option<&PreparedImage>) -> Option<String> {
 
 async fn run_benchmark<B: Backend>(
     supervisor: &Supervisor<B>,
+    config: BenchmarkRunConfig,
+) -> Result<BenchmarkReport, CliErrorSource> {
+    let execution = execute_benchmark_runs(supervisor, &config).await?;
+    let mut accumulator = BenchmarkAccumulator::default();
+    for attempt in execution.attempts {
+        accumulator.record(config.measurement_mode, attempt);
+    }
+    Ok(accumulator.finish(supervisor, &config, execution.measured_wall_micros))
+}
+
+async fn execute_benchmark_runs<B: Backend>(
+    supervisor: &Supervisor<B>,
+    config: &BenchmarkRunConfig,
+) -> Result<BenchmarkExecution, CliErrorSource> {
+    if config.measurement_mode == BenchmarkModeArg::Warm {
+        supervisor.run(config.spec()).await?;
+    }
+    let measured_started = Instant::now();
+    let attempts = stream::iter(0..config.iterations)
+        .map(|index| {
+            let spec = config.spec();
+            async move {
+                let started = Instant::now();
+                BenchmarkAttempt {
+                    index,
+                    result: supervisor.run(spec).await,
+                    elapsed_micros: elapsed_micros(started),
+                }
+            }
+        })
+        .buffer_unordered(config.concurrency)
+        .collect::<Vec<_>>()
+        .await;
+    Ok(BenchmarkExecution {
+        attempts,
+        measured_wall_micros: elapsed_micros(measured_started).max(1),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct BenchmarkRunConfig {
     command: Vec<String>,
     iterations: u32,
+    measurement_mode: BenchmarkModeArg,
+    concurrency: usize,
     box_id: Option<BoxId>,
     output_limit: usize,
     kill_grace: Duration,
-) -> Result<BenchmarkReport, CliErrorSource> {
-    let mut samples = Vec::with_capacity(iterations as usize);
-    let mut backend_ready_samples = Vec::with_capacity(iterations as usize);
-    let mut command_start_samples = Vec::with_capacity(iterations as usize);
-    let mut root_prepare_samples = Vec::new();
-    let mut cache_lookup_samples = Vec::new();
-    let mut box_lock_samples = Vec::new();
-    let mut disk_clone_samples = Vec::new();
-    let mut helper_spawn_samples = Vec::new();
-    let mut prepared_ready_samples = Vec::new();
-    let mut prepared_lease_samples = Vec::new();
-    let mut prepared_pool_hits = 0_u32;
-    let mut prepared_pool_misses = 0_u32;
-    let mut failures = 0_u32;
-    for _ in 0..iterations {
-        let mut spec = RunSpec::command(command.clone());
-        spec.box_id = box_id;
-        spec.output_limit = output_limit;
-        spec.kill_grace = kill_grace;
-        let report = supervisor.run(spec).await?;
-        if report.exit_code != Some(0) || report.timed_out {
-            failures += 1;
+}
+
+impl BenchmarkRunConfig {
+    fn from_args(args: &BenchmarkArgs, box_id: Option<BoxId>) -> Self {
+        Self {
+            command: args.command.clone(),
+            iterations: args.iterations,
+            measurement_mode: args.mode,
+            concurrency: usize::from(args.concurrency),
+            box_id,
+            output_limit: args.output_limit,
+            kill_grace: args.kill_grace,
         }
-        samples.push(report.elapsed_micros);
+    }
+
+    fn spec(&self) -> RunSpec {
+        let mut spec = RunSpec::command(self.command.clone());
+        spec.box_id = self.box_id;
+        spec.output_limit = self.output_limit;
+        spec.kill_grace = self.kill_grace;
+        spec
+    }
+}
+
+struct BenchmarkExecution {
+    attempts: Vec<BenchmarkAttempt>,
+    measured_wall_micros: u64,
+}
+
+struct BenchmarkAttempt {
+    index: u32,
+    elapsed_micros: u64,
+    result: Result<moraebox_runtime::RunReport, moraebox_runtime::SupervisorError>,
+}
+
+#[derive(Default)]
+struct BenchmarkAccumulator {
+    completion: Vec<u64>,
+    backend_ready: Vec<u64>,
+    first_output: Vec<u64>,
+    cold_startup: Vec<u64>,
+    warm_startup: Vec<u64>,
+    root_prepare: Vec<u64>,
+    cache_lookup: Vec<u64>,
+    box_lock: Vec<u64>,
+    disk_clone: Vec<u64>,
+    helper_spawn: Vec<u64>,
+    prepared_ready: Vec<u64>,
+    prepared_lease: Vec<u64>,
+    prepared_pool_hits: u32,
+    prepared_pool_misses: u32,
+    completed: u32,
+    failures: u32,
+    errors: BenchmarkErrorSummary,
+}
+
+impl BenchmarkAccumulator {
+    fn record(&mut self, mode: BenchmarkModeArg, attempt: BenchmarkAttempt) {
+        let Ok(report) = attempt.result else {
+            self.failures += 1;
+            self.errors.supervisor_errors += 1;
+            return;
+        };
+        self.completed += 1;
+        if report.exit_code != Some(0) || report.timed_out {
+            self.failures += 1;
+        }
+        self.errors.non_zero_exits += u32::from(report.exit_code.is_some_and(|code| code != 0));
+        self.errors.timeouts += u32::from(report.timed_out);
+        self.errors.output_truncations += u32::from(report.output_truncated);
+        self.completion.push(if report.elapsed_micros == 0 {
+            attempt.elapsed_micros
+        } else {
+            report.elapsed_micros
+        });
+
         let command_started = report
             .trace
             .iter()
             .find(|event| event.kind == moraebox_runtime::TraceKind::CommandStarted)
             .map(|event| event.elapsed_micros);
         if let Some(command_started) = command_started {
-            backend_ready_samples.push(command_started);
+            self.backend_ready.push(command_started);
+            self.record_startup(
+                mode,
+                attempt.index,
+                report.startup.prepared_pool_hit,
+                command_started,
+            );
         }
         match report.startup.prepared_pool_hit {
             Some(true) => {
-                prepared_pool_hits += 1;
-                if let Some(command_started) = command_started {
-                    prepared_ready_samples.push(command_started);
-                }
+                self.prepared_pool_hits += 1;
+                extend_if_some(&mut self.prepared_ready, command_started);
                 extend_if_some(
-                    &mut prepared_lease_samples,
+                    &mut self.prepared_lease,
                     report.startup.prepared_lease_micros,
                 );
             }
-            Some(false) => prepared_pool_misses += 1,
+            Some(false) => self.prepared_pool_misses += 1,
             None => {}
         }
-        if let Some(first_output) = report
-            .trace
-            .iter()
-            .find(|event| event.kind == moraebox_runtime::TraceKind::FirstOutput)
-        {
-            command_start_samples.push(first_output.elapsed_micros);
-        }
         extend_if_some(
-            &mut root_prepare_samples,
-            report.startup.root_prepare_micros,
+            &mut self.first_output,
+            report
+                .trace
+                .iter()
+                .find(|event| event.kind == moraebox_runtime::TraceKind::FirstOutput)
+                .map(|event| event.elapsed_micros),
         );
-        extend_if_some(
-            &mut cache_lookup_samples,
-            report.startup.cache_lookup_micros,
-        );
-        extend_if_some(&mut box_lock_samples, report.startup.box_lock_micros);
-        extend_if_some(&mut disk_clone_samples, report.startup.disk_clone_micros);
-        extend_if_some(
-            &mut helper_spawn_samples,
-            report.startup.helper_spawn_micros,
-        );
+        extend_if_some(&mut self.root_prepare, report.startup.root_prepare_micros);
+        extend_if_some(&mut self.cache_lookup, report.startup.cache_lookup_micros);
+        extend_if_some(&mut self.box_lock, report.startup.box_lock_micros);
+        extend_if_some(&mut self.disk_clone, report.startup.disk_clone_micros);
+        extend_if_some(&mut self.helper_spawn, report.startup.helper_spawn_micros);
     }
-    samples.sort_unstable();
-    let backend = supervisor.backend_name();
-    Ok(BenchmarkReport {
-        backend: backend.into(),
-        mode: benchmark_mode(supervisor.backend_capabilities()).into(),
-        resolved_image_digest: None,
-        iterations,
-        failures,
-        min_micros: samples[0],
-        p50_micros: percentile(&samples, 50),
-        p95_micros: percentile(&samples, 95),
-        p99_micros: percentile(&samples, 99),
-        max_micros: *samples.last().expect("iterations is non-zero"),
-        command_start_p95_micros: optional_percentile(&mut command_start_samples, 95),
-        backend_ready_p95_micros: optional_percentile(&mut backend_ready_samples, 95),
-        root_prepare_p95_micros: optional_percentile(&mut root_prepare_samples, 95),
-        cache_lookup_p95_micros: optional_percentile(&mut cache_lookup_samples, 95),
-        box_lock_p95_micros: optional_percentile(&mut box_lock_samples, 95),
-        disk_clone_p95_micros: optional_percentile(&mut disk_clone_samples, 95),
-        helper_spawn_p95_micros: optional_percentile(&mut helper_spawn_samples, 95),
-        prepared_pool_hits,
-        prepared_pool_misses,
-        prepared_ready_p50_micros: optional_percentile(&mut prepared_ready_samples, 50),
-        prepared_ready_p95_micros: optional_percentile(&mut prepared_ready_samples, 95),
-        prepared_ready_p99_micros: optional_percentile(&mut prepared_ready_samples, 99),
-        prepared_lease_p50_micros: optional_percentile(&mut prepared_lease_samples, 50),
-        prepared_lease_p95_micros: optional_percentile(&mut prepared_lease_samples, 95),
-        prepared_lease_p99_micros: optional_percentile(&mut prepared_lease_samples, 99),
-    })
+
+    fn record_startup(
+        &mut self,
+        mode: BenchmarkModeArg,
+        index: u32,
+        pool_hit: Option<bool>,
+        elapsed_micros: u64,
+    ) {
+        let warm = match mode {
+            BenchmarkModeArg::Cold => false,
+            BenchmarkModeArg::Warm => true,
+            BenchmarkModeArg::Mixed => pool_hit.unwrap_or(index > 0),
+        };
+        if warm {
+            self.warm_startup.push(elapsed_micros);
+        } else {
+            self.cold_startup.push(elapsed_micros);
+        }
+    }
+
+    fn finish<B: Backend>(
+        mut self,
+        supervisor: &Supervisor<B>,
+        config: &BenchmarkRunConfig,
+        measured_wall_micros: u64,
+    ) -> BenchmarkReport {
+        let full_completion = summarize_phase(&mut self.completion);
+        let first_output = summarize_phase(&mut self.first_output);
+        let cache_total = self
+            .prepared_pool_hits
+            .saturating_add(self.prepared_pool_misses);
+        BenchmarkReport {
+            backend: supervisor.backend_name().into(),
+            mode: benchmark_mode(supervisor.backend_capabilities()).into(),
+            measurement_mode: benchmark_mode_name(config.measurement_mode).into(),
+            resolved_image_digest: None,
+            build: BenchmarkBuildMetadata::current(),
+            native: None,
+            iterations: config.iterations,
+            warmup_iterations: u32::from(config.measurement_mode == BenchmarkModeArg::Warm),
+            concurrency: config.concurrency,
+            completed: self.completed,
+            failures: self.failures,
+            errors: self.errors,
+            measured_wall_micros,
+            throughput_runs_per_second: rate_per_second(self.completed, measured_wall_micros),
+            attempted_runs_per_second: rate_per_second(config.iterations, measured_wall_micros),
+            peak_child_rss_bytes: child_peak_rss_bytes(),
+            cold_startup: summarize_phase(&mut self.cold_startup),
+            warm_startup: summarize_phase(&mut self.warm_startup),
+            first_output: first_output.clone(),
+            full_completion: full_completion.clone(),
+            cache: BenchmarkCacheSummary {
+                hits: self.prepared_pool_hits,
+                misses: self.prepared_pool_misses,
+                hit_ratio: (cache_total > 0)
+                    .then(|| f64::from(self.prepared_pool_hits) / f64::from(cache_total)),
+            },
+            min_micros: phase_value(full_completion.as_ref(), |phase| phase.min_micros),
+            p50_micros: phase_value(full_completion.as_ref(), |phase| phase.p50_micros),
+            p95_micros: phase_value(full_completion.as_ref(), |phase| phase.p95_micros),
+            p99_micros: phase_value(full_completion.as_ref(), |phase| phase.p99_micros),
+            max_micros: phase_value(full_completion.as_ref(), |phase| phase.max_micros),
+            command_start_p95_micros: first_output.as_ref().map(|phase| phase.p95_micros),
+            backend_ready_p95_micros: optional_percentile(&mut self.backend_ready, 95),
+            root_prepare_p95_micros: optional_percentile(&mut self.root_prepare, 95),
+            cache_lookup_p95_micros: optional_percentile(&mut self.cache_lookup, 95),
+            box_lock_p95_micros: optional_percentile(&mut self.box_lock, 95),
+            disk_clone_p95_micros: optional_percentile(&mut self.disk_clone, 95),
+            helper_spawn_p95_micros: optional_percentile(&mut self.helper_spawn, 95),
+            prepared_pool_hits: self.prepared_pool_hits,
+            prepared_pool_misses: self.prepared_pool_misses,
+            prepared_ready_p50_micros: optional_percentile(&mut self.prepared_ready, 50),
+            prepared_ready_p95_micros: optional_percentile(&mut self.prepared_ready, 95),
+            prepared_ready_p99_micros: optional_percentile(&mut self.prepared_ready, 99),
+            prepared_lease_p50_micros: optional_percentile(&mut self.prepared_lease, 50),
+            prepared_lease_p95_micros: optional_percentile(&mut self.prepared_lease, 95),
+            prepared_lease_p99_micros: optional_percentile(&mut self.prepared_lease, 99),
+        }
+    }
+}
+
+fn rate_per_second(count: u32, elapsed_micros: u64) -> f64 {
+    f64::from(count) / Duration::from_micros(elapsed_micros.max(1)).as_secs_f64()
+}
+
+fn phase_value(
+    summary: Option<&BenchmarkPhaseSummary>,
+    value: impl FnOnce(&BenchmarkPhaseSummary) -> u64,
+) -> u64 {
+    summary.map_or(0, value)
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn benchmark_mode_name(mode: BenchmarkModeArg) -> &'static str {
+    match mode {
+        BenchmarkModeArg::Mixed => "mixed",
+        BenchmarkModeArg::Cold => "cold",
+        BenchmarkModeArg::Warm => "warm",
+    }
 }
 
 fn benchmark_mode(capabilities: BackendCapabilities) -> &'static str {
@@ -1291,6 +1612,26 @@ fn benchmark_mode(capabilities: BackendCapabilities) -> &'static str {
         IsolationLevel::MicroVm => "cached-one-shot",
         IsolationLevel::HostProcess => "host-process",
     }
+}
+
+#[cfg(unix)]
+fn child_peak_rss_bytes() -> Option<u64> {
+    use nix::sys::resource::{UsageWho, getrusage};
+
+    let value = u64::try_from(getrusage(UsageWho::RUSAGE_CHILDREN).ok()?.max_rss()).ok()?;
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    {
+        Some(value)
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+    {
+        Some(value.saturating_mul(1024))
+    }
+}
+
+#[cfg(not(unix))]
+fn child_peak_rss_bytes() -> Option<u64> {
+    None
 }
 
 fn extend_if_some(samples: &mut Vec<u64>, value: Option<u64>) {
@@ -1306,6 +1647,21 @@ fn optional_percentile(samples: &mut [u64], percentile_value: usize) -> Option<u
         samples.sort_unstable();
         Some(percentile(samples, percentile_value))
     }
+}
+
+fn summarize_phase(samples: &mut [u64]) -> Option<BenchmarkPhaseSummary> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    Some(BenchmarkPhaseSummary {
+        samples: u32::try_from(samples.len()).unwrap_or(u32::MAX),
+        min_micros: samples[0],
+        p50_micros: percentile(samples, 50),
+        p95_micros: percentile(samples, 95),
+        p99_micros: percentile(samples, 99),
+        max_micros: *samples.last().expect("phase samples are non-empty"),
+    })
 }
 
 fn percentile(sorted: &[u64], percentile: usize) -> u64 {
@@ -1325,13 +1681,99 @@ struct BoxMutationReport {
     generation: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct BenchmarkPhaseSummary {
+    samples: u32,
+    min_micros: u64,
+    p50_micros: u64,
+    p95_micros: u64,
+    p99_micros: u64,
+    max_micros: u64,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct BenchmarkErrorSummary {
+    supervisor_errors: u32,
+    non_zero_exits: u32,
+    timeouts: u32,
+    output_truncations: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkCacheSummary {
+    hits: u32,
+    misses: u32,
+    hit_ratio: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkBuildMetadata {
+    version: &'static str,
+    git_commit: Option<&'static str>,
+    target_os: &'static str,
+    target_arch: &'static str,
+}
+
+impl BenchmarkBuildMetadata {
+    fn current() -> Self {
+        Self {
+            version: env!("CARGO_PKG_VERSION"),
+            git_commit: option_env!("MORAE_BUILD_GIT_SHA"),
+            target_os: std::env::consts::OS,
+            target_arch: std::env::consts::ARCH,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkNativeMetadata {
+    helper_path: String,
+    library_path: String,
+    firmware_path: Option<String>,
+    vcpus: u8,
+    memory_mib: u32,
+    prepared_pool_enabled: bool,
+}
+
+impl BenchmarkNativeMetadata {
+    fn from_config(config: &moraebox_runtime::LibkrunConfig, mode: BenchmarkModeArg) -> Self {
+        Self {
+            helper_path: config.helper_path.display().to_string(),
+            library_path: config.library_path.display().to_string(),
+            firmware_path: config
+                .libkrunfw_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            vcpus: config.vcpus,
+            memory_mib: config.memory_mib,
+            prepared_pool_enabled: mode != BenchmarkModeArg::Cold,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct BenchmarkReport {
     backend: String,
     mode: String,
+    measurement_mode: String,
     resolved_image_digest: Option<String>,
+    build: BenchmarkBuildMetadata,
+    native: Option<BenchmarkNativeMetadata>,
     iterations: u32,
+    warmup_iterations: u32,
+    concurrency: usize,
+    completed: u32,
     failures: u32,
+    errors: BenchmarkErrorSummary,
+    measured_wall_micros: u64,
+    throughput_runs_per_second: f64,
+    attempted_runs_per_second: f64,
+    peak_child_rss_bytes: Option<u64>,
+    cold_startup: Option<BenchmarkPhaseSummary>,
+    warm_startup: Option<BenchmarkPhaseSummary>,
+    first_output: Option<BenchmarkPhaseSummary>,
+    full_completion: Option<BenchmarkPhaseSummary>,
+    cache: BenchmarkCacheSummary,
     min_micros: u64,
     p50_micros: u64,
     p95_micros: u64,
@@ -1461,6 +1903,120 @@ pub(super) fn parse_env(input: &str) -> Result<(String, String), String> {
         return Err("environment keys and values must be non-empty and NUL-free".into());
     }
     Ok((key.to_owned(), value.to_owned()))
+}
+
+pub(super) fn parse_box_name(input: &str) -> Result<String, String> {
+    validate_box_identifier("box name", input, 64, false)?;
+    Ok(input.into())
+}
+
+pub(super) fn parse_box_label_key(input: &str) -> Result<String, String> {
+    validate_box_identifier("label key", input, 63, true)?;
+    Ok(input.into())
+}
+
+pub(super) fn parse_box_label(input: &str) -> Result<(String, String), String> {
+    let Some((key, value)) = input.split_once('=') else {
+        return Err("labels must use KEY=VALUE".into());
+    };
+    let key = parse_box_label_key(key)?;
+    validate_box_label_value(value)?;
+    Ok((key, value.into()))
+}
+
+pub(super) fn parse_box_label_filter(input: &str) -> Result<(String, Option<String>), String> {
+    match input.split_once('=') {
+        Some((key, value)) => {
+            let key = parse_box_label_key(key)?;
+            validate_box_label_value(value)?;
+            Ok((key, Some(value.into())))
+        }
+        None => Ok((parse_box_label_key(input)?, None)),
+    }
+}
+
+pub(super) fn parse_box_tag(input: &str) -> Result<String, String> {
+    validate_box_identifier("tag", input, 63, false)?;
+    Ok(input.into())
+}
+
+fn validate_box_label_value(value: &str) -> Result<(), String> {
+    if value.chars().count() > 256 || value.trim() != value || value.chars().any(char::is_control) {
+        return Err(
+            "label value must contain at most 256 non-control characters without surrounding whitespace"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_box_identifier(
+    label: &str,
+    value: &str,
+    max_chars: usize,
+    allow_slash: bool,
+) -> Result<(), String> {
+    if value.is_empty()
+        || value.chars().count() > max_chars
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'-')
+                || (allow_slash && byte == b'/')
+        })
+    {
+        return Err(format!(
+            "{label} must be 1-{max_chars} ASCII alphanumeric, '.', '_', '-'{} characters",
+            if allow_slash { ", or '/'" } else { "" }
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn parse_copy_in(input: &str) -> Result<CopyInSpec, String> {
+    let Some((source, destination)) = input.rsplit_once('=') else {
+        return Err("copy-in must use HOST=GUEST".into());
+    };
+    if source.is_empty() || destination.is_empty() {
+        return Err("copy-in source and destination must be non-empty".into());
+    }
+    Ok(CopyInSpec {
+        source: source.into(),
+        destination: destination.into(),
+    })
+}
+
+pub(super) fn parse_copy_out(input: &str) -> Result<CopyOutSpec, String> {
+    let Some((source, destination)) = input.split_once('=') else {
+        return Err("copy-out must use GUEST=HOST".into());
+    };
+    if source.is_empty() || destination.is_empty() {
+        return Err("copy-out source and destination must be non-empty".into());
+    }
+    Ok(CopyOutSpec {
+        source: source.into(),
+        destination: destination.into(),
+    })
+}
+
+fn absolutize_copy_in(mut copy: CopyInSpec) -> Result<CopyInSpec, CliErrorSource> {
+    copy.source = absolutize_host_path(copy.source)?;
+    Ok(copy)
+}
+
+fn absolutize_copy_out(mut copy: CopyOutSpec) -> Result<CopyOutSpec, CliErrorSource> {
+    copy.destination = absolutize_host_path(copy.destination)?;
+    Ok(copy)
+}
+
+fn absolutize_host_path(
+    path: impl Into<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, CliErrorSource> {
+    let path = path.into();
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
 }
 
 pub(super) fn exit_code(code: i32) -> ExitCode {
@@ -1600,12 +2156,18 @@ mod tests {
             panic!("expected benchmark command");
         };
         assert_eq!(benchmark.backend, "libkrun");
+        assert_eq!(benchmark.mode, BenchmarkModeArg::Mixed);
+        assert_eq!(benchmark.concurrency, 1);
 
         let process = Cli::try_parse_from([
             "morae",
             "benchmark",
             "--backend",
             "process",
+            "--mode",
+            "warm",
+            "--concurrency",
+            "4",
             "--",
             "/bin/true",
         ])
@@ -1614,6 +2176,8 @@ mod tests {
             panic!("expected benchmark command");
         };
         assert_eq!(process.backend, "process");
+        assert_eq!(process.mode, BenchmarkModeArg::Warm);
+        assert_eq!(process.concurrency, 4);
     }
 
     #[test]
@@ -1745,6 +2309,43 @@ mod tests {
             ("A".into(), "hello world".into())
         );
         assert!(parse_env("MISSING").is_err());
+    }
+
+    #[test]
+    fn parses_explicit_copy_mappings_without_shell_splitting() {
+        let copy_in = parse_copy_in("host path=/workspace/input").unwrap();
+        assert_eq!(copy_in.source, Path::new("host path"));
+        assert_eq!(copy_in.destination, "/workspace/input");
+        let copy_out = parse_copy_out("/workspace/result=host path").unwrap();
+        assert_eq!(copy_out.source, "/workspace/result");
+        assert_eq!(copy_out.destination, Path::new("host path"));
+        assert!(parse_copy_in("missing-separator").is_err());
+        assert!(parse_copy_out("missing-separator").is_err());
+
+        let parsed = Cli::try_parse_from([
+            "morae",
+            "run",
+            "--workspace",
+            "source",
+            "--workspace-writable",
+            "--workspace-copy-out",
+            "result",
+            "--workspace-diff",
+            "diff.json",
+            "--copy-in",
+            "input=/tmp/input",
+            "--copy-out",
+            "/tmp/output=output",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let Command::Run(run) = parsed.command else {
+            panic!("expected run command");
+        };
+        assert!(run.workspace_writable);
+        assert_eq!(run.copy_in.len(), 1);
+        assert_eq!(run.copy_out.len(), 1);
     }
 
     #[test]
@@ -1957,6 +2558,70 @@ mod tests {
     }
 
     #[test]
+    fn parses_box_metadata_and_bundle_management() {
+        let create = Cli::try_parse_from([
+            "morae",
+            "box",
+            "create",
+            "--name",
+            "dev-box",
+            "--label",
+            "team=core",
+            "--tag",
+            "warm",
+        ])
+        .unwrap();
+        let Command::Box {
+            command: BoxCommand::Create(create),
+        } = create.command
+        else {
+            panic!("expected box create command");
+        };
+        assert_eq!(create.name.as_deref(), Some("dev-box"));
+        assert_eq!(create.labels, [("team".into(), "core".into())]);
+        assert_eq!(create.tags, ["warm"]);
+
+        let list = Cli::try_parse_from([
+            "morae",
+            "box",
+            "list",
+            "--label",
+            "team=core",
+            "--tag",
+            "warm",
+            "--sort",
+            "last-used",
+            "--reverse",
+        ])
+        .unwrap();
+        let Command::Box {
+            command: BoxCommand::List(list),
+        } = list.command
+        else {
+            panic!("expected box list command");
+        };
+        assert_eq!(list.labels, [("team".into(), Some("core".into()))]);
+        assert!(list.reverse);
+
+        let box_id = BoxId::new().to_string();
+        assert!(
+            Cli::try_parse_from([
+                "morae",
+                "box",
+                "update",
+                &box_id,
+                "--remove-label",
+                "team",
+                "--tag",
+                "cold",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["morae", "box", "backup", &box_id, "box.tar"]).is_ok());
+        assert!(Cli::try_parse_from(["morae", "box", "import", "box.tar"]).is_ok());
+    }
+
+    #[test]
     fn parses_disk_size_units_and_rejects_zero() {
         assert_eq!(parse_disk_size("8GiB").unwrap(), 8 * 1024 * 1024 * 1024);
         assert_eq!(parse_disk_size("500MB").unwrap(), 500_000_000);
@@ -2030,5 +2695,59 @@ mod tests {
         assert_eq!(optional_percentile(&mut samples, 95), Some(50));
         assert_eq!(optional_percentile(&mut samples, 99), Some(50));
         assert_eq!(optional_percentile(&mut [], 50), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_benchmark_reports_phases_concurrency_and_throughput() {
+        let report = run_benchmark(
+            &Supervisor::new(ProcessBackend),
+            BenchmarkRunConfig {
+                command: vec!["/usr/bin/printf".into(), "x".into()],
+                iterations: 4,
+                measurement_mode: BenchmarkModeArg::Mixed,
+                concurrency: 2,
+                box_id: None,
+                output_limit: 1024 * 1024,
+                kill_grace: Duration::from_secs(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.iterations, 4);
+        assert_eq!(report.completed, 4);
+        assert_eq!(report.concurrency, 2);
+        assert_eq!(report.failures, 0);
+        assert_eq!(report.cold_startup.as_ref().unwrap().samples, 1);
+        assert_eq!(report.warm_startup.as_ref().unwrap().samples, 3);
+        assert_eq!(report.first_output.as_ref().unwrap().samples, 4);
+        assert_eq!(report.full_completion.as_ref().unwrap().samples, 4);
+        assert!(report.throughput_runs_per_second > 0.0);
+        assert_eq!(report.cache.hits, 0);
+        assert_eq!(report.cache.misses, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_benchmark_counts_non_zero_exits() {
+        let report = run_benchmark(
+            &Supervisor::new(ProcessBackend),
+            BenchmarkRunConfig {
+                command: vec!["/usr/bin/false".into()],
+                iterations: 2,
+                measurement_mode: BenchmarkModeArg::Cold,
+                concurrency: 1,
+                box_id: None,
+                output_limit: 1024 * 1024,
+                kill_grace: Duration::from_secs(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.failures, 2);
+        assert_eq!(report.errors.non_zero_exits, 2);
+        assert_eq!(report.errors.supervisor_errors, 0);
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) async fn call_tool(
     server: &McpServer,
@@ -52,6 +53,15 @@ pub(super) async fn call_tool(
             .await
             .map(ToolOutput::mirrored),
         "sandbox_box_clone" => sandbox_box_clone(server, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_box_update" => sandbox_box_update(server, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_box_export" => sandbox_box_export(server, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_box_import" => sandbox_box_import(server, arguments)
             .await
             .map(ToolOutput::mirrored),
         _ => return protocol_error(id, -32602, "unknown tool"),
@@ -389,11 +399,20 @@ async fn sandbox_exec_with_inline_limit(
             "argv must contain an executable",
         )));
     }
+    if args.copy_in.len() > 64 || args.copy_out.len() > 64 {
+        return Err(ExecError::Failed(ToolError::invalid_arguments(
+            "copy_in and copy_out each support at most 64 entries",
+        )));
+    }
     let mut spec = RunSpec::command(args.argv);
     spec.box_id = args.box_id;
     spec.image_pull_policy = args.pull_policy;
     spec.tty = args.tty;
     spec.network = args.network;
+    spec.workspace_mode = args.workspace_mode;
+    spec.copy_in = args.copy_in;
+    spec.copy_out = args.copy_out;
+    spec.copy_limit_bytes = args.copy_limit_bytes;
     if let Some(output_limit) = args.output_limit_bytes {
         if !(1..=MAX_OUTPUT_LIMIT).contains(&output_limit) {
             return Err(ExecError::Failed(ToolError::invalid_arguments(format!(
@@ -429,6 +448,8 @@ async fn sandbox_exec_with_inline_limit(
     spec.stdin = decode_bounded_stdin(args.stdin_base64)
         .map_err(ExecError::Failed)?
         .unwrap_or_default();
+    spec.validate()
+        .map_err(|error| ExecError::Failed(ToolError::invalid_arguments(error)))?;
     if args.wait {
         let result = match cancellation {
             Some(cancellation) => {
@@ -611,25 +632,40 @@ async fn sandbox_box_create(server: &McpServer, arguments: Value) -> Result<Valu
                     format!("base disk task failed: {error}"),
                 )
             })??;
+    let request = CreateBox::new(
+        prepared.manifest_digest,
+        platform_name(&server.boxes.platform),
+        disk_size,
+    )
+    .with_labels(args.labels)
+    .with_tags(args.tags);
+    let request = if let Some(name) = args.name {
+        request.with_name(name)
+    } else {
+        request
+    };
     let metadata = server
         .sdk
-        .create_box(
-            CreateBox::new(
-                prepared.manifest_digest,
-                platform_name(&server.boxes.platform),
-                disk_size,
-            ),
-            base.disk_path().to_path_buf(),
-        )
+        .create_box(request, base.disk_path().to_path_buf())
         .await?;
     serde_json::to_value(metadata)
         .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
 }
 
 async fn sandbox_box_list(server: &McpServer, arguments: Value) -> Result<Value, ToolError> {
-    let _: EmptyArgs = serde_json::from_value(arguments)
+    let args: BoxListArgs = serde_json::from_value(arguments)
         .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
-    let report = server.sdk.list_boxes().await?;
+    let report = server
+        .sdk
+        .list_boxes_with(BoxQuery {
+            name: args.name,
+            labels: args.labels,
+            tags: args.tags,
+            state: args.state,
+            sort_by: args.sort_by,
+            descending: args.descending,
+        })
+        .await?;
     serde_json::to_value(report)
         .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
 }
@@ -691,6 +727,43 @@ async fn sandbox_box_clone(server: &McpServer, arguments: Value) -> Result<Value
         .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
     require_confirmation(args.confirm)?;
     let metadata = server.sdk.clone_box(args.box_id).await?;
+    serde_json::to_value(metadata)
+        .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
+}
+
+async fn sandbox_box_update(server: &McpServer, arguments: Value) -> Result<Value, ToolError> {
+    let args: BoxUpdateArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    let metadata = server
+        .sdk
+        .update_box(
+            args.box_id,
+            UpdateBox {
+                name: args.name,
+                clear_name: args.clear_name,
+                set_labels: args.set_labels,
+                remove_labels: args.remove_labels,
+                add_tags: args.add_tags,
+                remove_tags: args.remove_tags,
+            },
+        )
+        .await?;
+    serde_json::to_value(metadata)
+        .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
+}
+
+async fn sandbox_box_export(server: &McpServer, arguments: Value) -> Result<Value, ToolError> {
+    let args: BoxExportArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    let report = server.sdk.export_box(args.box_id, args.destination).await?;
+    serde_json::to_value(report)
+        .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
+}
+
+async fn sandbox_box_import(server: &McpServer, arguments: Value) -> Result<Value, ToolError> {
+    let args: BoxImportArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    let metadata = server.sdk.import_box(args.source).await?;
     serde_json::to_value(metadata)
         .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
 }
@@ -943,12 +1016,18 @@ fn box_metadata_schema() -> Value {
             "generation": { "type": "integer", "minimum": 0 },
             "created_at_unix_ms": { "type": "integer", "minimum": 0 },
             "updated_at_unix_ms": { "type": "integer", "minimum": 0 },
-            "owner_uid": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] }
+            "owner_uid": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+            "name": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+            "labels": { "type": "object", "additionalProperties": { "type": "string" } },
+            "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+            "last_used_at_unix_ms": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+            "physical_size_bytes": { "type": "integer", "minimum": 0 }
         },
         "required": [
             "schema_version", "box_id", "state", "manifest_digest", "platform", "disk_format",
             "virtual_size_bytes", "generation", "created_at_unix_ms", "updated_at_unix_ms",
-            "owner_uid"
+            "owner_uid", "name", "labels", "tags", "last_used_at_unix_ms",
+            "physical_size_bytes"
         ],
         "additionalProperties": false
     })
@@ -995,6 +1074,20 @@ fn deleted_box_output_schema() -> Value {
         "type": "object",
         "properties": { "deleted": { "type": "string", "format": "uuid" } },
         "required": ["deleted"],
+        "additionalProperties": false
+    })
+}
+
+fn box_bundle_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "box_id": { "type": "string", "format": "uuid" },
+            "path": { "type": "string" },
+            "size_bytes": { "type": "integer", "minimum": 1 },
+            "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        },
+        "required": ["box_id", "path", "size_bytes", "sha256"],
         "additionalProperties": false
     })
 }
@@ -1052,6 +1145,10 @@ pub(super) fn tools_list() -> Value {
                         "kill_grace_ms": { "type": "integer", "minimum": 1, "maximum": 60_000, "default": DEFAULT_KILL_GRACE.as_millis() },
                         "network": { "type": "boolean", "default": false },
                         "tty": { "type": "boolean", "default": false },
+                        "workspace_mode": { "type": "string", "enum": ["read_only", "overlay"], "default": "read_only", "description": "Use overlay only when the MCP server was configured with a workspace disk." },
+                        "copy_in": { "type": "array", "maxItems": 64, "items": { "type": "object", "properties": { "source": { "type": "string", "description": "Host file or directory." }, "destination": { "type": "string", "description": "Normalized absolute guest destination." } }, "required": ["source", "destination"], "additionalProperties": false }, "default": [] },
+                        "copy_out": { "type": "array", "maxItems": 64, "items": { "type": "object", "properties": { "source": { "type": "string", "description": "Normalized absolute guest source." }, "destination": { "type": "string", "description": "Absolute create-new host destination." } }, "required": ["source", "destination"], "additionalProperties": false }, "default": [] },
+                        "copy_limit_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_COPY_LIMIT, "default": DEFAULT_COPY_LIMIT },
                         "wait": { "type": "boolean", "default": true }
                     },
                     "required": ["argv"],
@@ -1139,7 +1236,10 @@ pub(super) fn tools_list() -> Value {
                     "properties": {
                         "image": { "type": "string", "description": "OCI image reference; uses the configured default when omitted." },
                         "pull_policy": { "type": "string", "enum": ["missing", "always", "never"], "default": "missing", "description": "Image acquisition policy." },
-                        "disk_size_bytes": { "type": "integer", "minimum": 1, "description": "Virtual root disk size; uses the server default when omitted." }
+                        "disk_size_bytes": { "type": "integer", "minimum": 1, "description": "Virtual root disk size; uses the server default when omitted." },
+                        "name": { "type": "string", "description": "Optional unique display name." },
+                        "labels": { "type": "object", "additionalProperties": { "type": "string" } },
+                        "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
                     },
                     "additionalProperties": false
                 },
@@ -1149,8 +1249,22 @@ pub(super) fn tools_list() -> Value {
             {
                 "name": "sandbox_box_list",
                 "title": "List persistent Boxes",
-                "description": "List persistent Box metadata without starting a microVM.",
-                "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+                "description": "Filter and stably sort persistent Box metadata without starting a microVM.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "labels": {
+                            "type": "object",
+                            "additionalProperties": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+                        },
+                        "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+                        "state": { "type": "string", "enum": ["ready", "dirty", "needs_repair"] },
+                        "sort_by": { "type": "string", "enum": ["id", "name", "created", "updated", "last_used", "physical_size", "virtual_size"], "default": "id" },
+                        "descending": { "type": "boolean", "default": false }
+                    },
+                    "additionalProperties": false
+                },
                 "outputSchema": tool_output_schema(box_list_output_schema()),
                 "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
             },
@@ -1214,6 +1328,56 @@ pub(super) fn tools_list() -> Value {
                 },
                 "outputSchema": tool_output_schema(box_metadata_schema()),
                 "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_box_update",
+                "title": "Update persistent Box metadata",
+                "description": "Rename an idle Box or atomically add and remove labels and tags. Names are unique case-insensitively.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "box_id": { "type": "string", "format": "uuid" },
+                        "name": { "type": "string" },
+                        "clear_name": { "type": "boolean", "default": false },
+                        "set_labels": { "type": "object", "additionalProperties": { "type": "string" } },
+                        "remove_labels": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+                        "add_tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+                        "remove_tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+                    },
+                    "required": ["box_id"],
+                    "additionalProperties": false
+                },
+                "outputSchema": tool_output_schema(box_metadata_schema()),
+                "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_box_export",
+                "title": "Export persistent Box",
+                "description": "Create a new SHA-256-verified sparse tar bundle from one idle ready Box. Existing destination files are never overwritten.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "box_id": { "type": "string", "format": "uuid" },
+                        "destination": { "type": "string" }
+                    },
+                    "required": ["box_id", "destination"],
+                    "additionalProperties": false
+                },
+                "outputSchema": tool_output_schema(box_bundle_output_schema()),
+                "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_box_import",
+                "title": "Import persistent Box",
+                "description": "Verify a versioned Box tar bundle and atomically restore it under a new BoxId without overwriting existing Boxes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "source": { "type": "string" } },
+                    "required": ["source"],
+                    "additionalProperties": false
+                },
+                "outputSchema": tool_output_schema(box_metadata_schema()),
+                "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
             }
         ]
     })
@@ -1233,6 +1397,10 @@ struct ExecArgs {
     kill_grace_ms: Option<u64>,
     network: bool,
     tty: bool,
+    workspace_mode: WorkspaceMode,
+    copy_in: Vec<CopyInSpec>,
+    copy_out: Vec<CopyOutSpec>,
+    copy_limit_bytes: u64,
     wait: bool,
 }
 
@@ -1249,6 +1417,10 @@ impl Default for ExecArgs {
             kill_grace_ms: None,
             network: false,
             tty: false,
+            workspace_mode: WorkspaceMode::ReadOnly,
+            copy_in: Vec::new(),
+            copy_out: Vec::new(),
+            copy_limit_bytes: DEFAULT_COPY_LIMIT,
             wait: true,
         }
     }
@@ -1300,6 +1472,51 @@ struct BoxCreateArgs {
     image: Option<String>,
     pull_policy: ImagePullPolicy,
     disk_size_bytes: Option<u64>,
+    name: Option<String>,
+    labels: BTreeMap<String, String>,
+    tags: BTreeSet<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct BoxListArgs {
+    name: Option<String>,
+    labels: BTreeMap<String, Option<String>>,
+    tags: BTreeSet<String>,
+    state: Option<BoxState>,
+    sort_by: BoxSortBy,
+    descending: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoxUpdateArgs {
+    box_id: BoxId,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    clear_name: bool,
+    #[serde(default)]
+    set_labels: BTreeMap<String, String>,
+    #[serde(default)]
+    remove_labels: BTreeSet<String>,
+    #[serde(default)]
+    add_tags: BTreeSet<String>,
+    #[serde(default)]
+    remove_tags: BTreeSet<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoxExportArgs {
+    box_id: BoxId,
+    destination: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoxImportArgs {
+    source: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1399,7 +1616,7 @@ mod tests {
             .get("tools")
             .and_then(Value::as_array)
             .expect("tools list");
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 15);
         assert!(tools.iter().all(|tool| tool.get("outputSchema").is_some()));
         assert!(tools.iter().all(|tool| {
             tool.pointer("/outputSchema/oneOf/1/properties/error")
@@ -1593,6 +1810,14 @@ mod tests {
             list.pointer("/result/tools/0/inputSchema/properties/pull_policy/enum"),
             Some(&json!(["missing", "always", "never"]))
         );
+        assert_eq!(
+            list.pointer("/result/tools/0/inputSchema/properties/copy_limit_bytes/maximum"),
+            Some(&json!(MAX_COPY_LIMIT))
+        );
+        assert_eq!(
+            list.pointer("/result/tools/0/inputSchema/properties/workspace_mode/enum"),
+            Some(&json!(["read_only", "overlay"]))
+        );
     }
 
     fn assert_exec_pull_contract(list: &Value, call: &Value) {
@@ -1738,6 +1963,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn tool_handlers_reject_schema_bypasses_before_execution() {
         let server = test_server(SandboxSdk::new(Arc::new(ProcessBackend)));
         let cases = [
@@ -1777,6 +2003,19 @@ mod tests {
                 "sandbox_exec",
                 json!({ "argv": successful_command(), "kill_grace_ms": 60_001 }),
                 "kill_grace_ms must be between",
+            ),
+            (
+                "sandbox_exec",
+                json!({ "argv": successful_command(), "copy_limit_bytes": 0 }),
+                "copy_limit_bytes must be between",
+            ),
+            (
+                "sandbox_exec",
+                json!({
+                    "argv": successful_command(),
+                    "copy_out": [{ "source": "/workspace/../host", "destination": "/tmp/result" }]
+                }),
+                "copy-out requires",
             ),
             (
                 "sandbox_io",
@@ -1983,6 +2222,54 @@ mod tests {
             list.pointer("/result/structuredContent/errors/0/code"),
             Some(&json!("invalid_name"))
         );
+        let bundle = temporary.path().join("box.tar");
+        let exported = call(
+            &server,
+            "sandbox_box_export",
+            json!({"box_id": metadata.box_id, "destination": bundle}),
+        )
+        .await;
+        assert_eq!(exported.pointer("/result/isError"), Some(&json!(false)));
+        let imported = call(
+            &server,
+            "sandbox_box_import",
+            json!({"source": temporary.path().join("box.tar")}),
+        )
+        .await;
+        assert_eq!(imported.pointer("/result/isError"), Some(&json!(false)));
+        assert_ne!(
+            imported.pointer("/result/structuredContent/box_id"),
+            Some(&json!(metadata.box_id))
+        );
+        let updated = call(
+            &server,
+            "sandbox_box_update",
+            json!({
+                "box_id": metadata.box_id,
+                "name": "dev-box",
+                "set_labels": {"team": "core"},
+                "add_tags": ["warm"]
+            }),
+        )
+        .await;
+        assert_eq!(
+            updated.pointer("/result/structuredContent/name"),
+            Some(&json!("dev-box"))
+        );
+        let filtered = call(
+            &server,
+            "sandbox_box_list",
+            json!({
+                "labels": {"team": "core"},
+                "tags": ["warm"],
+                "sort_by": "name"
+            }),
+        )
+        .await;
+        assert_eq!(
+            filtered.pointer("/result/structuredContent/boxes/0/box_id"),
+            Some(&json!(metadata.box_id))
+        );
         let get = call(
             &server,
             "sandbox_box_get",
@@ -2055,6 +2342,7 @@ mod tests {
             gvproxy: None,
             rootfs: Some("ignored-rootfs".into()),
             image: None,
+            workspace: None,
             cache_dir: Some(".moraebox/cache".into()),
             state_dir: Some(".moraebox/state".into()),
             registry_username: None,
@@ -2092,6 +2380,7 @@ mod tests {
             gvproxy: None,
             rootfs: None,
             image: None,
+            workspace: None,
             cache_dir: Some(cache_dir.clone()),
             state_dir: Some(temporary.path().join("state")),
             registry_username: None,

@@ -1,0 +1,36 @@
+[package]
+name = "moraebox-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3.21.0"
+moraebox-box = { path = "../crates/moraebox-box" }
+moraebox-image = { path = "../crates/moraebox-image" }
+moraebox-protocol = { path = "../crates/moraebox-protocol" }
+
+[[bin]]
+name = "protocol_decode"
+path = "fuzz_targets/protocol_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "box_bundle"
+path = "fuzz_targets/box_bundle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_reference"
+path = "fuzz_targets/image_reference.rs"
+test = false
+doc = false
+bench = false

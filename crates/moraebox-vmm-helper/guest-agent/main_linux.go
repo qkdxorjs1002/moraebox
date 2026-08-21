@@ -51,24 +51,29 @@ func main() {
 func serve(connection *os.File, sessionID string) (int, error) {
 	writer := &frameWriter{w: connection, sessionID: sessionID}
 	if err := writer.send(payloadHello, encodeHello(agentVersion, []string{
-		"exec", "stdin", "signal", "resize", "tty", "output-v1",
+		"exec", "stdin", "signal", "resize", "tty", "output-v1", "copy-tar-v1",
 	})); err != nil {
 		return 125, err
 	}
-	first, err := readFrame(connection)
-	if err != nil {
-		return 125, err
-	}
-	if first.sessionID != sessionID || first.streamID != execStreamID || first.sequence != 0 || first.payload != payloadExec {
-		return 125, errors.New("invalid initial exec frame")
-	}
-	request, err := decodeExec(first.body)
+	request, copyOut, nextSequence, err := readInitialRequest(connection, sessionID)
 	if err != nil {
 		return 125, err
 	}
 	process, err := startProcess(request, writer)
 	if err != nil {
 		_ = writer.send(payloadOutput, encodeOutput(1, []byte(err.Error()+"\n")))
+		if diffErr := writeWorkspaceDiffIfRequested(copyOut); diffErr != nil {
+			_ = writer.send(payloadOutput, encodeOutput(1, []byte(diffErr.Error()+"\n")))
+			_ = writer.send(payloadExit, encodeExit(125, nil))
+			return 125, nil
+		}
+		for _, copyRequest := range copyOut {
+			if copyErr := sendCopyOut(writer, copyRequest); copyErr != nil {
+				_ = writer.send(payloadOutput, encodeOutput(1, []byte(copyErr.Error()+"\n")))
+				_ = writer.send(payloadExit, encodeExit(125, nil))
+				return 125, nil
+			}
+		}
 		_ = writer.send(payloadExit, encodeExit(127, nil))
 		return 127, nil
 	}
@@ -88,7 +93,6 @@ func serve(connection *os.File, sessionID string) (int, error) {
 	waited := make(chan processResult, 1)
 	go func() { waited <- process.wait() }()
 
-	nextSequence := uint64(1)
 	stdinClosed := false
 	for {
 		select {
@@ -132,6 +136,20 @@ func serve(connection *os.File, sessionID string) (int, error) {
 				return 125, errors.New("unexpected host payload")
 			}
 		case result := <-waited:
+			if err := writeWorkspaceDiffIfRequested(copyOut); err != nil {
+				message := []byte("morae guest agent: workspace diff failed: " + err.Error() + "\n")
+				_ = writer.send(payloadOutput, encodeOutput(1, message))
+				_ = writer.send(payloadExit, encodeExit(125, nil))
+				return 125, nil
+			}
+			for _, copyRequest := range copyOut {
+				if err := sendCopyOut(writer, copyRequest); err != nil {
+					message := []byte("morae guest agent: copy-out failed: " + err.Error() + "\n")
+					_ = writer.send(payloadOutput, encodeOutput(1, message))
+					_ = writer.send(payloadExit, encodeExit(125, nil))
+					return 125, nil
+				}
+			}
 			if err := writer.send(payloadExit, encodeExit(result.code, result.signal)); err != nil {
 				return 125, err
 			}
@@ -139,6 +157,87 @@ func serve(connection *os.File, sessionID string) (int, error) {
 		case err := <-readErrors:
 			process.kill(syscall.SIGKILL)
 			return 125, fmt.Errorf("control connection failed: %w", err)
+		}
+	}
+}
+
+func readInitialRequest(connection *os.File, sessionID string) (execRequest, []copyOutRequest, uint64, error) {
+	var active *inboundCopy
+	defer func() {
+		if active != nil {
+			active.discard()
+		}
+	}()
+	copyOut := make([]copyOutRequest, 0)
+	seenTransfers := make(map[uint64]struct{})
+	nextSequence := uint64(0)
+	for {
+		frame, err := readFrame(connection)
+		if err != nil {
+			return execRequest{}, nil, 0, err
+		}
+		if frame.sessionID != sessionID || frame.streamID != execStreamID || frame.sequence != nextSequence {
+			return execRequest{}, nil, 0, errors.New("invalid initial protocol identity or sequence")
+		}
+		nextSequence++
+		switch frame.payload {
+		case payloadCopyInStart:
+			if active != nil {
+				return execRequest{}, nil, 0, errors.New("copy-in transfer is already active")
+			}
+			start, err := decodeCopyInStart(frame.body)
+			if err != nil {
+				return execRequest{}, nil, 0, err
+			}
+			if _, duplicate := seenTransfers[start.transferID]; duplicate {
+				return execRequest{}, nil, 0, errors.New("duplicate transfer id")
+			}
+			seenTransfers[start.transferID] = struct{}{}
+			active, err = newInboundCopy(start)
+			if err != nil {
+				return execRequest{}, nil, 0, err
+			}
+		case payloadCopyInChunk:
+			if active == nil {
+				return execRequest{}, nil, 0, errors.New("copy-in chunk has no active transfer")
+			}
+			chunk, err := decodeCopyChunk(frame.body)
+			if err != nil || active.append(chunk) != nil {
+				return execRequest{}, nil, 0, errors.New("invalid copy-in chunk")
+			}
+		case payloadCopyInEnd:
+			if active == nil {
+				return execRequest{}, nil, 0, errors.New("copy-in end has no active transfer")
+			}
+			transferID, err := decodeTransferID(frame.body)
+			if err != nil {
+				return execRequest{}, nil, 0, err
+			}
+			if err := active.finish(transferID); err != nil {
+				return execRequest{}, nil, 0, err
+			}
+			active = nil
+		case payloadCopyOutRequest:
+			if active != nil {
+				return execRequest{}, nil, 0, errors.New("copy-out requested during copy-in")
+			}
+			request, err := decodeCopyOutRequest(frame.body)
+			if err != nil {
+				return execRequest{}, nil, 0, err
+			}
+			if _, duplicate := seenTransfers[request.transferID]; duplicate {
+				return execRequest{}, nil, 0, errors.New("duplicate transfer id")
+			}
+			seenTransfers[request.transferID] = struct{}{}
+			copyOut = append(copyOut, request)
+		case payloadExec:
+			if active != nil {
+				return execRequest{}, nil, 0, errors.New("exec received during copy-in")
+			}
+			request, err := decodeExec(frame.body)
+			return request, copyOut, nextSequence, err
+		default:
+			return execRequest{}, nil, 0, errors.New("unexpected initial host payload")
 		}
 	}
 }

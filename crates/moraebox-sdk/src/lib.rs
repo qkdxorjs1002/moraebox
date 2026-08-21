@@ -7,6 +7,12 @@ mod configuration;
 pub use configuration::{
     ManagedStorage, NativeConfigurationError, NativeRuntimeOverrides, NativeSandboxConfig,
 };
+pub use moraebox_box::{
+    BoxBundleReport, BoxListReport, BoxMetadata, BoxQuery, BoxSortBy, CreateBox, UpdateBox,
+};
+pub use moraebox_core::{
+    CopyInSpec, CopyOutSpec, RunSpec, WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode,
+};
 
 use std::{
     collections::HashMap,
@@ -17,9 +23,9 @@ use std::{
     time::Duration,
 };
 
-use moraebox_box::{BoxListReport, BoxMetadata, BoxStore, BoxStoreError, CreateBox};
+use moraebox_box::{BoxStore, BoxStoreError};
 use moraebox_core::{
-    BoxId, OutputChunk, OutputRead, OutputReadError, RunSpec, SessionId, SessionState, Signal,
+    BoxId, OutputChunk, OutputRead, OutputReadError, SessionId, SessionState, Signal,
 };
 use moraebox_runtime::{
     Backend, MAX_SESSION_OUTPUT_READ_BYTES, SessionError, SessionHandle, SessionManager,
@@ -574,6 +580,14 @@ impl SandboxSdk {
             .map_err(Into::into)
     }
 
+    pub async fn list_boxes_with(&self, query: BoxQuery) -> Result<BoxListReport, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.list_with(&query))
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
     pub async fn get_box(&self, box_id: BoxId) -> Result<BoxMetadata, SdkError> {
         let store = self.box_store()?;
         tokio::task::spawn_blocking(move || store.get(box_id))
@@ -605,6 +619,46 @@ impl SandboxSdk {
     pub async fn clone_box(&self, box_id: BoxId) -> Result<BoxMetadata, SdkError> {
         let store = self.box_store()?;
         tokio::task::spawn_blocking(move || store.clone_box(box_id))
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
+    pub async fn rename_box(&self, box_id: BoxId, name: String) -> Result<BoxMetadata, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.rename(box_id, name))
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
+    pub async fn update_box(
+        &self,
+        box_id: BoxId,
+        update: UpdateBox,
+    ) -> Result<BoxMetadata, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.update(box_id, &update))
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
+    pub async fn export_box(
+        &self,
+        box_id: BoxId,
+        destination: PathBuf,
+    ) -> Result<BoxBundleReport, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.export_bundle(box_id, &destination))
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
+    pub async fn import_box(&self, source: PathBuf) -> Result<BoxMetadata, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.import_bundle(&source))
             .await
             .map_err(|error| SdkError::BoxTask(error.to_string()))?
             .map_err(Into::into)

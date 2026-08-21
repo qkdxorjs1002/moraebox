@@ -23,6 +23,7 @@ impl ProcessBackend {
         network: CapabilitySupport::Unsupported,
         box_persistence: CapabilitySupport::Unsupported,
         workspace: CapabilitySupport::Unsupported,
+        file_transfer: CapabilitySupport::Unsupported,
     };
 }
 
@@ -55,6 +56,11 @@ impl Backend for ProcessBackend {
         if spec.network {
             return Err(BackendError::Unsupported(
                 "network opt-in on the process backend; it already uses the host network without VM isolation",
+            ));
+        }
+        if !spec.copy_in.is_empty() || !spec.copy_out.is_empty() {
+            return Err(BackendError::Unsupported(
+                "copy-in/out on the process backend; it does not provide a guest boundary",
             ));
         }
 

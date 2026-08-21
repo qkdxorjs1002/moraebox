@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 mod errors;
 mod registration;
@@ -23,13 +24,17 @@ use std::{
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand};
-use moraebox_box::{BaseDiskSpec, BaseDiskStore, BoxStore, BoxStoreError, CreateBox};
-use moraebox_core::{
-    BoxId, DEFAULT_KILL_GRACE, DEFAULT_OUTPUT_LIMIT, ImagePullPolicy, MAX_KILL_GRACE,
-    MAX_OUTPUT_LIMIT, OutputChunk, OutputReadError, RunSpec, SessionId, Signal, TimeoutPolicy,
-    resolve_cache_dir, resolve_state_dir,
+use moraebox_box::{
+    BaseDiskSpec, BaseDiskStore, BoxQuery, BoxSortBy, BoxState, BoxStore, BoxStoreError, CreateBox,
+    UpdateBox,
 };
-use moraebox_image::{Credentials, ImageCache, Platform};
+use moraebox_core::{
+    BoxId, CopyInSpec, CopyOutSpec, DEFAULT_COPY_LIMIT, DEFAULT_KILL_GRACE, DEFAULT_OUTPUT_LIMIT,
+    ImagePullPolicy, MAX_COPY_LIMIT, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, OutputChunk,
+    OutputReadError, RunSpec, SessionId, Signal, TimeoutPolicy, WorkspaceMode, resolve_cache_dir,
+    resolve_state_dir,
+};
+use moraebox_image::{Credentials, ImageCache, Platform, WorkspaceSnapshot};
 use moraebox_runtime::{
     Backend, BackendCapabilities, BackendError, BoxRootSource, BoxRuntimeConfig, DiskToolPaths,
     LibkrunBackend, LibkrunConfig, PoolConfig, PreparedRootPool, ProcessBackend, RunBudget,
@@ -109,9 +114,12 @@ struct ServerArgs {
     /// Use an already materialized guest root directory instead of a managed image.
     #[arg(long, env = "MORAE_ROOTFS")]
     rootfs: Option<PathBuf>,
-    /// OCI image reference. Uses the configured default image when omitted.
+    /// Registry, oci-layout:PATH, or docker-archive:PATH#REPO:TAG image reference.
     #[arg(long, conflicts_with = "rootfs")]
     image: Option<String>,
+    /// Host directory snapshotted into an immutable workspace disk for opt-in run overlays.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
     /// Cache root; defaults to ~/.moraebox/cache.
     #[arg(long)]
     cache_dir: Option<PathBuf>,
@@ -172,15 +180,21 @@ struct LazyImageBackend {
     platform: Platform,
     credentials: Option<Credentials>,
     prepared_roots: Arc<PreparedRootPool>,
+    workspace_digest: Option<String>,
 }
 
 impl LazyImageBackend {
     fn backend(&self, source: Option<BoxRootSource>) -> LibkrunBackend {
         let mut runtime = self.runtime.clone();
         runtime.source = source;
-        LibkrunBackend::new(self.config.clone())
+        let backend = LibkrunBackend::new(self.config.clone())
             .with_box_runtime(runtime)
-            .with_prepared_pool(Arc::clone(&self.prepared_roots))
+            .with_prepared_pool(Arc::clone(&self.prepared_roots));
+        if let Some(digest) = &self.workspace_digest {
+            backend.with_workspace_digest(digest)
+        } else {
+            backend
+        }
     }
 
     async fn prepare(
@@ -348,6 +362,22 @@ fn create_server(args: ServerArgs) -> Result<McpServer, McpServerError> {
         args.debugfs.clone(),
     );
     let mke2fs_path = disk_tools.mke2fs_command();
+    let workspace = if let Some(source) = args.workspace.as_deref() {
+        if args.backend != "libkrun" {
+            return Err("--workspace requires --backend libkrun".into());
+        }
+        Some(
+            WorkspaceSnapshot::create_with_managed_roots(
+                source,
+                &cache_dir,
+                std::slice::from_ref(&state_dir),
+                &mke2fs_path,
+            )
+            .map_err(|error| McpServerError::from(error.to_string()))?,
+        )
+    } else {
+        None
+    };
     let backend: Arc<dyn Backend> = match args.backend.as_str() {
         "process" => {
             if args.rootfs.is_some() || args.image.is_some() {
@@ -375,7 +405,11 @@ fn create_server(args: ServerArgs) -> Result<McpServer, McpServerError> {
                 .rootfs
                 .clone()
                 .unwrap_or_else(|| cache_dir.join("rootfs"));
-            let config = native.libkrun_config(Some(root_path), storage, None)?;
+            let config = native.libkrun_config(
+                Some(root_path),
+                storage,
+                workspace.as_ref().map(|value| value.image_path.clone()),
+            )?;
             let runtime = native.box_runtime(storage, None);
             let prepared_roots = Arc::new(
                 PreparedRootPool::new(PoolConfig::default())
@@ -386,7 +420,15 @@ fn create_server(args: ServerArgs) -> Result<McpServer, McpServerError> {
                 let mut runtime = runtime;
                 runtime.source = Some(source);
                 Arc::new(
-                    LibkrunBackend::new(config)
+                    workspace
+                        .as_ref()
+                        .map_or_else(
+                            || LibkrunBackend::new(config.clone()),
+                            |workspace| {
+                                LibkrunBackend::new(config.clone())
+                                    .with_workspace_digest(workspace.image_digest.to_string())
+                            },
+                        )
                         .with_box_runtime(runtime)
                         .with_prepared_pool(prepared_roots),
                 )
@@ -400,6 +442,9 @@ fn create_server(args: ServerArgs) -> Result<McpServer, McpServerError> {
                     platform: platform.clone(),
                     credentials: credentials.clone(),
                     prepared_roots,
+                    workspace_digest: workspace
+                        .as_ref()
+                        .map(|value| value.image_digest.to_string()),
                 })
             }
         }

@@ -1482,7 +1482,9 @@ mod tests {
             root.path(),
             "#!/bin/sh\nprintf '%s' \"$$\" > \"${0}.pid\"\nwhile :; do :; done\n",
         );
-        let timeout = Duration::from_secs(1);
+        // The deadline covers scan and image allocation too. Leave enough headroom for the
+        // fake mke2fs process to start even when the full workspace suite runs in parallel.
+        let timeout = Duration::from_secs(3);
 
         let error =
             WorkspaceSnapshot::create_async(&source, &cache, &mke2fs, Some(timeout), |_| {})

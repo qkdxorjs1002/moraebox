@@ -122,6 +122,11 @@ morae image default --unset
 
 `--rootfs /path/to/rootfs`는 이미 구체화한 guest root 디렉터리를 사용하는 고급 대안입니다. 이미지 해석을 우회하며 `--image`와 함께 사용할 수 없습니다.
 
+로컬 이미지는 명시적인 `oci-layout:/path/to/layout` 또는
+`docker-archive:/path/to/image.tar#repo/name:tag` 형식을 사용합니다. 원격 pull과
+같은 digest·size·platform·layer diff-ID·안전 경로 검증을 적용하며 Docker archive는
+`#` 뒤의 정확한 `repo:tag`를 생략할 수 없습니다.
+
 ### Persistent Box로 작업 이어가기
 
 일반 실행은 새 `SessionId`, 새 microVM, 정리 후 삭제되는 ephemeral copy-on-write root disk를 받습니다. 이후 실행에서도 파일 변경을 유지해야 할 때만 Box를 만듭니다.
@@ -141,7 +146,7 @@ morae box delete "$BOX_ID" --yes
 
 writable Box disk를 guest에 연결하기 전에 moraebox는 `Dirty` metadata를 원자적으로 기록하고 file과 parent directory를 모두 flush합니다. clean helper shutdown만 Box를 `Ready`로 되돌립니다. host crash, timeout, signal, helper 실패 또는 spawn 실패는 `Dirty`를 유지하므로 다음 실행은 Box lease를 잡은 상태에서 `e2fsck -p`를 수행합니다. 복구 성공은 disk를 다시 사용하기 전에 기록되며, 복구할 수 없는 filesystem은 `NeedsRepair`로 표시하고 실행을 차단합니다.
 
-### 읽기 전용 워크스페이스 연결
+### 워크스페이스 연결과 파일 전송
 
 ```sh
 morae run \
@@ -151,13 +156,20 @@ morae run \
 
 moraebox는 심볼릭 링크를 따라가지 않고 호스트 트리를 순회하며, 안전하지 않은 항목을 거부한 뒤 읽기 전용 ext4 스냅샷을 만들어 `/workspace`에 연결합니다. 원본 호스트 디렉터리는 VM에 노출하지 않습니다.
 
+`--workspace-writable`은 불변 원본 위에 실행별 overlay를 만들고,
+`--workspace-copy-out`과 `--workspace-diff`는 새 host 경로에만 결과와 변경
+manifest를 원자적으로 기록합니다. `--copy-in HOST=GUEST`, `--copy-out
+GUEST=HOST`, `--copy-limit 64MiB`로 일반 파일 전송도 제한할 수 있습니다. 경로
+traversal과 제한 초과는 거부되며 부분 host 결과를 publish하지 않습니다.
+
 ### 대화형 터미널 사용
 
 ```sh
 morae run --image alpine:latest --tty --interactive -- /bin/sh
 ```
 
-네이티브 백엔드는 PTY 할당을 지원합니다. 실시간 터미널 크기 조절은 아직 구현되지 않았습니다.
+네이티브 백엔드는 PTY 할당과 SIGWINCH부터 guest PTY까지 이어지는 실시간
+터미널 크기 조절을 지원합니다.
 
 ### 로컬 저장공간 관리
 
@@ -166,9 +178,13 @@ morae image pull python:3.12
 morae image list
 morae image remove python:3.12
 
-morae box create --image python:3.12
-morae box list
+morae box create --image python:3.12 --name dev --label team=agents --tag active
+morae box list --label team=agents --tag active --sort last-used --reverse
 morae box show BOX_ID
+morae box rename BOX_ID dev-next
+morae box update BOX_ID --label stage=test --tag reproducible
+morae box export BOX_ID backup.tar
+morae box import backup.tar
 morae box clone BOX_ID --yes
 morae box reset BOX_ID --yes
 morae box delete BOX_ID --yes
@@ -198,11 +214,17 @@ morae benchmark --backend process --iterations 100 -- /usr/bin/true
 네이티브 cached-start를 검증할 때는 첫 guest 출력을 보수적인 command-start 신호로 측정할 수 있도록 즉시 출력하는 명령을 사용합니다.
 
 ```sh
-morae benchmark --image alpine:latest \
-  --iterations 100 -- /bin/echo ready
+morae benchmark --image alpine:latest --mode cold \
+  --iterations 100 --concurrency 4 -- /bin/echo ready
+morae benchmark --image alpine:latest --mode warm \
+  --iterations 100 --concurrency 4 -- /bin/echo ready
 ```
 
-JSON report는 immutable-base 조회, Box lock, CoW clone, root 준비, helper spawn, 첫 guest 출력, 전체 완료 percentile을 분리합니다. Native 실행은 `mode: "cached-one-shot"`, 명시적 process benchmark는 `mode: "host-process"`로 표시하므로 호스트 실행을 microVM 성능으로 오인하지 않습니다.
+JSON report는 cold/warm startup, immutable-base 조회, Box lock, CoW clone, root
+준비, helper spawn, 첫 guest 출력, 전체 완료, 동시 처리량, 오류, cache hit, peak
+child RSS를 분리하고 build/native dependency metadata를 포함합니다. 명시적 process
+benchmark는 `mode: "host-process"`로 표시하므로 호스트 실행을 microVM 성능으로
+오인하지 않습니다.
 
 ## 코딩 에이전트 연결
 
@@ -237,8 +259,10 @@ claude mcp remove --scope user moraebox
 | `sandbox_exec` | 명령 하나를 실행하거나 비동기 세션 시작, 선택형 `box_id`로 파일 상태 재사용 |
 | `sandbox_io` | 제한된 출력 읽기, stdin 쓰기·닫기, 크기 조절, 시그널 전송 |
 | `sandbox_stop` | 세션을 중지하고 정리가 끝날 때까지 대기 |
-| `sandbox_box_create` | OCI 이미지에서 persistent Box 생성 |
-| `sandbox_box_list` / `sandbox_box_get` | persistent Box metadata 조회 |
+| `sandbox_box_create` | registry 또는 로컬 이미지에서 persistent Box 생성 |
+| `sandbox_box_list` / `sandbox_box_get` | persistent Box metadata 필터·정렬·조회 |
+| `sandbox_box_update` | Box rename 또는 label/tag 원자적 갱신 |
+| `sandbox_box_export` / `sandbox_box_import` | 검증된 versioned bundle로 Box backup·복원 |
 | `sandbox_box_delete` / `sandbox_box_reset` | 명시적 확인 후 idle Box를 영구 변경 |
 | `sandbox_box_clone` | 명시적 확인 후 독립된 durable Box 생성 |
 
@@ -317,11 +341,11 @@ moraebox는 적대적인 호스트 사용자, 손상된 hypervisor·VMM, 적대�
 | Apple Silicon macOS | 네이티브 libkrun 실행, 현재 릴리스 검증 대상 |
 | Linux 및 Windows | 컴파일·테스트 대상, 네이티브 릴리스 런타임 없음 |
 | libkrun 스택 | 정식 libkrun 1.19.4 및 libkrunfw 5.5.0으로 검증 |
-| 이미지 소스 | 원격 OCI 레지스트리, 로컬 OCI layout과 Docker archive는 아직 가져오지 않음 |
+| 이미지 소스 | 원격 OCI 레지스트리, 로컬 OCI layout, 명시적으로 선택한 Docker archive |
 | VM 재사용 | 구체화한 artifact는 캐시할 수 있지만 부팅한 신뢰 불가 VM은 재사용하지 않음 |
 | Box 지속성 | opt-in 전체 root filesystem 지속성, 각 실행은 여전히 새 microVM 사용 |
-| 워크스페이스 | 읽기 전용 스냅샷, 쓰기 overlay와 copy-out/diff는 후속 작업 |
-| 대화형 I/O | PTY 지원, 실시간 크기 조절은 후속 작업 |
+| 워크스페이스 | 불변 스냅샷, 선택적 일회용 쓰기 overlay와 bounded copy-out/diff |
+| 대화형 I/O | PTY와 bounded control protocol 기반 실시간 크기 조절 |
 
 이 프로젝트는 아직 초기 단계입니다. 보안에 민감한 작업에 사용하기 전에 위 경계를 검토하세요.
 
@@ -356,6 +380,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo deny --all-features --locked check
 ```
+
+property/fuzz/Loom/Miri 실행법과 process 성능 회귀 기준은
+[docs/testing.md](docs/testing.md)에 정리되어 있습니다.
 
 CI는 macOS, Linux, Windows에서 잠긴 이식 가능 품질 게이트를 실행합니다. 별도 Ubuntu job은 선언된 Rust 1.85 MSRV로 잠긴 workspace를 compile·test합니다. dependency-policy job은 cargo-deny로 advisory, 허용되지 않은 라이선스, wildcard 의존성, 알 수 없는 package source를 거부하며 중복된 전이 버전은 경고로 계속 표시합니다. 모든 외부 GitHub Action은 변경 불가능한 commit SHA로 고정하고 관리자가 원래 release tag를 알 수 있도록 주석을 유지합니다. Apple Silicon macOS job은 고정된 native 의존성을 설치하고 서명된 실제 백엔드 suite를 실행합니다. runner에 필수 native capability가 없으면 정확한 누락 capability와 dependency setup 결과를 GitHub Step Summary에 남깁니다. capability가 준비된 뒤 발생한 build, image 준비, doctor, smoke 실패는 skip으로 숨기지 않고 job을 실패시킵니다.
 

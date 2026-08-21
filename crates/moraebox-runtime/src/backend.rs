@@ -41,6 +41,7 @@ pub struct BackendCapabilities {
     pub network: CapabilitySupport,
     pub box_persistence: CapabilitySupport,
     pub workspace: CapabilitySupport,
+    pub file_transfer: CapabilitySupport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

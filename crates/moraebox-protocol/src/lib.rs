@@ -8,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
+pub const MAX_TRANSFER_SIZE: u64 = 1024 * 1024 * 1024;
 pub const EXEC_STREAM_ID: u64 = 1;
 
 #[derive(Clone, PartialEq, Message)]
@@ -20,7 +21,10 @@ pub struct Frame {
     pub stream_id: u64,
     #[prost(uint64, tag = "4")]
     pub sequence: u64,
-    #[prost(oneof = "frame::Payload", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18")]
+    #[prost(
+        oneof = "frame::Payload",
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25"
+    )]
     pub payload: Option<frame::Payload>,
 }
 
@@ -28,7 +32,8 @@ pub mod frame {
     use prost::Oneof;
 
     use super::{
-        ExecRequest, Exit, Hello, Output, Resize, Shutdown, SignalRequest, Stdin, StdinEof,
+        CopyChunk, CopyInEnd, CopyInStart, CopyOutEnd, CopyOutRequest, CopyOutStart, ExecRequest,
+        Exit, Hello, Output, Resize, Shutdown, SignalRequest, Stdin, StdinEof,
     };
 
     #[derive(Clone, PartialEq, Oneof)]
@@ -51,6 +56,20 @@ pub mod frame {
         Exit(Exit),
         #[prost(message, tag = "18")]
         Shutdown(Shutdown),
+        #[prost(message, tag = "19")]
+        CopyInStart(CopyInStart),
+        #[prost(message, tag = "20")]
+        CopyInChunk(CopyChunk),
+        #[prost(message, tag = "21")]
+        CopyInEnd(CopyInEnd),
+        #[prost(message, tag = "22")]
+        CopyOutRequest(CopyOutRequest),
+        #[prost(message, tag = "23")]
+        CopyOutStart(CopyOutStart),
+        #[prost(message, tag = "24")]
+        CopyOutChunk(CopyChunk),
+        #[prost(message, tag = "25")]
+        CopyOutEnd(CopyOutEnd),
     }
 }
 
@@ -140,6 +159,58 @@ pub struct Shutdown {
     pub reason: String,
 }
 
+#[derive(Clone, PartialEq, Message)]
+pub struct CopyInStart {
+    #[prost(uint64, tag = "1")]
+    pub transfer_id: u64,
+    #[prost(string, tag = "2")]
+    pub destination: String,
+    #[prost(uint64, tag = "3")]
+    pub archive_size: u64,
+    #[prost(string, tag = "4")]
+    pub sha256: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CopyChunk {
+    #[prost(uint64, tag = "1")]
+    pub transfer_id: u64,
+    #[prost(bytes = "vec", tag = "2")]
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CopyInEnd {
+    #[prost(uint64, tag = "1")]
+    pub transfer_id: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CopyOutRequest {
+    #[prost(uint64, tag = "1")]
+    pub transfer_id: u64,
+    #[prost(string, tag = "2")]
+    pub source: String,
+    #[prost(uint64, tag = "3")]
+    pub max_bytes: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CopyOutStart {
+    #[prost(uint64, tag = "1")]
+    pub transfer_id: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CopyOutEnd {
+    #[prost(uint64, tag = "1")]
+    pub transfer_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub total_bytes: u64,
+    #[prost(string, tag = "3")]
+    pub sha256: String,
+}
+
 impl Frame {
     pub fn new(session_id: impl Into<String>, stream_id: u64, payload: frame::Payload) -> Self {
         Self {
@@ -174,6 +245,7 @@ pub struct InboundValidator {
     peer: PeerRole,
     next_sequence: u64,
     state: PeerState,
+    transfer_id: Option<u64>,
 }
 
 impl InboundValidator {
@@ -184,6 +256,7 @@ impl InboundValidator {
             peer,
             next_sequence: 0,
             state: PeerState::Initial,
+            transfer_id: None,
         }
     }
 
@@ -215,11 +288,55 @@ impl InboundValidator {
                 payload: payload_name(payload),
             }
         })?;
+        self.accept_transfer(payload)?;
         self.next_sequence = self
             .next_sequence
             .checked_add(1)
             .ok_or(ProtocolError::SequenceExhausted)?;
         self.state = next_state;
+        Ok(())
+    }
+
+    fn accept_transfer(&mut self, payload: &frame::Payload) -> Result<(), ProtocolError> {
+        use frame::Payload::{
+            CopyInChunk, CopyInEnd, CopyInStart, CopyOutChunk, CopyOutEnd, CopyOutStart, Exec, Exit,
+        };
+
+        match payload {
+            CopyInStart(start) => self.open_transfer(start.transfer_id),
+            CopyOutStart(start) => self.open_transfer(start.transfer_id),
+            CopyInChunk(chunk) | CopyOutChunk(chunk) => self.require_transfer(chunk.transfer_id),
+            CopyInEnd(end) => self.close_transfer(end.transfer_id),
+            CopyOutEnd(end) => self.close_transfer(end.transfer_id),
+            Exec(_) | Exit(_) if self.transfer_id.is_some() => {
+                Err(ProtocolError::TransferStillOpen)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn open_transfer(&mut self, transfer_id: u64) -> Result<(), ProtocolError> {
+        if let Some(active) = self.transfer_id {
+            return Err(ProtocolError::TransferAlreadyOpen { active });
+        }
+        self.transfer_id = Some(transfer_id);
+        Ok(())
+    }
+
+    fn require_transfer(&self, transfer_id: u64) -> Result<(), ProtocolError> {
+        match self.transfer_id {
+            Some(active) if active == transfer_id => Ok(()),
+            Some(active) => Err(ProtocolError::TransferMismatch {
+                expected: active,
+                actual: transfer_id,
+            }),
+            None => Err(ProtocolError::TransferNotOpen),
+        }
+    }
+
+    fn close_transfer(&mut self, transfer_id: u64) -> Result<(), ProtocolError> {
+        self.require_transfer(transfer_id)?;
+        self.transfer_id = None;
         Ok(())
     }
 }
@@ -335,15 +452,27 @@ fn validate_frame_size(size: usize) -> Result<(), ProtocolError> {
 }
 
 fn transition(peer: PeerRole, state: PeerState, payload: &frame::Payload) -> Option<PeerState> {
-    use frame::Payload::{Exec, Exit, Hello, Output, Resize, Shutdown, Signal, Stdin, StdinEof};
+    use frame::Payload::{
+        CopyInChunk, CopyInEnd, CopyInStart, CopyOutChunk, CopyOutEnd, CopyOutRequest,
+        CopyOutStart, Exec, Exit, Hello, Output, Resize, Shutdown, Signal, Stdin, StdinEof,
+    };
 
     match (peer, state, payload) {
         (PeerRole::Guest, PeerState::Initial, Hello(_))
         | (PeerRole::Host, PeerState::Initial, Exec(_))
-        | (PeerRole::Guest, PeerState::Running, Output(_))
+        | (
+            PeerRole::Guest,
+            PeerState::Running,
+            Output(_) | CopyOutStart(_) | CopyOutChunk(_) | CopyOutEnd(_),
+        )
         | (PeerRole::Host, PeerState::Running, Stdin(_) | Resize(_) | Signal(_)) => {
             Some(PeerState::Running)
         }
+        (
+            PeerRole::Host,
+            PeerState::Initial,
+            CopyInStart(_) | CopyInChunk(_) | CopyInEnd(_) | CopyOutRequest(_),
+        ) => Some(PeerState::Initial),
         (PeerRole::Host, PeerState::Running, StdinEof(_)) => Some(PeerState::InputClosed),
         (PeerRole::Host, PeerState::InputClosed, Resize(_) | Signal(_)) => {
             Some(PeerState::InputClosed)
@@ -367,6 +496,13 @@ fn payload_name(payload: &frame::Payload) -> &'static str {
         frame::Payload::Output(_) => "output",
         frame::Payload::Exit(_) => "exit",
         frame::Payload::Shutdown(_) => "shutdown",
+        frame::Payload::CopyInStart(_) => "copy_in_start",
+        frame::Payload::CopyInChunk(_) => "copy_in_chunk",
+        frame::Payload::CopyInEnd(_) => "copy_in_end",
+        frame::Payload::CopyOutRequest(_) => "copy_out_request",
+        frame::Payload::CopyOutStart(_) => "copy_out_start",
+        frame::Payload::CopyOutChunk(_) => "copy_out_chunk",
+        frame::Payload::CopyOutEnd(_) => "copy_out_end",
     }
 }
 
@@ -379,6 +515,83 @@ fn validate_frame(frame: &Frame) -> Result<(), ProtocolError> {
     }
     if frame.payload.is_none() {
         return Err(ProtocolError::MissingPayload);
+    }
+    validate_payload(frame.payload.as_ref().expect("payload checked"))?;
+    Ok(())
+}
+
+fn validate_payload(payload: &frame::Payload) -> Result<(), ProtocolError> {
+    match payload {
+        frame::Payload::CopyInStart(start) => {
+            validate_transfer_id(start.transfer_id)?;
+            validate_guest_path(&start.destination)?;
+            validate_transfer_size(start.archive_size)?;
+            validate_sha256(&start.sha256)?;
+        }
+        frame::Payload::CopyInChunk(chunk) | frame::Payload::CopyOutChunk(chunk) => {
+            validate_transfer_id(chunk.transfer_id)?;
+            if chunk.data.is_empty() {
+                return Err(ProtocolError::EmptyTransferChunk);
+            }
+        }
+        frame::Payload::CopyInEnd(end) => validate_transfer_id(end.transfer_id)?,
+        frame::Payload::CopyOutRequest(request) => {
+            validate_transfer_id(request.transfer_id)?;
+            validate_transfer_size(request.max_bytes)?;
+            validate_guest_path(&request.source)?;
+        }
+        frame::Payload::CopyOutStart(start) => validate_transfer_id(start.transfer_id)?,
+        frame::Payload::CopyOutEnd(end) => {
+            validate_transfer_id(end.transfer_id)?;
+            validate_transfer_size(end.total_bytes)?;
+            validate_sha256(&end.sha256)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_transfer_id(transfer_id: u64) -> Result<(), ProtocolError> {
+    if transfer_id == 0 {
+        Err(ProtocolError::InvalidTransferId)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_transfer_size(size: u64) -> Result<(), ProtocolError> {
+    if size == 0 || size > MAX_TRANSFER_SIZE {
+        Err(ProtocolError::InvalidTransferSize {
+            size,
+            maximum: MAX_TRANSFER_SIZE,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_sha256(digest: &str) -> Result<(), ProtocolError> {
+    let hex = digest.strip_prefix("sha256:").unwrap_or_default();
+    if hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(ProtocolError::InvalidTransferDigest)
+    }
+}
+
+pub fn validate_guest_path(path: &str) -> Result<(), ProtocolError> {
+    if path.len() > 4096 || !path.starts_with('/') || path.contains('\0') {
+        return Err(ProtocolError::InvalidTransferPath(path.into()));
+    }
+    if path == "/" {
+        return Err(ProtocolError::InvalidTransferPath(path.into()));
+    }
+    if path
+        .split('/')
+        .skip(1)
+        .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(ProtocolError::InvalidTransferPath(path.into()));
     }
     Ok(())
 }
@@ -411,6 +624,24 @@ pub enum ProtocolError {
     },
     #[error("protocol sequence space is exhausted")]
     SequenceExhausted,
+    #[error("transfer id must be non-zero")]
+    InvalidTransferId,
+    #[error("transfer size {size} is outside 1..={maximum}")]
+    InvalidTransferSize { size: u64, maximum: u64 },
+    #[error("transfer digest must be a sha256 digest")]
+    InvalidTransferDigest,
+    #[error("transfer path is invalid: {0}")]
+    InvalidTransferPath(String),
+    #[error("transfer chunks must not be empty")]
+    EmptyTransferChunk,
+    #[error("transfer {active} is already open")]
+    TransferAlreadyOpen { active: u64 },
+    #[error("no transfer is open")]
+    TransferNotOpen,
+    #[error("transfer id mismatch: expected {expected}, actual {actual}")]
+    TransferMismatch { expected: u64, actual: u64 },
+    #[error("execution cannot finish while a transfer is open")]
+    TransferStillOpen,
     #[error("failed to read frame header: {source}")]
     ReadHeader { source: std::io::Error },
     #[error("failed to read {declared}-byte frame body: {source}")]
@@ -427,6 +658,39 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn property_encoded_frames_round_trip(data in prop::collection::vec(any::<u8>(), 0..4096)) {
+            let frame = Frame::new(
+                "property-session",
+                EXEC_STREAM_ID,
+                frame::Payload::Stdin(Stdin { data }),
+            );
+            let encoded = encode_frame(&frame).unwrap();
+            prop_assert_eq!(decode_frame(&encoded).unwrap(), frame);
+        }
+
+        #[test]
+        fn property_arbitrary_wire_bytes_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..16384)) {
+            let _ = decode_frame(&bytes);
+        }
+
+        #[test]
+        fn property_normalized_absolute_guest_paths_are_accepted(
+            components in prop::collection::vec("[A-Za-z0-9_-]{1,16}", 1..8)
+        ) {
+            let path = format!("/{}", components.join("/"));
+            prop_assert!(validate_guest_path(&path).is_ok());
+            let traversal = format!("{path}/../escape");
+            let empty_component = format!("{path}//child");
+            prop_assert!(validate_guest_path(&traversal).is_err());
+            prop_assert!(validate_guest_path(&empty_component).is_err());
+        }
+    }
 
     #[test]
     fn round_trips_a_frame() {
@@ -450,6 +714,19 @@ mod tests {
         );
         let bytes = encode_frame(&frame).unwrap();
         assert_eq!(&bytes[4..], b"\x08\x01\x12\x07session\x18\x01\x6a\x00");
+    }
+
+    #[test]
+    fn copy_out_request_matches_the_guest_agent_golden_vector() {
+        let message = CopyOutRequest {
+            transfer_id: 7,
+            source: "/workspace/result".into(),
+            max_bytes: 4096,
+        };
+        assert_eq!(
+            message.encode_to_vec(),
+            b"\x08\x07\x12\x11/workspace/result\x18\x80\x20"
+        );
     }
 
     #[test]
@@ -608,5 +885,64 @@ mod tests {
         validator.accept(&eof).unwrap();
         validator.accept(&signal).unwrap();
         validator.accept(&resize).unwrap();
+    }
+
+    #[test]
+    fn validates_copy_transfer_order_and_paths() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let mut frames = FrameSequence::new("session", EXEC_STREAM_ID);
+        let start = frames
+            .next(frame::Payload::CopyInStart(CopyInStart {
+                transfer_id: 7,
+                destination: "/workspace/input".into(),
+                archive_size: 3,
+                sha256: digest,
+            }))
+            .unwrap();
+        let chunk = frames
+            .next(frame::Payload::CopyInChunk(CopyChunk {
+                transfer_id: 7,
+                data: b"tar".to_vec(),
+            }))
+            .unwrap();
+        let end = frames
+            .next(frame::Payload::CopyInEnd(CopyInEnd { transfer_id: 7 }))
+            .unwrap();
+        let request = frames
+            .next(frame::Payload::CopyOutRequest(CopyOutRequest {
+                transfer_id: 8,
+                source: "/workspace/output".into(),
+                max_bytes: 1024,
+            }))
+            .unwrap();
+        let exec = frames
+            .next(frame::Payload::Exec(ExecRequest {
+                argv: vec!["/bin/true".into()],
+                cwd: String::new(),
+                env: Vec::new(),
+                tty: false,
+                rows: 24,
+                cols: 80,
+            }))
+            .unwrap();
+        let mut validator = InboundValidator::new("session", EXEC_STREAM_ID, PeerRole::Host);
+        validator.accept(&start).unwrap();
+        validator.accept(&chunk).unwrap();
+        validator.accept(&end).unwrap();
+        validator.accept(&request).unwrap();
+        validator.accept(&exec).unwrap();
+
+        assert!(matches!(
+            validate_guest_path("/workspace/../host"),
+            Err(ProtocolError::InvalidTransferPath(_))
+        ));
+        let mut validator = InboundValidator::new("session", EXEC_STREAM_ID, PeerRole::Host);
+        validator.accept(&start).unwrap();
+        let mut early_exec = exec.clone();
+        early_exec.sequence = 1;
+        assert!(matches!(
+            validator.accept(&early_exec),
+            Err(ProtocolError::TransferStillOpen)
+        ));
     }
 }

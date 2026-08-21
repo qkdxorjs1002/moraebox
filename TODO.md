@@ -244,9 +244,9 @@
 
 ## P2 — 의도된 기능 확장
 
-> 현재 순차 개선 작업 범위에서 제외한다. 미래 백로그로만 유지한다.
+> 아래 기능 확장은 bounded protocol과 single-use VM 수명주기를 유지한 채 구현했다.
 
-- [ ] `moraebox-protocol`을 bounded versioned vsock host/guest protocol에 실제로 연결한다.
+- [x] `moraebox-protocol`을 bounded versioned vsock host/guest protocol에 실제로 연결한다.
   - exec, streaming I/O, signal, resize, copy-in/out frame과 size/path validation을 포함한다.
   - MCP stdout과 guest protocol diagnostics가 섞이지 않게 한다.
 
@@ -256,18 +256,18 @@
   - lease 소비 후 실행된 VM과 root disk를 재사용하지 않고 파기·보충한다.
   - image pull, template build, workspace import 시간을 warm lease SLO와 분리한다.
 
-- [ ] live PTY resize를 SIGWINCH부터 native controller까지 연결한다.
+- [x] live PTY resize를 SIGWINCH부터 native controller까지 연결한다.
 
-- [ ] read-only workspace 원본을 유지하면서 writable overlay와 bounded copy-out/diff를 제공한다.
+- [x] read-only workspace 원본을 유지하면서 writable overlay와 bounded copy-out/diff를 제공한다.
 
-- [ ] local OCI layout과 Docker archive import를 지원하고 remote registry와 동일한 digest/path 검증을 적용한다.
+- [x] local OCI layout과 Docker archive import를 지원하고 remote registry와 동일한 digest/path 검증을 적용한다.
 
-- [ ] Box에 label/tag, last-used, physical allocation, 정렬·필터와 rename을 제공한다.
+- [x] Box에 label/tag, last-used, physical allocation, 정렬·필터와 rename을 제공한다.
 
-- [ ] Box export/import/backup과 versioned metadata migration을 제공한다.
+- [x] Box export/import/backup과 versioned metadata migration을 제공한다.
   - booted VM snapshot이나 untrusted VM 재사용 기능으로 구현하지 않는다.
 
-- [ ] benchmark를 cold/warm startup, first output, full completion, concurrent throughput, peak RSS, cache hit으로 분리한다.
+- [x] benchmark를 cold/warm startup, first output, full completion, concurrent throughput, peak RSS, cache hit으로 분리한다.
   - build/host/native dependency metadata와 오류 수를 결과에 포함한다.
 
-- [ ] property/fuzz/loom/miri와 성능 회귀 기준을 안전성·동시성 핵심 경로에 단계적으로 추가한다.
+- [x] property/fuzz/loom/miri와 성능 회귀 기준을 안전성·동시성 핵심 경로에 단계적으로 추가한다.

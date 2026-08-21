@@ -5,23 +5,32 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 )
 
 const (
 	protocolVersion = uint64(1)
 	maxFrameSize    = 8 * 1024 * 1024
+	maxTransferSize = uint64(1024 * 1024 * 1024)
 	execStreamID    = uint64(1)
 
-	payloadHello    = 10
-	payloadExec     = 11
-	payloadStdin    = 12
-	payloadStdinEOF = 13
-	payloadResize   = 14
-	payloadSignal   = 15
-	payloadOutput   = 16
-	payloadExit     = 17
-	payloadShutdown = 18
+	payloadHello          = 10
+	payloadExec           = 11
+	payloadStdin          = 12
+	payloadStdinEOF       = 13
+	payloadResize         = 14
+	payloadSignal         = 15
+	payloadOutput         = 16
+	payloadExit           = 17
+	payloadShutdown       = 18
+	payloadCopyInStart    = 19
+	payloadCopyInChunk    = 20
+	payloadCopyInEnd      = 21
+	payloadCopyOutRequest = 22
+	payloadCopyOutStart   = 23
+	payloadCopyOutChunk   = 24
+	payloadCopyOutEnd     = 25
 )
 
 var (
@@ -45,6 +54,24 @@ type execRequest struct {
 	tty  bool
 	rows uint32
 	cols uint32
+}
+
+type copyInStart struct {
+	transferID  uint64
+	destination string
+	archiveSize uint64
+	digest      string
+}
+
+type copyChunk struct {
+	transferID uint64
+	data       []byte
+}
+
+type copyOutRequest struct {
+	transferID uint64
+	source     string
+	maxBytes   uint64
 }
 
 type frameWriter struct {
@@ -141,7 +168,9 @@ func decodeFrame(input []byte) (wireFrame, error) {
 			}
 			frame.sequence = value
 		case payloadHello, payloadExec, payloadStdin, payloadStdinEOF, payloadResize,
-			payloadSignal, payloadOutput, payloadExit, payloadShutdown:
+			payloadSignal, payloadOutput, payloadExit, payloadShutdown, payloadCopyInStart,
+			payloadCopyInChunk, payloadCopyInEnd, payloadCopyOutRequest, payloadCopyOutStart,
+			payloadCopyOutChunk, payloadCopyOutEnd:
 			if wire != 2 || frame.payload != 0 {
 				return wireFrame{}, errMalformedProtobuf
 			}
@@ -153,6 +182,170 @@ func decodeFrame(input []byte) (wireFrame, error) {
 		return wireFrame{}, errMalformedProtobuf
 	}
 	return frame, nil
+}
+
+func decodeCopyInStart(input []byte) (copyInStart, error) {
+	var request copyInStart
+	fields := wireFields{input: input}
+	for fields.more() {
+		field, wire, value, raw, err := fields.next()
+		if err != nil {
+			return copyInStart{}, err
+		}
+		switch field {
+		case 1:
+			if wire != 0 {
+				return copyInStart{}, errMalformedProtobuf
+			}
+			request.transferID = value
+		case 2:
+			if wire != 2 {
+				return copyInStart{}, errMalformedProtobuf
+			}
+			request.destination = string(raw)
+		case 3:
+			if wire != 0 {
+				return copyInStart{}, errMalformedProtobuf
+			}
+			request.archiveSize = value
+		case 4:
+			if wire != 2 {
+				return copyInStart{}, errMalformedProtobuf
+			}
+			request.digest = string(raw)
+		}
+	}
+	if request.transferID == 0 || request.archiveSize == 0 || request.archiveSize > maxTransferSize ||
+		!validGuestPath(request.destination) || !validDigest(request.digest) {
+		return copyInStart{}, errMalformedProtobuf
+	}
+	return request, nil
+}
+
+func decodeCopyChunk(input []byte) (copyChunk, error) {
+	var chunk copyChunk
+	fields := wireFields{input: input}
+	for fields.more() {
+		field, wire, value, raw, err := fields.next()
+		if err != nil {
+			return copyChunk{}, err
+		}
+		switch field {
+		case 1:
+			if wire != 0 {
+				return copyChunk{}, errMalformedProtobuf
+			}
+			chunk.transferID = value
+		case 2:
+			if wire != 2 {
+				return copyChunk{}, errMalformedProtobuf
+			}
+			chunk.data = append([]byte(nil), raw...)
+		}
+	}
+	if chunk.transferID == 0 || len(chunk.data) == 0 {
+		return copyChunk{}, errMalformedProtobuf
+	}
+	return chunk, nil
+}
+
+func decodeTransferID(input []byte) (uint64, error) {
+	fields := wireFields{input: input}
+	for fields.more() {
+		field, wire, value, _, err := fields.next()
+		if err != nil {
+			return 0, err
+		}
+		if field == 1 {
+			if wire != 0 || value == 0 {
+				return 0, errMalformedProtobuf
+			}
+			return value, nil
+		}
+	}
+	return 0, errMalformedProtobuf
+}
+
+func decodeCopyOutRequest(input []byte) (copyOutRequest, error) {
+	var request copyOutRequest
+	fields := wireFields{input: input}
+	for fields.more() {
+		field, wire, value, raw, err := fields.next()
+		if err != nil {
+			return copyOutRequest{}, err
+		}
+		switch field {
+		case 1:
+			if wire != 0 {
+				return copyOutRequest{}, errMalformedProtobuf
+			}
+			request.transferID = value
+		case 2:
+			if wire != 2 {
+				return copyOutRequest{}, errMalformedProtobuf
+			}
+			request.source = string(raw)
+		case 3:
+			if wire != 0 {
+				return copyOutRequest{}, errMalformedProtobuf
+			}
+			request.maxBytes = value
+		}
+	}
+	if request.transferID == 0 || !validGuestPath(request.source) || request.maxBytes == 0 || request.maxBytes > maxTransferSize {
+		return copyOutRequest{}, errMalformedProtobuf
+	}
+	return request, nil
+}
+
+func encodeCopyInStart(id uint64, destination string, size uint64, digest string) []byte {
+	body := appendVarintField(nil, 1, id)
+	body = appendBytesField(body, 2, []byte(destination))
+	body = appendVarintField(body, 3, size)
+	return appendBytesField(body, 4, []byte(digest))
+}
+
+func encodeCopyChunk(id uint64, data []byte) []byte {
+	body := appendVarintField(nil, 1, id)
+	return appendBytesField(body, 2, data)
+}
+
+func encodeTransferID(id uint64) []byte { return appendVarintField(nil, 1, id) }
+
+func encodeCopyOutRequest(id uint64, source string, maxBytes uint64) []byte {
+	body := appendVarintField(nil, 1, id)
+	body = appendBytesField(body, 2, []byte(source))
+	return appendVarintField(body, 3, maxBytes)
+}
+
+func encodeCopyOutEnd(id, total uint64, digest string) []byte {
+	body := appendVarintField(nil, 1, id)
+	body = appendVarintField(body, 2, total)
+	return appendBytesField(body, 3, []byte(digest))
+}
+
+func validGuestPath(value string) bool {
+	if len(value) < 2 || len(value) > 4096 || value[0] != '/' || value == "/" {
+		return false
+	}
+	for _, component := range strings.Split(value[1:], "/") {
+		if component == "" || component == "." || component == ".." {
+			return false
+		}
+	}
+	return !strings.ContainsRune(value, '\x00')
+}
+
+func validDigest(value string) bool {
+	if !strings.HasPrefix(value, "sha256:") || len(value) != 71 {
+		return false
+	}
+	for _, current := range value[7:] {
+		if !(current >= '0' && current <= '9' || current >= 'a' && current <= 'f' || current >= 'A' && current <= 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeExec(input []byte) (execRequest, error) {

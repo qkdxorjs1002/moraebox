@@ -64,3 +64,18 @@ func TestDecodeRejectsDuplicatePayload(t *testing.T) {
 		t.Fatal("duplicate payload was accepted")
 	}
 }
+
+func TestCopyOutRequestRoundTrip(t *testing.T) {
+	body := encodeCopyOutRequest(7, "/workspace/result", 4096)
+	const expected = "080712112f776f726b73706163652f726573756c74188020"
+	if hex.EncodeToString(body) != expected {
+		t.Fatalf("copy-out request = %x, want %s", body, expected)
+	}
+	request, err := decodeCopyOutRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.transferID != 7 || request.source != "/workspace/result" || request.maxBytes != 4096 {
+		t.Fatalf("unexpected copy-out request: %#v", request)
+	}
+}

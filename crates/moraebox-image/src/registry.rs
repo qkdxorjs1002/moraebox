@@ -116,7 +116,7 @@ impl Default for ImagePullLimits {
 
 #[derive(Debug, Clone)]
 pub struct PulledImage {
-    pub reference: RegistryReference,
+    pub reference: String,
     pub source_manifest_digest: Digest,
     pub manifest_digest: Digest,
     pub manifest: ImageManifest,
@@ -385,7 +385,7 @@ impl RegistryClient {
         )
         .await?;
         Ok(PulledImage {
-            reference,
+            reference: reference.to_string(),
             source_manifest_digest,
             manifest_digest,
             manifest,
@@ -859,7 +859,7 @@ async fn read_bounded_response(
     Ok(bytes)
 }
 
-fn platform_matches(actual: Option<&Platform>, expected: &Platform) -> bool {
+pub(crate) fn platform_matches(actual: Option<&Platform>, expected: &Platform) -> bool {
     actual.is_some_and(|actual| {
         actual.os == expected.os
             && actual.architecture == expected.architecture
@@ -901,7 +901,7 @@ fn verify_manifest_descriptor(
     verify_descriptor_size(descriptor, actual_size)
 }
 
-fn validate_manifest_limits(
+pub(crate) fn validate_manifest_limits(
     manifest: &ImageManifest,
     limits: &ImagePullLimits,
 ) -> Result<(), RegistryError> {
@@ -2020,7 +2020,7 @@ mod tests {
             platform: None,
         };
         let image = PulledImage {
-            reference: "example.com/a/b:latest".parse().unwrap(),
+            reference: "example.com/a/b:latest".into(),
             source_manifest_digest: manifest_digest.clone(),
             manifest_digest: manifest_digest.clone(),
             manifest: ImageManifest {

@@ -3,8 +3,10 @@ use std::{env, path::PathBuf, process::Command};
 fn main() {
     println!("cargo:rerun-if-changed=guest-agent/go.mod");
     println!("cargo:rerun-if-changed=guest-agent/main_linux.go");
+    println!("cargo:rerun-if-changed=guest-agent/copy_linux.go");
     println!("cargo:rerun-if-changed=guest-agent/process_linux.go");
     println!("cargo:rerun-if-changed=guest-agent/protocol.go");
+    println!("cargo:rerun-if-changed=guest-agent/workspace_linux.go");
     println!("cargo:rerun-if-env-changed=MORAE_GO");
 
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"))

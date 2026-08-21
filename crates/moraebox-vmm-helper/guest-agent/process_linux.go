@@ -89,18 +89,31 @@ func startProcess(request execRequest, writer *frameWriter) (*guestProcess, erro
 	if err != nil {
 		return nil, err
 	}
-	stdout, err := cmd.StdoutPipe()
+	stdout, stdoutWriter, err := os.Pipe()
 	if err != nil {
+		stdin.Close()
 		return nil, err
 	}
-	stderr, err := cmd.StderrPipe()
+	stderr, stderrWriter, err := os.Pipe()
 	if err != nil {
+		stdin.Close()
+		stdout.Close()
+		stdoutWriter.Close()
 		return nil, err
 	}
+	cmd.Stdout = stdoutWriter
+	cmd.Stderr = stderrWriter
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
 	if err := cmd.Start(); err != nil {
+		stdin.Close()
+		stdout.Close()
+		stdoutWriter.Close()
+		stderr.Close()
+		stderrWriter.Close()
 		return nil, err
 	}
+	stdoutWriter.Close()
+	stderrWriter.Close()
 	process.stdin = stdin
 	process.pipeOutput(stdout, 0)
 	process.pipeOutput(stderr, 1)
@@ -135,6 +148,9 @@ func (p *guestProcess) pipeOutput(reader io.Reader, channel uint64) {
 	p.output.Add(1)
 	go func() {
 		defer p.output.Done()
+		if closer, ok := reader.(io.Closer); ok {
+			defer closer.Close()
+		}
 		buffer := make([]byte, 32*1024)
 		for {
 			count, err := reader.Read(buffer)

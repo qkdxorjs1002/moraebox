@@ -1,0 +1,7 @@
+{
+  "max_failures": 0,
+  "max_first_output_p95_micros": 5000000,
+  "max_full_completion_p95_micros": 5000000,
+  "min_throughput_runs_per_second": 1.0,
+  "max_peak_child_rss_bytes": 1073741824
+}

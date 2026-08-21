@@ -141,6 +141,17 @@ morae image default --unset
 
 Registry manifests and blobs are digest-verified before layers are materialized. Private registries accept an explicit username/password pair through CLI options or `MORAE_REGISTRY_USERNAME` and `MORAE_REGISTRY_PASSWORD`. Bearer token realms must use HTTPS; credentials are sent only to the registry origin, its child auth origins, Docker Hub's token service, or an HTTPS origin explicitly trusted with the Rust SDK's `RegistryClient::with_allowed_credential_realm_origin` builder.
 
+Local sources use explicit schemes and the same digest, size, platform, layer
+diff-ID, and safe archive-path checks as remote pulls:
+
+```sh
+morae image pull oci-layout:/path/to/layout
+morae image pull 'docker-archive:/path/to/image.tar#repo/name:tag'
+```
+
+Docker archives require the exact `repo:tag` selector after `#`; ambiguous
+archives are never selected implicitly.
+
 `--rootfs /path/to/rootfs` is an advanced alternative for an already materialized guest root directory. It bypasses image resolution and is mutually exclusive with `--image`.
 
 ### Continue work with a persistent Box
@@ -162,7 +173,7 @@ morae box delete "$BOX_ID" --yes
 
 Before a writable Box disk is exposed to a guest, moraebox atomically records `Dirty` metadata and flushes both the file and its parent directory. Only a clean helper shutdown returns it to `Ready`. A host crash, timeout, signal, helper failure, or failed spawn leaves it `Dirty`, so the next run executes `e2fsck -p` while holding the Box lease. Successful repair is recorded before the disk can be used again; an unrecoverable filesystem is marked `NeedsRepair` and blocked.
 
-### Attach a read-only workspace
+### Attach a workspace and transfer files
 
 ```sh
 morae run \
@@ -171,6 +182,21 @@ morae run \
 ```
 
 moraebox walks the host tree without following symlinks, rejects unsafe entries, sizes ext4 data and inodes from the scan, creates a read-only snapshot, and attaches it at `/workspace`. It does not expose the original host directory to the VM. Cache and state roots must remain outside the workspace source; overlapping paths are rejected before image preparation.
+
+The opt-in overlay preserves that immutable lower snapshot. Copy results only
+to create-new host destinations, with a per-operation encoded byte bound:
+
+```sh
+morae run --workspace ./my-project --workspace-writable \
+  --workspace-copy-out ./workspace-result \
+  --workspace-diff ./workspace-diff.json \
+  --copy-in ./input.txt=/tmp/input.txt \
+  --copy-out /tmp/output.txt=./output.txt \
+  --copy-limit 64MiB -- /bin/sh -c 'cp /tmp/input.txt /tmp/output.txt'
+```
+
+Copy paths are normalized and reject traversal. A failed or oversized transfer
+does not publish a partial host destination.
 
 ### Use an interactive terminal
 
@@ -187,9 +213,13 @@ morae image pull python:3.12
 morae image list
 morae image remove python:3.12
 
-morae box create --image python:3.12
-morae box list
+morae box create --image python:3.12 --name dev --label team=agents --tag active
+morae box list --label team=agents --tag active --sort last-used --reverse
 morae box show BOX_ID
+morae box rename BOX_ID dev-next
+morae box update BOX_ID --label stage=test --tag reproducible
+morae box export BOX_ID backup.tar
+morae box import backup.tar
 morae box clone BOX_ID --yes
 morae box reset BOX_ID --yes
 morae box delete BOX_ID --yes
@@ -227,11 +257,18 @@ morae benchmark --backend process --iterations 100 -- /usr/bin/true
 For native cached-start qualification, use a command that writes immediately so the report can measure the first guest output as a conservative command-start signal:
 
 ```sh
-morae benchmark --image alpine:latest \
-  --iterations 100 -- /bin/echo ready
+morae benchmark --image alpine:latest --mode cold \
+  --iterations 100 --concurrency 4 -- /bin/echo ready
+morae benchmark --image alpine:latest --mode warm \
+  --iterations 100 --concurrency 4 -- /bin/echo ready
 ```
 
-The JSON report separates immutable-base lookup, Box lock, CoW clone, root preparation, helper spawn, first guest output, and full completion percentiles. Native runs report `mode: "cached-one-shot"`; an explicit process benchmark reports `mode: "host-process"` so host execution cannot be mistaken for microVM performance.
+The JSON report separates cold/warm startup, immutable-base lookup, Box lock,
+CoW clone, root preparation, helper spawn, first guest output, full completion,
+concurrent throughput, errors, cache hits, and peak child RSS. Build and native
+dependency metadata are included. An explicit process benchmark reports
+`mode: "host-process"` so host execution cannot be mistaken for microVM
+performance.
 
 ## Connect a coding agent
 
@@ -268,8 +305,10 @@ The server exposes execution tools plus persistent Box management:
 | `sandbox_session_list` / `sandbox_session_status` | List connection-owned sessions or read one current status without waiting |
 | `sandbox_stop` | Stop a session and wait for cleanup while retaining its record |
 | `sandbox_remove` | Stop if needed and immediately remove retained session status and output |
-| `sandbox_box_create` | Create a persistent Box from an OCI image |
-| `sandbox_box_list` / `sandbox_box_get` | Inspect persistent Box metadata |
+| `sandbox_box_create` | Create a persistent Box from a registry or local image |
+| `sandbox_box_list` / `sandbox_box_get` | Filter, sort, and inspect persistent Box metadata |
+| `sandbox_box_update` | Rename a Box or atomically update labels and tags |
+| `sandbox_box_export` / `sandbox_box_import` | Back up or restore a verified versioned Box bundle under a new ID |
 | `sandbox_box_delete` / `sandbox_box_reset` | Permanently mutate an idle Box with explicit confirmation |
 | `sandbox_box_clone` | Create a new independent durable Box with explicit confirmation |
 
@@ -356,10 +395,10 @@ moraebox does **not** claim to protect against a hostile host user, a compromise
 | Apple Silicon macOS | Native libkrun execution; current release-qualified target |
 | Linux and Windows | Compile-and-test targets; no native release runtime |
 | libkrun stack | Validated with released libkrun 1.19.4 and libkrunfw 5.5.0 |
-| Image sources | Remote OCI registries; local OCI layouts and Docker archives are not imported yet |
+| Image sources | Remote OCI registries, local OCI layouts, and explicitly selected Docker archives |
 | VM reuse | Materialized artifacts may be cached; booted untrusted VMs are never reused |
 | Box persistence | Opt-in full root filesystem persistence; each run still uses a fresh microVM |
-| Workspaces | Read-only snapshots; writable overlays and copy-out/diff are future work |
+| Workspaces | Immutable snapshots with optional disposable writable overlays and bounded copy-out/diff |
 | Interactive I/O | PTY and live terminal resize supported over the bounded control protocol |
 
 This is an early-stage project. Review the boundaries above before using it for security-sensitive workloads.
@@ -397,6 +436,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo deny --all-features --locked check
 ```
+
+Property/fuzz/Loom/Miri commands and the checked-in process performance ceiling
+are documented in [docs/testing.md](docs/testing.md).
 
 CI runs the locked portable quality gate on macOS, Linux, and Windows. A separate Ubuntu job compiles and tests the locked workspace with the declared Rust 1.85 MSRV. The dependency-policy job uses cargo-deny to reject advisories, unapproved licenses, wildcard dependencies, and unknown package sources; duplicate transitive versions remain visible as warnings. Every external GitHub Action is pinned to an immutable commit SHA and retains its release tag in a comment for maintainers. The Apple Silicon macOS job installs the pinned native dependencies and runs the signed real-backend suite; if the runner lacks a required native capability, the job records the exact missing capability and dependency-setup outcome in the GitHub Step Summary. Once the capabilities are present, build, image preparation, doctor, or smoke failures fail the job instead of being reported as skips.
 

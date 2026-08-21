@@ -11,6 +11,7 @@ use moraebox_core::{ImagePullPolicy, StorageRootError, ensure_private_storage_ro
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::local::import_local_image;
 use crate::{
     Cas, Credentials, Digest, ImageManifest, ImageReference, Platform, RegistryClient,
     RegistryError, durability::sync_directory, lock::AdvisoryLock, reference::Selector,
@@ -454,14 +455,18 @@ impl ImageCache {
     {
         let parsed = ImageReference::from_str(reference)
             .map_err(|error| ImageCacheError::InvalidTarget(error.to_string()))?;
-        let ImageReference::Registry(reference) = parsed else {
-            return Err(ImageCacheError::InvalidTarget(reference.into()));
-        };
         let cas = Cas::new(self.root.join("oci"));
         progress(ImageProgressStage::PullImage);
-        let image = RegistryClient::new(credentials)?
-            .pull(reference, platform, &cas)
-            .await?;
+        let image = match parsed {
+            ImageReference::Registry(reference) => {
+                RegistryClient::new(credentials)?
+                    .pull(reference, platform, &cas)
+                    .await?
+            }
+            local => import_local_image(&local, platform, &cas)
+                .await
+                .map_err(|error| ImageCacheError::Local(error.to_string()))?,
+        };
         progress(ImageProgressStage::MaterializeRootfs);
         let staging = StagedRootfs::new(&self.root, &image.manifest_digest);
         let materialize_image = image.clone();
@@ -480,7 +485,7 @@ impl ImageCache {
         .map_err(|error| ImageCacheError::Task(error.to_string()))??;
         self.publish_staged_rootfs(
             staging,
-            &image.reference.to_string(),
+            reference,
             &image.source_manifest_digest,
             &image.manifest_digest,
             platform,
@@ -1317,21 +1322,18 @@ fn validate_record(record: &ImageRecord, path: &Path) -> Result<(), ImageCacheEr
 fn canonical_reference(value: &str) -> Result<String, ImageCacheError> {
     let reference = ImageReference::from_str(value)
         .map_err(|error| ImageCacheError::InvalidTarget(error.to_string()))?;
-    let ImageReference::Registry(reference) = reference else {
-        return Err(ImageCacheError::InvalidTarget(value.into()));
-    };
     Ok(reference.to_string())
 }
 
 fn pinned_source_digest(value: &str) -> Result<Option<Digest>, ImageCacheError> {
     let reference = ImageReference::from_str(value)
         .map_err(|error| ImageCacheError::InvalidTarget(error.to_string()))?;
-    let ImageReference::Registry(reference) = reference else {
-        return Err(ImageCacheError::InvalidTarget(value.into()));
-    };
-    match reference.selector {
-        Selector::Digest(digest) => parse_digest(&digest).map(Some),
-        Selector::Tag(_) => Ok(None),
+    match reference {
+        ImageReference::Registry(reference) => match reference.selector {
+            Selector::Digest(digest) => parse_digest(&digest).map(Some),
+            Selector::Tag(_) => Ok(None),
+        },
+        ImageReference::OciLayout(_) | ImageReference::DockerArchive { .. } => Ok(None),
     }
 }
 
@@ -1403,6 +1405,8 @@ pub enum ImageCacheError {
     CacheOnlyMiss(String),
     #[error("invalid image target: {0}")]
     InvalidTarget(String),
+    #[error("local image import failed: {0}")]
+    Local(String),
     #[error("invalid sha256 digest: {0}")]
     InvalidDigest(String),
     #[error("invalid image cache record: {}", .0.display())]

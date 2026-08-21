@@ -11,8 +11,9 @@ pub use output::{
     OutputBuffer, OutputChannel, OutputChunk, OutputRead, OutputReadError, OutputReadSnapshot,
 };
 pub use spec::{
-    BoxId, DEFAULT_KILL_GRACE, DEFAULT_OUTPUT_LIMIT, DEFAULT_TIMEOUT, ImagePullPolicy,
-    MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, RunSpec, SessionId, Signal, TimeoutPolicy,
+    BoxId, CopyInSpec, CopyOutSpec, DEFAULT_COPY_LIMIT, DEFAULT_KILL_GRACE, DEFAULT_OUTPUT_LIMIT,
+    DEFAULT_TIMEOUT, ImagePullPolicy, MAX_COPY_LIMIT, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, RunSpec,
+    SessionId, Signal, TimeoutPolicy, WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode,
 };
 pub use state::{Lifecycle, LifecycleError, LifecycleEvent, SessionState, TerminationReason};
 pub use storage::{

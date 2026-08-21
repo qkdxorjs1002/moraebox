@@ -6,6 +6,7 @@ mod cache;
 mod cas;
 mod durability;
 mod layer;
+mod local;
 mod lock;
 mod reference;
 mod registry;

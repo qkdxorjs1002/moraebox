@@ -6,7 +6,7 @@ use thiserror::Error;
 pub enum ImageReference {
     Registry(RegistryReference),
     OciLayout(PathBuf),
-    DockerArchive(PathBuf),
+    DockerArchive { path: PathBuf, selector: String },
 }
 
 impl FromStr for ImageReference {
@@ -16,10 +16,34 @@ impl FromStr for ImageReference {
         if let Some(path) = value.strip_prefix("oci-layout:") {
             return non_empty_path(path, "OCI layout").map(Self::OciLayout);
         }
-        if let Some(path) = value.strip_prefix("docker-archive:") {
-            return non_empty_path(path, "Docker archive").map(Self::DockerArchive);
+        if let Some(value) = value.strip_prefix("docker-archive:") {
+            let (path, selector) =
+                value
+                    .rsplit_once('#')
+                    .ok_or_else(|| ReferenceError::InvalidComponent {
+                        kind: "Docker archive selector",
+                        value: value.into(),
+                    })?;
+            let path = non_empty_path(path, "Docker archive")?;
+            validate_docker_selector(selector)?;
+            return Ok(Self::DockerArchive {
+                path,
+                selector: selector.into(),
+            });
         }
         value.parse().map(Self::Registry)
+    }
+}
+
+impl fmt::Display for ImageReference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry(reference) => reference.fmt(formatter),
+            Self::OciLayout(path) => write!(formatter, "oci-layout:{}", path.display()),
+            Self::DockerArchive { path, selector } => {
+                write!(formatter, "docker-archive:{}#{selector}", path.display())
+            }
+        }
     }
 }
 
@@ -175,6 +199,21 @@ fn non_empty_path(value: &str, kind: &'static str) -> Result<PathBuf, ReferenceE
     }
 }
 
+fn validate_docker_selector(value: &str) -> Result<(), ReferenceError> {
+    let last_slash = value.rfind('/');
+    let last_colon = value.rfind(':');
+    let valid_tag = last_colon.is_some_and(|colon| {
+        colon > 0 && colon + 1 < value.len() && last_slash.is_none_or(|slash| colon > slash)
+    });
+    if !valid_tag || value.contains(char::is_whitespace) || value.contains(['#', '@', '\0']) {
+        return Err(ReferenceError::InvalidComponent {
+            kind: "Docker archive selector",
+            value: value.into(),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum ReferenceError {
     #[error("invalid image reference: {0}")]
@@ -210,5 +249,16 @@ mod tests {
             "oci-layout:/tmp/image".parse::<ImageReference>().unwrap(),
             ImageReference::OciLayout(_)
         ));
+        assert!(matches!(
+            "docker-archive:/tmp/image.tar#example/app:v1"
+                .parse::<ImageReference>()
+                .unwrap(),
+            ImageReference::DockerArchive { selector, .. } if selector == "example/app:v1"
+        ));
+        assert!(
+            "docker-archive:/tmp/image.tar"
+                .parse::<ImageReference>()
+                .is_err()
+        );
     }
 }

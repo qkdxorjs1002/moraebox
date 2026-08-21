@@ -10,6 +10,9 @@ pub const MAX_KILL_GRACE: Duration = Duration::from_secs(60);
 pub const MAX_OUTPUT_LIMIT: usize = 1024 * 1024 * 1024;
 pub const DEFAULT_TTY_ROWS: u16 = 24;
 pub const DEFAULT_TTY_COLUMNS: u16 = 80;
+pub const DEFAULT_COPY_LIMIT: u64 = 64 * 1024 * 1024;
+pub const MAX_COPY_LIMIT: u64 = 1024 * 1024 * 1024;
+pub const WORKSPACE_DIFF_GUEST_PATH: &str = "/run/moraebox-workspace/diff.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -138,6 +141,28 @@ pub enum Signal {
     Hangup,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMode {
+    #[default]
+    ReadOnly,
+    Overlay,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CopyInSpec {
+    pub source: PathBuf,
+    pub destination: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CopyOutSpec {
+    pub source: String,
+    pub destination: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSpec {
     pub session_id: SessionId,
@@ -159,6 +184,14 @@ pub struct RunSpec {
     pub tty: bool,
     pub tty_rows: u16,
     pub tty_columns: u16,
+    #[serde(default)]
+    pub copy_in: Vec<CopyInSpec>,
+    #[serde(default)]
+    pub copy_out: Vec<CopyOutSpec>,
+    #[serde(default = "default_copy_limit")]
+    pub copy_limit_bytes: u64,
+    #[serde(default)]
+    pub workspace_mode: WorkspaceMode,
 }
 
 impl RunSpec {
@@ -179,6 +212,10 @@ impl RunSpec {
             tty: false,
             tty_rows: DEFAULT_TTY_ROWS,
             tty_columns: DEFAULT_TTY_COLUMNS,
+            copy_in: Vec::new(),
+            copy_out: Vec::new(),
+            copy_limit_bytes: DEFAULT_COPY_LIMIT,
+            workspace_mode: WorkspaceMode::ReadOnly,
         }
     }
 
@@ -201,8 +238,57 @@ impl RunSpec {
         if self.tty && (self.tty_rows == 0 || self.tty_columns == 0) {
             return Err("PTY rows and columns must be greater than zero");
         }
+        if self.copy_limit_bytes == 0 || self.copy_limit_bytes > MAX_COPY_LIMIT {
+            return Err("copy_limit_bytes must be between 1 byte and 1 GiB");
+        }
+        if self.copy_in.iter().any(|copy| {
+            copy.source.as_os_str().is_empty() || !valid_guest_transfer_path(&copy.destination)
+        }) {
+            return Err("copy-in requires a host source and normalized absolute guest destination");
+        }
+        if self
+            .copy_out
+            .iter()
+            .any(|copy| !valid_guest_transfer_path(&copy.source) || !copy.destination.is_absolute())
+        {
+            return Err(
+                "copy-out requires a normalized absolute guest source and host destination",
+            );
+        }
+        let mut copy_in_destinations = std::collections::BTreeSet::new();
+        if self
+            .copy_in
+            .iter()
+            .any(|copy| !copy_in_destinations.insert(&copy.destination))
+        {
+            return Err("copy-in guest destinations must be unique");
+        }
+        let mut copy_out_destinations = std::collections::BTreeSet::new();
+        if self
+            .copy_out
+            .iter()
+            .any(|copy| !copy_out_destinations.insert(&copy.destination))
+        {
+            return Err("copy-out host destinations must be unique");
+        }
         Ok(())
     }
+}
+
+const fn default_copy_limit() -> u64 {
+    DEFAULT_COPY_LIMIT
+}
+
+fn valid_guest_transfer_path(path: &str) -> bool {
+    path.len() >= 2
+        && path.len() <= 4096
+        && path.starts_with('/')
+        && path != "/"
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .skip(1)
+            .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
 }
 
 mod duration_millis {
@@ -310,5 +396,25 @@ mod tests {
     fn box_id_round_trips_as_a_uuid() {
         let id = BoxId::new();
         assert_eq!(id.to_string().parse::<BoxId>().unwrap(), id);
+    }
+
+    #[test]
+    fn copy_transfers_are_bounded_and_use_normalized_guest_paths() {
+        let mut spec = RunSpec::command(["true"]);
+        spec.copy_in.push(CopyInSpec {
+            source: "/host/input".into(),
+            destination: "/workspace/input".into(),
+        });
+        spec.copy_out.push(CopyOutSpec {
+            source: "/workspace/output".into(),
+            destination: "/host/output".into(),
+        });
+        assert!(spec.validate().is_ok());
+
+        spec.copy_out[0].source = "/workspace/../host".into();
+        assert!(spec.validate().is_err());
+        spec.copy_out[0].source = "/workspace/output".into();
+        spec.copy_limit_bytes = MAX_COPY_LIMIT + 1;
+        assert!(spec.validate().is_err());
     }
 }

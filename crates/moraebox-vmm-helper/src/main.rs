@@ -11,9 +11,9 @@ use std::os::{
     },
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::{CStr, CString, c_char},
-    io,
+    io::{self, Seek as _},
     path::{Path, PathBuf},
     process::ExitCode,
     thread::JoinHandle,
@@ -33,10 +33,13 @@ use clap::Parser;
 use libloading::Library;
 #[cfg(unix)]
 use moraebox_protocol::{
-    EXEC_STREAM_ID, ExecRequest, Exit, Frame, FrameSequence, Hello, InboundValidator,
-    MAX_FRAME_SIZE, Output, PeerRole, ProtocolError, Resize, SignalRequest, Stdin, StdinEof,
-    WireOutputChannel, WireSignal, decode_frame, encode_frame, frame,
+    CopyChunk, CopyInEnd, CopyInStart, CopyOutEnd, CopyOutRequest, EXEC_STREAM_ID, ExecRequest,
+    Exit, Frame, FrameSequence, Hello, InboundValidator, MAX_FRAME_SIZE, MAX_TRANSFER_SIZE, Output,
+    PeerRole, ProtocolError, Resize, SignalRequest, Stdin, StdinEof, WireOutputChannel, WireSignal,
+    decode_frame, encode_frame, frame, validate_guest_path,
 };
+#[cfg(unix)]
+use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
 use tempfile::TempDir;
 use thiserror::Error;
@@ -66,8 +69,18 @@ const GUEST_AGENT_PATH: &str = "/.moraebox-agent";
 #[cfg(unix)]
 const GUEST_AGENT: &[u8] = include_bytes!(env!("MORAE_GUEST_AGENT_PATH"));
 #[cfg(unix)]
-const REQUIRED_AGENT_CAPABILITIES: [&str; 6] =
-    ["exec", "stdin", "signal", "resize", "tty", "output-v1"];
+const REQUIRED_AGENT_CAPABILITIES: [&str; 7] = [
+    "exec",
+    "stdin",
+    "signal",
+    "resize",
+    "tty",
+    "output-v1",
+    "copy-tar-v1",
+];
+const DEFAULT_COPY_LIMIT: u64 = 64 * 1024 * 1024;
+const COPY_CHUNK_SIZE: usize = 64 * 1024;
+const MAX_COPY_ENTRIES: usize = 100_000;
 const DEFAULT_DAX_WINDOW: u64 = 256 * 1024 * 1024;
 const NETWORK_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
 // Released libkrun 1.19.4 ABI constants from libkrun.h.
@@ -102,6 +115,9 @@ struct Args {
     /// Read-only ext4 workspace disk; mounted at /workspace before command execution.
     #[arg(long)]
     workspace_disk: Option<PathBuf>,
+    /// Mount the immutable workspace disk as an overlay lower with a disposable tmpfs upper.
+    #[arg(long, requires = "workspace_disk")]
+    workspace_writable: bool,
     /// gvproxy vfkit Unix datagram endpoint for opt-in guest egress.
     #[arg(long)]
     network_socket: Option<PathBuf>,
@@ -116,6 +132,21 @@ struct Args {
     tty_cols: u16,
     #[arg(long = "env", value_parser = parse_env)]
     env: Vec<(String, String)>,
+    /// Host source to archive and copy into the guest before execution.
+    #[arg(long = "copy-in-source", requires = "root_disk")]
+    copy_in_sources: Vec<PathBuf>,
+    /// Absolute guest destination paired with --copy-in-source by position.
+    #[arg(long = "copy-in-destination", requires = "root_disk")]
+    copy_in_destinations: Vec<String>,
+    /// Absolute guest source to archive after execution.
+    #[arg(long = "copy-out-source", requires = "root_disk")]
+    copy_out_sources: Vec<String>,
+    /// Host destination paired with --copy-out-source by position.
+    #[arg(long = "copy-out-destination", requires = "root_disk")]
+    copy_out_destinations: Vec<PathBuf>,
+    /// Maximum encoded bytes for each copy operation.
+    #[arg(long, default_value_t = DEFAULT_COPY_LIMIT)]
+    copy_limit_bytes: u64,
     #[arg(required = true, last = true)]
     command: Vec<String>,
 }
@@ -148,12 +179,17 @@ fn run(args: Args) -> Result<i32, HelperError> {
             "terminal rows and columns must be non-zero",
         ));
     }
+    let transfers = validate_copy_arguments(&args)?;
     if let Some(parent_pid) = args.parent_pid {
         spawn_parent_watchdog(parent_pid);
     }
 
     let effective_command = if args.workspace_disk.is_some() {
-        workspace_command(&args.command, args.root_disk.is_some())
+        workspace_command(
+            &args.command,
+            args.root_disk.is_some(),
+            args.workspace_writable,
+        )
     } else {
         args.command.clone()
     };
@@ -278,6 +314,9 @@ fn run(args: Args) -> Result<i32, HelperError> {
                 tty: args.tty,
                 rows: args.tty_rows,
                 cols: args.tty_cols,
+                copy_in: transfers.copy_in,
+                copy_out: transfers.copy_out,
+                copy_limit: args.copy_limit_bytes,
             })
         })
         .transpose()?;
@@ -564,11 +603,31 @@ struct BridgeRequest {
     tty: bool,
     rows: u16,
     cols: u16,
+    copy_in: Vec<CopyInMapping>,
+    copy_out: Vec<CopyOutMapping>,
+    copy_limit: u64,
+}
+
+#[derive(Debug)]
+struct CopyInMapping {
+    source: PathBuf,
+    destination: String,
+}
+
+#[derive(Debug)]
+struct CopyOutMapping {
+    source: String,
+    destination: PathBuf,
+}
+
+struct ValidatedTransfers {
+    copy_in: Vec<CopyInMapping>,
+    copy_out: Vec<CopyOutMapping>,
 }
 
 #[cfg(unix)]
 struct ControlEndpoint {
-    _directory: TempDir,
+    directory: TempDir,
     listener: UnixListener,
     socket_path: PathBuf,
 }
@@ -583,7 +642,7 @@ impl ControlEndpoint {
         let socket_path = directory.path().join("control.sock");
         let listener = UnixListener::bind(&socket_path)?;
         Ok(Self {
-            _directory: directory,
+            directory,
             listener,
             socket_path,
         })
@@ -618,6 +677,31 @@ impl ControlEndpoint {
         };
         validate_agent_hello(hello)?;
 
+        let mut next_transfer_id = 1_u64;
+        for mapping in &request.copy_in {
+            let transfer_id = take_transfer_id(&mut next_transfer_id)?;
+            send_copy_in(
+                &sender,
+                transfer_id,
+                mapping,
+                request.copy_limit,
+                self.directory.path(),
+            )?;
+        }
+        let mut pending_copy_out = BTreeMap::new();
+        for mapping in request.copy_out {
+            let transfer_id = take_transfer_id(&mut next_transfer_id)?;
+            send_host_frame(
+                &sender,
+                frame::Payload::CopyOutRequest(CopyOutRequest {
+                    transfer_id,
+                    source: mapping.source.clone(),
+                    max_bytes: request.copy_limit,
+                }),
+            )?;
+            pending_copy_out.insert(transfer_id, mapping);
+        }
+
         send_host_frame(
             &sender,
             frame::Payload::Exec(ExecRequest {
@@ -632,12 +716,42 @@ impl ControlEndpoint {
         spawn_stdin_forwarder(Arc::clone(&sender))?;
         spawn_signal_forwarder(Arc::clone(&sender), signals, request.tty)?;
 
+        let mut active_copy_out = None;
         loop {
             let frame = read_protocol_frame(&mut reader)?;
             validator.accept(&frame)?;
             match frame.payload.expect("validated frame contains a payload") {
                 frame::Payload::Output(output) => write_guest_output(&output)?,
-                frame::Payload::Exit(exit) => return protocol_exit_code(&exit),
+                frame::Payload::CopyOutStart(start) => {
+                    if active_copy_out.is_some() {
+                        return Err(BridgeError::UnexpectedGuestPayload);
+                    }
+                    let mapping = pending_copy_out
+                        .remove(&start.transfer_id)
+                        .ok_or(BridgeError::UnexpectedCopyTransfer(start.transfer_id))?;
+                    active_copy_out = Some(ReceivedCopy::new(
+                        start.transfer_id,
+                        mapping,
+                        request.copy_limit,
+                        self.directory.path(),
+                    )?);
+                }
+                frame::Payload::CopyOutChunk(chunk) => active_copy_out
+                    .as_mut()
+                    .ok_or(BridgeError::UnexpectedGuestPayload)?
+                    .append(&chunk)?,
+                frame::Payload::CopyOutEnd(end) => {
+                    let received = active_copy_out
+                        .take()
+                        .ok_or(BridgeError::UnexpectedGuestPayload)?;
+                    received.finish(&end)?;
+                }
+                frame::Payload::Exit(exit) => {
+                    if active_copy_out.is_some() || !pending_copy_out.is_empty() {
+                        return Err(BridgeError::IncompleteCopyOut);
+                    }
+                    return protocol_exit_code(&exit);
+                }
                 frame::Payload::Shutdown(shutdown) => {
                     return Err(BridgeError::AgentShutdown(shutdown.reason));
                 }
@@ -804,6 +918,395 @@ fn send_host_frame(
         .lock()
         .map_err(|_| BridgeError::SenderPoisoned)?
         .send(payload)
+}
+
+#[cfg(unix)]
+fn take_transfer_id(next: &mut u64) -> Result<u64, BridgeError> {
+    let current = *next;
+    *next = next
+        .checked_add(1)
+        .ok_or(BridgeError::TransferIdsExhausted)?;
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn send_copy_in(
+    sender: &Arc<Mutex<HostSender>>,
+    transfer_id: u64,
+    mapping: &CopyInMapping,
+    limit: u64,
+    staging: &Path,
+) -> Result<(), BridgeError> {
+    let mut archive = build_copy_archive(&mapping.source, limit, staging)?;
+    send_host_frame(
+        sender,
+        frame::Payload::CopyInStart(CopyInStart {
+            transfer_id,
+            destination: mapping.destination.clone(),
+            archive_size: archive.size,
+            sha256: archive.digest.clone(),
+        }),
+    )?;
+    let mut buffer = vec![0_u8; COPY_CHUNK_SIZE];
+    loop {
+        let count = archive.file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        send_host_frame(
+            sender,
+            frame::Payload::CopyInChunk(CopyChunk {
+                transfer_id,
+                data: buffer[..count].to_vec(),
+            }),
+        )?;
+    }
+    send_host_frame(sender, frame::Payload::CopyInEnd(CopyInEnd { transfer_id }))
+}
+
+#[cfg(unix)]
+struct PreparedCopy {
+    file: tempfile::NamedTempFile,
+    size: u64,
+    digest: String,
+}
+
+#[cfg(unix)]
+struct BoundedArchiveWriter<'a> {
+    file: &'a mut File,
+    hasher: Sha256,
+    written: u64,
+    limit: u64,
+}
+
+#[cfg(unix)]
+impl io::Write for BoundedArchiveWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let count = u64::try_from(bytes.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "copy archive chunk is too large",
+            )
+        })?;
+        if self
+            .written
+            .checked_add(count)
+            .is_none_or(|size| size > self.limit)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "copy archive exceeds its byte limit",
+            ));
+        }
+        let written = self.file.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        self.written += u64::try_from(written).expect("usize fits u64 on supported hosts");
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+#[cfg(unix)]
+fn build_copy_archive(
+    source: &Path,
+    limit: u64,
+    staging: &Path,
+) -> Result<PreparedCopy, BridgeError> {
+    let mut file = tempfile::NamedTempFile::new_in(staging)?;
+    let (size, digest) = {
+        let mut writer = BoundedArchiveWriter {
+            file: file.as_file_mut(),
+            hasher: Sha256::new(),
+            written: 0,
+            limit,
+        };
+        {
+            let mut builder = tar::Builder::new(&mut writer);
+            let mut entries = 0_usize;
+            append_copy_entry(&mut builder, source, Path::new("root"), &mut entries)?;
+            builder.finish()?;
+        }
+        writer.flush()?;
+        (
+            writer.written,
+            format!("sha256:{:x}", writer.hasher.finalize()),
+        )
+    };
+    file.as_file_mut().seek(io::SeekFrom::Start(0))?;
+    Ok(PreparedCopy { file, size, digest })
+}
+
+#[cfg(unix)]
+fn append_copy_entry<W: io::Write>(
+    builder: &mut tar::Builder<W>,
+    source: &Path,
+    name: &Path,
+    entries: &mut usize,
+) -> Result<(), BridgeError> {
+    *entries = entries
+        .checked_add(1)
+        .ok_or(BridgeError::TooManyCopyEntries)?;
+    if *entries > MAX_COPY_ENTRIES {
+        return Err(BridgeError::TooManyCopyEntries);
+    }
+    let metadata = fs::symlink_metadata(source)?;
+    let kind = metadata.file_type();
+    let mut header = tar::Header::new_gnu();
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mode(metadata.permissions().mode() & 0o777);
+    header.set_mtime(0);
+    if metadata.is_file() {
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(metadata.len());
+        header.set_cksum();
+        let mut input = File::open(source)?;
+        builder.append_data(&mut header, name, &mut input)?;
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_cksum();
+        builder.append_data(&mut header, name, io::empty())?;
+        let mut children = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
+        children.sort_by_key(std::fs::DirEntry::file_name);
+        for child in children {
+            append_copy_entry(
+                builder,
+                &child.path(),
+                &name.join(child.file_name()),
+                entries,
+            )?;
+        }
+        return Ok(());
+    }
+    if kind.is_symlink() {
+        let target = fs::read_link(source)?;
+        if !valid_archive_symlink(name, &target) {
+            return Err(BridgeError::UnsafeCopyArchive(format!(
+                "symlink {} escapes the copied root",
+                source.display()
+            )));
+        }
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_link_name(target)?;
+        header.set_cksum();
+        builder.append_data(&mut header, name, io::empty())?;
+        return Ok(());
+    }
+    Err(BridgeError::UnsafeCopyArchive(format!(
+        "unsupported file type at {}",
+        source.display()
+    )))
+}
+
+#[cfg(unix)]
+struct ReceivedCopy {
+    transfer_id: u64,
+    mapping: CopyOutMapping,
+    file: tempfile::NamedTempFile,
+    hasher: Sha256,
+    received: u64,
+    limit: u64,
+}
+
+#[cfg(unix)]
+impl ReceivedCopy {
+    fn new(
+        transfer_id: u64,
+        mapping: CopyOutMapping,
+        limit: u64,
+        staging: &Path,
+    ) -> Result<Self, BridgeError> {
+        Ok(Self {
+            transfer_id,
+            mapping,
+            file: tempfile::NamedTempFile::new_in(staging)?,
+            hasher: Sha256::new(),
+            received: 0,
+            limit,
+        })
+    }
+
+    fn append(&mut self, chunk: &CopyChunk) -> Result<(), BridgeError> {
+        if chunk.transfer_id != self.transfer_id {
+            return Err(BridgeError::UnexpectedCopyTransfer(chunk.transfer_id));
+        }
+        let count = u64::try_from(chunk.data.len())
+            .map_err(|_| BridgeError::CopyLimitExceeded(self.limit))?;
+        let next = self
+            .received
+            .checked_add(count)
+            .filter(|size| *size <= self.limit)
+            .ok_or(BridgeError::CopyLimitExceeded(self.limit))?;
+        self.file.write_all(&chunk.data)?;
+        self.hasher.update(&chunk.data);
+        self.received = next;
+        Ok(())
+    }
+
+    fn finish(mut self, end: &CopyOutEnd) -> Result<(), BridgeError> {
+        if end.transfer_id != self.transfer_id {
+            return Err(BridgeError::UnexpectedCopyTransfer(end.transfer_id));
+        }
+        if end.total_bytes != self.received {
+            return Err(BridgeError::CopySizeMismatch {
+                expected: end.total_bytes,
+                actual: self.received,
+            });
+        }
+        let digest = format!("sha256:{:x}", self.hasher.finalize());
+        if !digest.eq_ignore_ascii_case(&end.sha256) {
+            return Err(BridgeError::CopyDigestMismatch);
+        }
+        self.file.as_file_mut().seek(io::SeekFrom::Start(0))?;
+        extract_copy_archive(self.file.as_file_mut(), &self.mapping.destination)
+    }
+}
+
+#[cfg(unix)]
+fn extract_copy_archive<R: io::Read>(
+    reader: &mut R,
+    destination: &Path,
+) -> Result<(), BridgeError> {
+    if fs::symlink_metadata(destination).is_ok() {
+        return Err(BridgeError::CopyDestinationExists(
+            destination.to_path_buf(),
+        ));
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        BridgeError::UnsafeCopyArchive("copy-out destination has no parent".into())
+    })?;
+    fs::create_dir_all(parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".morae-copy-")
+        .tempdir_in(parent)?;
+    let mut archive = tar::Archive::new(reader);
+    let mut directories = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut count = 0_usize;
+    for entry in archive.entries()? {
+        count = count
+            .checked_add(1)
+            .ok_or(BridgeError::TooManyCopyEntries)?;
+        if count > MAX_COPY_ENTRIES {
+            return Err(BridgeError::TooManyCopyEntries);
+        }
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if !valid_archive_path(&path) || !seen.insert(path.clone()) {
+            return Err(BridgeError::UnsafeCopyArchive(format!(
+                "invalid or duplicate path {}",
+                path.display()
+            )));
+        }
+        let target = staging.path().join(&path);
+        ensure_real_directory_path(staging.path(), target.parent().expect("entry has parent"))?;
+        let mode = entry.header().mode()? & 0o777;
+        let kind = entry.header().entry_type();
+        if kind.is_dir() {
+            fs::create_dir(&target)?;
+            directories.push((target, mode));
+        } else if kind.is_file() {
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)?;
+            io::copy(&mut entry, &mut output)?;
+            fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
+        } else if kind.is_symlink() {
+            let link = entry
+                .link_name()?
+                .ok_or_else(|| BridgeError::UnsafeCopyArchive("symlink has no target".into()))?;
+            if !valid_archive_symlink(&path, &link) {
+                return Err(BridgeError::UnsafeCopyArchive(format!(
+                    "symlink {} escapes the copied root",
+                    path.display()
+                )));
+            }
+            std::os::unix::fs::symlink(link, target)?;
+        } else {
+            return Err(BridgeError::UnsafeCopyArchive(format!(
+                "unsupported tar entry type {}",
+                kind.as_byte()
+            )));
+        }
+    }
+    let root = staging.path().join("root");
+    if fs::symlink_metadata(&root).is_err() {
+        return Err(BridgeError::UnsafeCopyArchive(
+            "archive is missing its root entry".into(),
+        ));
+    }
+    for (directory, mode) in directories.into_iter().rev() {
+        fs::set_permissions(directory, fs::Permissions::from_mode(mode))?;
+    }
+    fs::rename(root, destination)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn valid_archive_path(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(components.next(), Some(std::path::Component::Normal(root)) if root == "root")
+        && components.all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+#[cfg(unix)]
+fn valid_archive_symlink(name: &Path, target: &Path) -> bool {
+    if target.as_os_str().is_empty() || target.is_absolute() {
+        return false;
+    }
+    let mut resolved = name
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_os_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for component in target.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(value) => resolved.push(value.to_os_string()),
+            std::path::Component::ParentDir if !resolved.is_empty() => {
+                resolved.pop();
+            }
+            _ => return false,
+        }
+    }
+    resolved
+        .first()
+        .is_some_and(|component| component == "root")
+}
+
+#[cfg(unix)]
+fn ensure_real_directory_path(root: &Path, directory: &Path) -> Result<(), BridgeError> {
+    let relative = directory.strip_prefix(root).map_err(|_| {
+        BridgeError::UnsafeCopyArchive("archive path escapes its staging directory".into())
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(BridgeError::UnsafeCopyArchive(
+                "archive parent path is not normalized".into(),
+            ));
+        };
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(BridgeError::UnsafeCopyArchive(
+                "archive parent is not a real directory".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1035,6 +1538,24 @@ enum BridgeError {
     AgentShutdown(String),
     #[error("protocol sender lock was poisoned")]
     SenderPoisoned,
+    #[error("protocol transfer id space is exhausted")]
+    TransferIdsExhausted,
+    #[error("guest used unexpected copy transfer id {0}")]
+    UnexpectedCopyTransfer(u64),
+    #[error("guest exited before every copy-out completed")]
+    IncompleteCopyOut,
+    #[error("copy transfer exceeded its {0}-byte limit")]
+    CopyLimitExceeded(u64),
+    #[error("copy transfer size mismatch: expected {expected}, received {actual}")]
+    CopySizeMismatch { expected: u64, actual: u64 },
+    #[error("copy transfer sha256 digest does not match")]
+    CopyDigestMismatch,
+    #[error("copy archive contains more than {MAX_COPY_ENTRIES} entries")]
+    TooManyCopyEntries,
+    #[error("unsafe copy archive: {0}")]
+    UnsafeCopyArchive(String),
+    #[error("copy-out destination already exists: {}", .0.display())]
+    CopyDestinationExists(PathBuf),
 }
 
 struct ContextGuard {
@@ -1118,14 +1639,109 @@ fn parse_env(input: &str) -> Result<(String, String), String> {
     Ok((key.to_owned(), value.to_owned()))
 }
 
-fn workspace_command(command: &[String], block_root: bool) -> Vec<String> {
+#[cfg(unix)]
+fn validate_copy_arguments(args: &Args) -> Result<ValidatedTransfers, HelperError> {
+    if args.copy_in_sources.len() != args.copy_in_destinations.len() {
+        return Err(HelperError::InvalidCopy(
+            "--copy-in-source and --copy-in-destination counts differ".into(),
+        ));
+    }
+    if args.copy_out_sources.len() != args.copy_out_destinations.len() {
+        return Err(HelperError::InvalidCopy(
+            "--copy-out-source and --copy-out-destination counts differ".into(),
+        ));
+    }
+    if args.copy_limit_bytes == 0 || args.copy_limit_bytes > MAX_TRANSFER_SIZE {
+        return Err(HelperError::InvalidCopy(format!(
+            "--copy-limit-bytes must be in 1..={MAX_TRANSFER_SIZE}"
+        )));
+    }
+    let mut guest_destinations = BTreeSet::new();
+    let mut copy_in = Vec::with_capacity(args.copy_in_sources.len());
+    for (source, destination) in args.copy_in_sources.iter().zip(&args.copy_in_destinations) {
+        validate_guest_path(destination)
+            .map_err(|error| HelperError::InvalidCopy(error.to_string()))?;
+        if !guest_destinations.insert(destination.clone()) {
+            return Err(HelperError::InvalidCopy(format!(
+                "duplicate guest copy-in destination {destination:?}"
+            )));
+        }
+        let metadata = fs::symlink_metadata(source).map_err(|error| {
+            HelperError::InvalidCopy(format!("cannot inspect {}: {error}", source.display()))
+        })?;
+        if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+            return Err(HelperError::InvalidCopy(format!(
+                "copy-in source must be a regular file or directory: {}",
+                source.display()
+            )));
+        }
+        copy_in.push(CopyInMapping {
+            source: source.clone(),
+            destination: destination.clone(),
+        });
+    }
+    let mut host_destinations = BTreeSet::new();
+    let mut copy_out = Vec::with_capacity(args.copy_out_sources.len());
+    for (source, destination) in args
+        .copy_out_sources
+        .iter()
+        .zip(&args.copy_out_destinations)
+    {
+        validate_guest_path(source).map_err(|error| HelperError::InvalidCopy(error.to_string()))?;
+        if !destination.is_absolute() {
+            return Err(HelperError::InvalidCopy(format!(
+                "copy-out destination must be absolute: {}",
+                destination.display()
+            )));
+        }
+        if !host_destinations.insert(destination.clone()) {
+            return Err(HelperError::InvalidCopy(format!(
+                "duplicate host copy-out destination {}",
+                destination.display()
+            )));
+        }
+        if fs::symlink_metadata(destination).is_ok() {
+            return Err(HelperError::InvalidCopy(format!(
+                "copy-out destination already exists: {}",
+                destination.display()
+            )));
+        }
+        copy_out.push(CopyOutMapping {
+            source: source.clone(),
+            destination: destination.clone(),
+        });
+    }
+    Ok(ValidatedTransfers { copy_in, copy_out })
+}
+
+#[cfg(not(unix))]
+fn validate_copy_arguments(args: &Args) -> Result<ValidatedTransfers, HelperError> {
+    if !args.copy_in_sources.is_empty() || !args.copy_out_sources.is_empty() {
+        return Err(HelperError::Unsupported(
+            "copy transfer requires a Unix host",
+        ));
+    }
+    Ok(ValidatedTransfers {
+        copy_in: Vec::new(),
+        copy_out: Vec::new(),
+    })
+}
+
+fn workspace_command(command: &[String], block_root: bool, writable: bool) -> Vec<String> {
     let device = if block_root { "/dev/vdb" } else { "/dev/vda" };
+    let setup = if writable {
+        format!(
+            "mkdir -p /workspace.lower /workspace /run/moraebox-workspace && mount -t ext4 -o ro {device} /workspace.lower && mount -t tmpfs -o mode=0700,nosuid,nodev tmpfs /run/moraebox-workspace && mkdir -p /run/moraebox-workspace/upper /run/moraebox-workspace/work && mount -t overlay overlay -o lowerdir=/workspace.lower,upperdir=/run/moraebox-workspace/upper,workdir=/run/moraebox-workspace/work /workspace && cd /workspace && exec \"$@\""
+        )
+    } else {
+        format!(
+            "mkdir -p /workspace && mount -t ext4 -o ro {device} /workspace && cd /workspace && exec \"$@\""
+        )
+    };
     let mut wrapped = vec![
         "/bin/sh".into(),
         "-c".into(),
-        format!(
-            "mkdir -p /workspace && mount -t ext4 -o ro {device} /workspace && cd /workspace && exec \"$@\""
-        ),
+        setup,
         "moraebox-workspace".into(),
     ];
     wrapped.extend_from_slice(command);
@@ -1162,6 +1778,8 @@ fn exit_code(code: i32) -> ExitCode {
 enum HelperError {
     #[error("invalid helper request: {0}")]
     Invalid(&'static str),
+    #[error("invalid copy request: {0}")]
+    InvalidCopy(String),
     #[error("libkrun has neither krun_set_root nor krun_add_virtiofs3")]
     MissingRootApi,
     #[error("libkrun does not provide krun_add_disk required for workspace isolation")]
@@ -1307,7 +1925,7 @@ mod tests {
 
     #[test]
     fn workspace_wrapper_preserves_argv() {
-        let wrapped = workspace_command(&["/bin/echo".into(), "hello".into()], false);
+        let wrapped = workspace_command(&["/bin/echo".into(), "hello".into()], false, false);
         assert_eq!(&wrapped[4..], ["/bin/echo", "hello"]);
         assert!(wrapped[2].contains("-o ro"));
         assert!(wrapped[2].contains("/dev/vda"));
@@ -1315,8 +1933,17 @@ mod tests {
 
     #[test]
     fn workspace_uses_the_second_disk_with_a_block_root() {
-        let wrapped = workspace_command(&["/bin/true".into()], true);
+        let wrapped = workspace_command(&["/bin/true".into()], true, false);
         assert!(wrapped[2].contains("/dev/vdb"));
+    }
+
+    #[test]
+    fn writable_workspace_uses_an_immutable_lower_and_disposable_upper() {
+        let wrapped = workspace_command(&["/bin/true".into()], true, true);
+        assert!(wrapped[2].contains("mount -t ext4 -o ro /dev/vdb /workspace.lower"));
+        assert!(wrapped[2].contains("mount -t tmpfs"));
+        assert!(wrapped[2].contains("lowerdir=/workspace.lower"));
+        assert!(wrapped[2].contains("upperdir=/run/moraebox-workspace/upper"));
     }
 
     static ROOT_DISK_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1556,5 +2183,70 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_archive_round_trips_without_following_links() {
+        let state = tempfile::tempdir().unwrap();
+        let source = state.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("value"), b"hello").unwrap();
+        std::os::unix::fs::symlink("value", source.join("link")).unwrap();
+        let staging = state.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        let mut archive = build_copy_archive(&source, 1024 * 1024, &staging).unwrap();
+        assert!(archive.size > 0);
+        assert!(archive.digest.starts_with("sha256:"));
+
+        let destination = state.path().join("destination");
+        extract_copy_archive(archive.file.as_file_mut(), &destination).unwrap();
+
+        assert_eq!(fs::read(destination.join("value")).unwrap(), b"hello");
+        assert_eq!(
+            fs::read_link(destination.join("link")).unwrap(),
+            Path::new("value")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_archive_rejects_traversal_and_escaping_links() {
+        assert!(valid_archive_symlink(
+            Path::new("root/directory/link"),
+            Path::new("../value")
+        ));
+        assert!(!valid_archive_symlink(
+            Path::new("root/link"),
+            Path::new("../../outside")
+        ));
+        assert!(!valid_archive_symlink(
+            Path::new("root"),
+            Path::new("outside")
+        ));
+
+        let mut encoded = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut encoded);
+            let mut root = tar::Header::new_gnu();
+            root.set_entry_type(tar::EntryType::Directory);
+            root.set_mode(0o755);
+            root.set_size(0);
+            root.set_cksum();
+            builder.append_data(&mut root, "root", io::empty()).unwrap();
+            let mut bad = tar::Header::new_gnu();
+            bad.set_entry_type(tar::EntryType::Regular);
+            bad.set_mode(0o600);
+            bad.set_size(0);
+            let name = b"root/../../escape";
+            bad.as_mut_bytes()[..name.len()].copy_from_slice(name);
+            bad.set_cksum();
+            builder.append(&bad, io::empty()).unwrap();
+            builder.finish().unwrap();
+        }
+        let state = tempfile::tempdir().unwrap();
+        let mut encoded = encoded.as_slice();
+        assert!(extract_copy_archive(&mut encoded, &state.path().join("destination")).is_err());
+        assert!(!state.path().join("escape").exists());
     }
 }

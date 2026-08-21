@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    cmp::Ordering as CmpOrdering,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -17,20 +19,28 @@ use moraebox_core::{BoxId, StorageRootError, ensure_private_storage_root};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod bundle;
 mod disk;
 
 use disk::copy_disk;
 
+pub use bundle::{BOX_BUNDLE_SCHEMA_VERSION, BoxBundleReport};
 pub use disk::{
     BASE_DISK_LAYOUT_VERSION, BaseDisk, BaseDiskMetadata, BaseDiskSpec, BaseDiskStore,
     DEFAULT_BOX_DISK_SIZE_BYTES, EphemeralDisk, EphemeralDiskStore, EphemeralGcReport,
 };
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
+const LEGACY_SCHEMA_VERSION: u32 = 1;
 const BOXES_DIRECTORY: &str = "boxes";
 const METADATA_FILE: &str = "metadata.json";
 const ROOT_DISK_FILE: &str = "root.ext4";
 const LOCK_FILE: &str = ".lock";
+const METADATA_LOCK_FILE: &str = ".metadata.lock";
+const MAX_NAME_CHARS: usize = 64;
+const MAX_LABEL_KEY_CHARS: usize = 63;
+const MAX_LABEL_VALUE_CHARS: usize = 256;
+const MAX_TAG_CHARS: usize = 63;
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub const DEFAULT_GC_MIN_AGE: Duration = Duration::from_secs(60 * 60);
 
@@ -73,6 +83,81 @@ pub struct BoxMetadata {
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     pub owner_uid: Option<u32>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub tags: BTreeSet<String>,
+    #[serde(default)]
+    pub last_used_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub physical_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoxSortBy {
+    Name,
+    Created,
+    Updated,
+    LastUsed,
+    PhysicalSize,
+    VirtualSize,
+    #[default]
+    Id,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoxQuery {
+    pub name: Option<String>,
+    pub labels: BTreeMap<String, Option<String>>,
+    pub tags: BTreeSet<String>,
+    pub state: Option<BoxState>,
+    pub sort_by: BoxSortBy,
+    pub descending: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateBox {
+    pub name: Option<String>,
+    pub clear_name: bool,
+    pub set_labels: BTreeMap<String, String>,
+    pub remove_labels: BTreeSet<String>,
+    pub add_tags: BTreeSet<String>,
+    pub remove_tags: BTreeSet<String>,
+}
+
+impl BoxQuery {
+    fn matches(&self, metadata: &BoxMetadata) -> bool {
+        self.name.as_deref().is_none_or(|name| {
+            metadata
+                .name
+                .as_deref()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+        }) && self.state.is_none_or(|state| metadata.state == state)
+            && self.labels.iter().all(|(key, value)| {
+                metadata
+                    .labels
+                    .get(key)
+                    .is_some_and(|candidate| value.as_ref().is_none_or(|value| candidate == value))
+            })
+            && self.tags.iter().all(|tag| metadata.tags.contains(tag))
+    }
+}
+
+impl BoxSortBy {
+    fn compare(self, left: &BoxMetadata, right: &BoxMetadata) -> CmpOrdering {
+        match self {
+            Self::Name => left.name.cmp(&right.name),
+            Self::Created => left.created_at_unix_ms.cmp(&right.created_at_unix_ms),
+            Self::Updated => left.updated_at_unix_ms.cmp(&right.updated_at_unix_ms),
+            Self::LastUsed => left.last_used_at_unix_ms.cmp(&right.last_used_at_unix_ms),
+            Self::PhysicalSize => left.physical_size_bytes.cmp(&right.physical_size_bytes),
+            Self::VirtualSize => left.virtual_size_bytes.cmp(&right.virtual_size_bytes),
+            Self::Id => CmpOrdering::Equal,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +207,9 @@ pub struct CreateBox {
     pub manifest_digest: String,
     pub platform: String,
     pub virtual_size_bytes: u64,
+    pub name: Option<String>,
+    pub labels: BTreeMap<String, String>,
+    pub tags: BTreeSet<String>,
 }
 
 impl CreateBox {
@@ -134,7 +222,28 @@ impl CreateBox {
             manifest_digest: manifest_digest.into(),
             platform: platform.into(),
             virtual_size_bytes,
+            name: None,
+            labels: BTreeMap::new(),
+            tags: BTreeSet::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_labels(mut self, labels: BTreeMap<String, String>) -> Self {
+        self.labels = labels;
+        self
+    }
+
+    #[must_use]
+    pub fn with_tags(mut self, tags: BTreeSet<String>) -> Self {
+        self.tags = tags;
+        self
     }
 
     fn validate(&self) -> Result<(), BoxStoreError> {
@@ -153,6 +262,9 @@ impl CreateBox {
                 "virtual disk size must be greater than zero".into(),
             ));
         }
+        validate_optional_name(self.name.as_deref())?;
+        validate_labels(&self.labels)?;
+        validate_tags(&self.tags)?;
         Ok(())
     }
 }
@@ -167,7 +279,7 @@ pub struct BoxLease {
     lock_file: File,
     directory: PathBuf,
     disk_path: PathBuf,
-    metadata: BoxMetadata,
+    metadata: Box<BoxMetadata>,
 }
 
 impl BoxLease {
@@ -218,6 +330,8 @@ impl BoxStore {
         secure_directory(&self.state_root)?;
         let boxes = self.boxes_directory();
         secure_directory(&boxes)?;
+        let _metadata_lock = self.lock_metadata_index()?;
+        self.ensure_unique_name(request.name.as_deref(), None)?;
 
         loop {
             let box_id = BoxId::new();
@@ -231,11 +345,31 @@ impl BoxStore {
 
     pub fn get(&self, box_id: BoxId) -> Result<BoxMetadata, BoxStoreError> {
         let paths = self.checked_paths(box_id)?;
-        read_metadata(&paths.metadata, box_id)
+        let (metadata, migrated) = read_metadata(&paths.metadata, box_id)?;
+        if migrated {
+            return Self::migrate_metadata_if_idle(&paths, metadata);
+        }
+        Ok(metadata)
     }
 
     pub fn list(&self) -> Result<BoxListReport, BoxStoreError> {
-        Ok(self.scan()?.report)
+        self.list_with(&BoxQuery::default())
+    }
+
+    pub fn list_with(&self, query: &BoxQuery) -> Result<BoxListReport, BoxStoreError> {
+        validate_query(query)?;
+        let mut report = self.scan()?.report;
+        report.boxes.retain(|metadata| query.matches(metadata));
+        report.boxes.sort_by(|left, right| {
+            query
+                .sort_by
+                .compare(left, right)
+                .then_with(|| left.box_id.to_string().cmp(&right.box_id.to_string()))
+        });
+        if query.descending {
+            report.boxes.reverse();
+        }
+        Ok(report)
     }
 
     pub fn repair(&self, apply: bool) -> Result<BoxRepairReport, BoxStoreError> {
@@ -446,7 +580,10 @@ impl BoxStore {
         set_file_permissions(&paths.lock)?;
         FileExt::try_lock_exclusive(&lock_file)
             .map_err(|source| BoxStoreError::Busy { box_id, source })?;
-        let metadata = read_metadata(&paths.metadata, box_id)?;
+        let (metadata, migrated) = read_metadata(&paths.metadata, box_id)?;
+        if migrated {
+            write_json_atomic(&paths.metadata, &metadata)?;
+        }
         if metadata.state == BoxState::NeedsRepair {
             return Err(BoxStoreError::NeedsRepair(box_id));
         }
@@ -455,28 +592,28 @@ impl BoxStore {
             lock_file,
             directory: paths.directory,
             disk_path: paths.disk,
-            metadata,
+            metadata: Box::new(metadata),
         })
     }
 
     /// Durably records that a writable Box is about to be exposed to a guest.
     pub fn begin_writable_use(&self, lease: &mut BoxLease) -> Result<(), BoxStoreError> {
-        self.transition_state(lease, BoxState::Ready, BoxState::Dirty)
+        self.transition_state(lease, BoxState::Ready, BoxState::Dirty, true)
     }
 
     /// Durably records that the helper completed a clean writable Box run.
     pub fn finish_clean_use(&self, lease: &mut BoxLease) -> Result<(), BoxStoreError> {
-        self.transition_state(lease, BoxState::Dirty, BoxState::Ready)
+        self.transition_state(lease, BoxState::Dirty, BoxState::Ready, false)
     }
 
     /// Durably records that `e2fsck` successfully recovered a dirty Box.
     pub fn finish_repair(&self, lease: &mut BoxLease) -> Result<(), BoxStoreError> {
-        self.transition_state(lease, BoxState::Dirty, BoxState::Ready)
+        self.transition_state(lease, BoxState::Dirty, BoxState::Ready, false)
     }
 
     /// Durably blocks a dirty Box after `e2fsck` could not repair it.
     pub fn mark_needs_repair(&self, lease: &mut BoxLease) -> Result<(), BoxStoreError> {
-        self.transition_state(lease, BoxState::Dirty, BoxState::NeedsRepair)
+        self.transition_state(lease, BoxState::Dirty, BoxState::NeedsRepair, false)
     }
 
     fn transition_state(
@@ -484,6 +621,7 @@ impl BoxStore {
         lease: &mut BoxLease,
         expected: BoxState,
         state: BoxState,
+        mark_used: bool,
     ) -> Result<(), BoxStoreError> {
         let expected_directory = self.box_directory(lease.id());
         if lease.directory != expected_directory {
@@ -499,18 +637,22 @@ impl BoxStore {
                 next: state,
             });
         }
-        let mut next_metadata = lease.metadata.clone();
+        let mut next_metadata = (*lease.metadata).clone();
+        let now = now_unix_millis()?;
         next_metadata.state = state;
-        next_metadata.updated_at_unix_ms = now_unix_millis()?;
+        next_metadata.updated_at_unix_ms = now;
+        if mark_used {
+            next_metadata.last_used_at_unix_ms = Some(now);
+        }
         let metadata = lease.directory.join(METADATA_FILE);
         write_json_atomic(&metadata, &next_metadata)?;
-        lease.metadata = next_metadata;
+        *lease.metadata = next_metadata;
         Ok(())
     }
 
     pub fn delete(&self, box_id: BoxId) -> Result<BoxMetadata, BoxStoreError> {
         let lease = self.try_acquire(box_id)?;
-        let metadata = lease.metadata.clone();
+        let metadata = (*lease.metadata).clone();
         let tombstone = self.temporary_path("deleted", box_id);
         fs::rename(&lease.directory, &tombstone)?;
         drop(lease);
@@ -536,9 +678,10 @@ impl BoxStore {
         fs::rename(&replacement, &lease.disk_path)?;
         lease.metadata.generation = lease.metadata.generation.saturating_add(1);
         lease.metadata.state = BoxState::Ready;
+        lease.metadata.physical_size_bytes = allocated_size_bytes(&lease.disk_path)?;
         lease.metadata.updated_at_unix_ms = now_unix_millis()?;
         write_json_atomic(&lease.directory.join(METADATA_FILE), &lease.metadata)?;
-        Ok(lease.metadata.clone())
+        Ok((*lease.metadata).clone())
     }
 
     pub fn clone_box(&self, source_id: BoxId) -> Result<BoxMetadata, BoxStoreError> {
@@ -547,8 +690,49 @@ impl BoxStore {
             source.metadata.manifest_digest.clone(),
             source.metadata.platform.clone(),
             source.metadata.virtual_size_bytes,
-        );
+        )
+        .with_labels(source.metadata.labels.clone())
+        .with_tags(source.metadata.tags.clone());
         self.create(&request, source.disk_path())
+    }
+
+    pub fn rename(
+        &self,
+        box_id: BoxId,
+        name: impl Into<String>,
+    ) -> Result<BoxMetadata, BoxStoreError> {
+        self.update(
+            box_id,
+            &UpdateBox {
+                name: Some(name.into()),
+                ..UpdateBox::default()
+            },
+        )
+    }
+
+    pub fn update(&self, box_id: BoxId, update: &UpdateBox) -> Result<BoxMetadata, BoxStoreError> {
+        validate_update(update)?;
+        self.ensure_root()?;
+        secure_directory(&self.boxes_directory())?;
+        let _metadata_lock = self.lock_metadata_index()?;
+        self.ensure_unique_name(update.name.as_deref(), Some(box_id))?;
+        let mut lease = self.try_acquire(box_id)?;
+        if update.clear_name {
+            lease.metadata.name = None;
+        } else if let Some(name) = &update.name {
+            lease.metadata.name = Some(name.clone());
+        }
+        for key in &update.remove_labels {
+            lease.metadata.labels.remove(key);
+        }
+        lease.metadata.labels.extend(update.set_labels.clone());
+        for tag in &update.remove_tags {
+            lease.metadata.tags.remove(tag);
+        }
+        lease.metadata.tags.extend(update.add_tags.iter().cloned());
+        lease.metadata.updated_at_unix_ms = now_unix_millis()?;
+        write_json_atomic(&lease.directory.join(METADATA_FILE), &lease.metadata)?;
+        Ok((*lease.metadata).clone())
     }
 
     fn create_with_id(
@@ -587,6 +771,11 @@ impl BoxStore {
                 created_at_unix_ms: now,
                 updated_at_unix_ms: now,
                 owner_uid: owner_uid(&staging)?,
+                name: request.name.clone(),
+                labels: request.labels.clone(),
+                tags: request.tags.clone(),
+                last_used_at_unix_ms: None,
+                physical_size_bytes: allocated_size_bytes(&disk)?,
             };
             write_json_atomic(&staging.join(METADATA_FILE), &metadata)?;
             lock_file.sync_all()?;
@@ -636,6 +825,80 @@ impl BoxStore {
     fn ensure_root(&self) -> Result<(), BoxStoreError> {
         ensure_private_storage_root(&self.state_root)?;
         Ok(())
+    }
+
+    fn lock_metadata_index(&self) -> Result<File, BoxStoreError> {
+        let path = self.boxes_directory().join(METADATA_LOCK_FILE);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        set_file_permissions(&path)?;
+        FileExt::lock_exclusive(&lock)?;
+        Ok(lock)
+    }
+
+    fn ensure_unique_name(
+        &self,
+        name: Option<&str>,
+        except: Option<BoxId>,
+    ) -> Result<(), BoxStoreError> {
+        let Some(name) = name else {
+            return Ok(());
+        };
+        for entry in fs::read_dir(self.boxes_directory())? {
+            let entry = entry?;
+            let Some(entry_name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(box_id) = BoxId::from_str(&entry_name) else {
+                continue;
+            };
+            if Some(box_id) == except {
+                continue;
+            }
+            let path = entry.path().join(METADATA_FILE);
+            let Ok((metadata, _)) = read_metadata(&path, box_id) else {
+                continue;
+            };
+            if metadata
+                .name
+                .as_deref()
+                .is_some_and(|existing| existing.eq_ignore_ascii_case(name))
+            {
+                return Err(BoxStoreError::NameConflict(name.into()));
+            }
+        }
+        Ok(())
+    }
+
+    fn migrate_metadata_if_idle(
+        paths: &BoxPaths,
+        fallback: BoxMetadata,
+    ) -> Result<BoxMetadata, BoxStoreError> {
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&paths.lock)?;
+        set_file_permissions(&paths.lock)?;
+        match FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => {
+                let (metadata, migrated) = read_metadata(&paths.metadata, fallback.box_id)?;
+                if migrated {
+                    write_json_atomic(&paths.metadata, &metadata)?;
+                }
+                Ok(metadata)
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(fallback),
+            Err(source) => Err(BoxStoreError::Busy {
+                box_id: fallback.box_id,
+                source,
+            }),
+        }
     }
 }
 
@@ -688,7 +951,9 @@ impl BoxEntryError {
         let code = match error {
             BoxStoreError::Busy { .. } => BoxEntryErrorCode::Busy,
             BoxStoreError::UnsupportedSchema { .. } => BoxEntryErrorCode::UnsupportedSchema,
-            BoxStoreError::InvalidMetadata(_) => BoxEntryErrorCode::InvalidMetadata,
+            BoxStoreError::InvalidMetadata(_)
+            | BoxStoreError::InvalidBundle(_)
+            | BoxStoreError::NameConflict(_) => BoxEntryErrorCode::InvalidMetadata,
             BoxStoreError::UnsafeFileType { .. } | BoxStoreError::InvalidPath(_) => {
                 BoxEntryErrorCode::UnsafeFileType
             }
@@ -836,17 +1101,24 @@ fn is_atomic_metadata_temporary_name(name: &str) -> bool {
     parts.next().is_none() && process_id.parse::<u32>().is_ok() && sequence.parse::<u64>().is_ok()
 }
 
-fn read_metadata(path: &Path, expected_id: BoxId) -> Result<BoxMetadata, BoxStoreError> {
+fn read_metadata(path: &Path, expected_id: BoxId) -> Result<(BoxMetadata, bool), BoxStoreError> {
     let bytes = fs::read(path)?;
-    let value: BoxMetadata = serde_json::from_slice(&bytes).map_err(|source| {
+    let mut value: BoxMetadata = serde_json::from_slice(&bytes).map_err(|source| {
         BoxStoreError::InvalidMetadata(format!("{}: {source}", path.display()))
     })?;
-    if value.schema_version != SCHEMA_VERSION {
-        return Err(BoxStoreError::UnsupportedSchema {
-            expected: SCHEMA_VERSION,
-            actual: value.schema_version,
-        });
-    }
+    let migrated = match value.schema_version {
+        SCHEMA_VERSION => false,
+        LEGACY_SCHEMA_VERSION => {
+            value.schema_version = SCHEMA_VERSION;
+            true
+        }
+        actual => {
+            return Err(BoxStoreError::UnsupportedSchema {
+                expected: SCHEMA_VERSION,
+                actual,
+            });
+        }
+    };
     if value.box_id != expected_id {
         return Err(BoxStoreError::CorruptStore(format!(
             "metadata at {} belongs to box {} instead of {expected_id}",
@@ -863,7 +1135,130 @@ fn read_metadata(path: &Path, expected_id: BoxId) -> Result<BoxMetadata, BoxStor
             path.display()
         )));
     }
-    Ok(value)
+    validate_optional_name(value.name.as_deref())?;
+    validate_labels(&value.labels)?;
+    validate_tags(&value.tags)?;
+    let disk = path
+        .parent()
+        .ok_or_else(|| BoxStoreError::InvalidPath(path.into()))?
+        .join(ROOT_DISK_FILE);
+    let disk_size = fs::metadata(&disk)?.len();
+    if disk_size != value.virtual_size_bytes {
+        return Err(BoxStoreError::CorruptStore(format!(
+            "root disk size {disk_size} does not match metadata virtual size {} for Box {expected_id}",
+            value.virtual_size_bytes
+        )));
+    }
+    value.physical_size_bytes = allocated_size_bytes(&disk)?;
+    Ok((value, migrated))
+}
+
+fn validate_query(query: &BoxQuery) -> Result<(), BoxStoreError> {
+    validate_optional_name(query.name.as_deref())?;
+    for (key, value) in &query.labels {
+        validate_label_key(key)?;
+        if let Some(value) = value {
+            validate_label_value(value)?;
+        }
+    }
+    validate_tags(&query.tags)
+}
+
+fn validate_update(update: &UpdateBox) -> Result<(), BoxStoreError> {
+    if update.name.is_some() && update.clear_name {
+        return Err(BoxStoreError::InvalidMetadata(
+            "name and clear_name cannot be used together".into(),
+        ));
+    }
+    validate_optional_name(update.name.as_deref())?;
+    validate_labels(&update.set_labels)?;
+    for key in &update.remove_labels {
+        validate_label_key(key)?;
+        if update.set_labels.contains_key(key) {
+            return Err(BoxStoreError::InvalidMetadata(format!(
+                "label {key} cannot be set and removed in one update"
+            )));
+        }
+    }
+    validate_tags(&update.add_tags)?;
+    validate_tags(&update.remove_tags)?;
+    if let Some(tag) = update.add_tags.intersection(&update.remove_tags).next() {
+        return Err(BoxStoreError::InvalidMetadata(format!(
+            "tag {tag} cannot be added and removed in one update"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_name(name: Option<&str>) -> Result<(), BoxStoreError> {
+    let Some(name) = name else {
+        return Ok(());
+    };
+    validate_identifier("box name", name, MAX_NAME_CHARS, false)
+}
+
+fn validate_labels(labels: &BTreeMap<String, String>) -> Result<(), BoxStoreError> {
+    for (key, value) in labels {
+        validate_label_key(key)?;
+        validate_label_value(value)?;
+    }
+    Ok(())
+}
+
+fn validate_label_key(key: &str) -> Result<(), BoxStoreError> {
+    validate_identifier("label key", key, MAX_LABEL_KEY_CHARS, true)
+}
+
+fn validate_label_value(value: &str) -> Result<(), BoxStoreError> {
+    if value.chars().count() > MAX_LABEL_VALUE_CHARS
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(BoxStoreError::InvalidMetadata(format!(
+            "label value must contain at most {MAX_LABEL_VALUE_CHARS} non-control characters without surrounding whitespace"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_tags(tags: &BTreeSet<String>) -> Result<(), BoxStoreError> {
+    for tag in tags {
+        validate_identifier("tag", tag, MAX_TAG_CHARS, false)?;
+    }
+    Ok(())
+}
+
+fn validate_identifier(
+    label: &str,
+    value: &str,
+    max_chars: usize,
+    allow_slash: bool,
+) -> Result<(), BoxStoreError> {
+    let valid = !value.is_empty()
+        && value.chars().count() <= max_chars
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'-')
+                || (allow_slash && byte == b'/')
+        });
+    if !valid {
+        return Err(BoxStoreError::InvalidMetadata(format!(
+            "{label} must be 1-{max_chars} ASCII alphanumeric, '.', '_', '-'{} characters",
+            if allow_slash { ", or '/'" } else { "" }
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn allocated_size_bytes(path: &Path) -> Result<u64, BoxStoreError> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(fs::metadata(path)?.blocks().saturating_mul(512))
+}
+
+#[cfg(not(unix))]
+fn allocated_size_bytes(path: &Path) -> Result<u64, BoxStoreError> {
+    Ok(fs::metadata(path)?.len())
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), BoxStoreError> {
@@ -994,6 +1389,8 @@ pub enum BoxStoreError {
     },
     #[error("box requires repair before it can run: {0}")]
     NeedsRepair(BoxId),
+    #[error("box name is already in use: {0}")]
+    NameConflict(String),
     #[error(
         "invalid state transition for Box {box_id}: expected {expected:?}, found {actual:?}, cannot transition to {next:?}"
     )]
@@ -1019,6 +1416,8 @@ pub enum BoxStoreError {
     UnsupportedSchema { expected: u32, actual: u32 },
     #[error("invalid box metadata: {0}")]
     InvalidMetadata(String),
+    #[error("invalid Box bundle: {0}")]
+    InvalidBundle(String),
     #[error("corrupt box store: {0}")]
     CorruptStore(String),
     #[error("unsafe {label} file type at {}", path.display())]
@@ -1040,8 +1439,55 @@ pub enum BoxStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     const DISK_BYTES: u64 = 1024 * 1024;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn property_v1_metadata_migration_preserves_identity_fields(
+            digest_suffix in "[a-f0-9]{1,32}",
+            architecture in "[a-z0-9_]{1,12}",
+            generation in any::<u16>(),
+        ) {
+            let temporary = tempfile::tempdir().unwrap();
+            let box_id = BoxId::new();
+            let directory = temporary.path().join(box_id.to_string());
+            fs::create_dir(&directory).unwrap();
+            File::create(directory.join(ROOT_DISK_FILE))
+                .unwrap()
+                .set_len(4096)
+                .unwrap();
+            let metadata_path = directory.join(METADATA_FILE);
+            let manifest_digest = format!("sha256:{digest_suffix}");
+            let platform = format!("linux/{architecture}");
+            fs::write(
+                &metadata_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 1,
+                    "box_id": box_id,
+                    "state": "ready",
+                    "manifest_digest": manifest_digest,
+                    "platform": platform,
+                    "disk_format": "raw_ext4",
+                    "virtual_size_bytes": 4096,
+                    "generation": generation,
+                    "created_at_unix_ms": 1,
+                    "updated_at_unix_ms": 2,
+                    "owner_uid": null
+                })).unwrap(),
+            ).unwrap();
+
+            let (migrated, changed) = read_metadata(&metadata_path, box_id).unwrap();
+            prop_assert!(changed);
+            prop_assert_eq!(migrated.schema_version, SCHEMA_VERSION);
+            prop_assert_eq!(migrated.manifest_digest, manifest_digest);
+            prop_assert_eq!(migrated.platform, platform);
+            prop_assert_eq!(migrated.generation, u64::from(generation));
+        }
+    }
 
     struct Fixture {
         temporary: tempfile::TempDir,
@@ -1083,6 +1529,8 @@ mod tests {
         assert_eq!(loaded.state, BoxState::Ready);
         assert_eq!(loaded.disk_format, BoxDiskFormat::RawExt4);
         assert_eq!(loaded.generation, 0);
+        assert_eq!(loaded.schema_version, 2);
+        assert!(loaded.physical_size_bytes <= loaded.virtual_size_bytes);
         assert_eq!(
             fs::metadata(
                 fixture
@@ -1093,6 +1541,174 @@ mod tests {
             .unwrap()
             .len(),
             DISK_BYTES
+        );
+    }
+
+    #[test]
+    fn lazily_migrates_v1_metadata_without_losing_fields() {
+        let fixture = Fixture::new();
+        let created = fixture.create();
+        let path = fixture
+            .store
+            .box_directory(created.box_id)
+            .join(METADATA_FILE);
+        let mut legacy = serde_json::to_value(&created).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.insert("schema_version".into(), serde_json::json!(1));
+        for field in [
+            "name",
+            "labels",
+            "tags",
+            "last_used_at_unix_ms",
+            "physical_size_bytes",
+        ] {
+            object.remove(field);
+        }
+        fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let migrated = fixture.store.get(created.box_id).unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+
+        assert_eq!(migrated.schema_version, 2);
+        assert_eq!(migrated.manifest_digest, created.manifest_digest);
+        assert_eq!(persisted["schema_version"], 2);
+        assert_eq!(persisted["labels"], serde_json::json!({}));
+        assert_eq!(persisted["tags"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn updates_names_labels_and_tags_atomically_and_rejects_collisions() {
+        let fixture = Fixture::new();
+        let first = fixture
+            .store
+            .create(
+                &CreateBox::new("sha256:abc", "linux/arm64", DISK_BYTES).with_name("alpha"),
+                &fixture.base,
+            )
+            .unwrap();
+        let second = fixture.create();
+        assert!(matches!(
+            fixture.store.rename(second.box_id, "ALPHA"),
+            Err(BoxStoreError::NameConflict(name)) if name == "ALPHA"
+        ));
+
+        let updated = fixture
+            .store
+            .update(
+                first.box_id,
+                &UpdateBox {
+                    name: Some("renamed".into()),
+                    set_labels: BTreeMap::from([("team/name".into(), "runtime".into())]),
+                    add_tags: BTreeSet::from(["warm".into()]),
+                    ..UpdateBox::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.name.as_deref(), Some("renamed"));
+        assert_eq!(updated.labels["team/name"], "runtime");
+        assert!(updated.tags.contains("warm"));
+
+        let _lease = fixture.store.try_acquire(first.box_id).unwrap();
+        assert!(matches!(
+            fixture.store.rename(first.box_id, "busy"),
+            Err(BoxStoreError::Busy { box_id, .. }) if box_id == first.box_id
+        ));
+        assert_eq!(
+            fixture.store.get(first.box_id).unwrap().name.as_deref(),
+            Some("renamed")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_labels_and_conflicting_updates() {
+        let fixture = Fixture::new();
+        let request = CreateBox::new("sha256:abc", "linux/arm64", DISK_BYTES)
+            .with_labels(BTreeMap::from([("bad label".into(), "value".into())]));
+        assert!(matches!(
+            fixture.store.create(&request, &fixture.base),
+            Err(BoxStoreError::InvalidMetadata(_))
+        ));
+
+        let created = fixture.create();
+        assert!(matches!(
+            fixture.store.update(
+                created.box_id,
+                &UpdateBox {
+                    set_labels: BTreeMap::from([("team".into(), "one".into())]),
+                    remove_labels: BTreeSet::from(["team".into()]),
+                    ..UpdateBox::default()
+                }
+            ),
+            Err(BoxStoreError::InvalidMetadata(_))
+        ));
+    }
+
+    #[test]
+    fn filters_and_sorts_boxes_deterministically() {
+        let fixture = Fixture::new();
+        let zebra = fixture
+            .store
+            .create(
+                &CreateBox::new("sha256:z", "linux/arm64", DISK_BYTES)
+                    .with_name("zebra")
+                    .with_labels(BTreeMap::from([("team".into(), "core".into())]))
+                    .with_tags(BTreeSet::from(["hot".into()])),
+                &fixture.base,
+            )
+            .unwrap();
+        let alpha = fixture
+            .store
+            .create(
+                &CreateBox::new("sha256:a", "linux/arm64", DISK_BYTES)
+                    .with_name("alpha")
+                    .with_labels(BTreeMap::from([("team".into(), "core".into())]))
+                    .with_tags(BTreeSet::from(["hot".into()])),
+                &fixture.base,
+            )
+            .unwrap();
+        fixture.create();
+
+        let report = fixture
+            .store
+            .list_with(&BoxQuery {
+                labels: BTreeMap::from([("team".into(), Some("core".into()))]),
+                tags: BTreeSet::from(["hot".into()]),
+                sort_by: BoxSortBy::Name,
+                ..BoxQuery::default()
+            })
+            .unwrap();
+
+        assert_eq!(
+            report
+                .boxes
+                .iter()
+                .map(|metadata| metadata.box_id)
+                .collect::<Vec<_>>(),
+            [alpha.box_id, zebra.box_id]
+        );
+    }
+
+    #[test]
+    fn writable_use_records_last_used_and_reports_sparse_allocation() {
+        let fixture = Fixture::new();
+        let created = fixture.create();
+        assert!(created.last_used_at_unix_ms.is_none());
+        assert!(created.physical_size_bytes <= created.virtual_size_bytes);
+
+        let mut lease = fixture.store.try_acquire(created.box_id).unwrap();
+        fixture.store.begin_writable_use(&mut lease).unwrap();
+        assert!(lease.metadata().last_used_at_unix_ms.is_some());
+        fixture.store.finish_clean_use(&mut lease).unwrap();
+        drop(lease);
+
+        assert!(
+            fixture
+                .store
+                .get(created.box_id)
+                .unwrap()
+                .last_used_at_unix_ms
+                .is_some()
         );
     }
 

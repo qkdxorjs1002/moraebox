@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use moraebox_box::{
     BaseDisk, BaseDiskSpec, BaseDiskStore, BoxState, BoxStore, EphemeralDisk, EphemeralDiskStore,
 };
-use moraebox_core::{OutputChannel, RunSpec, SessionId, Signal};
+use moraebox_core::{OutputChannel, RunSpec, SessionId, Signal, WorkspaceMode};
 use tokio::{
     process::{Child, Command},
     time::Instant,
@@ -209,6 +209,7 @@ impl LibkrunBackend {
         network: CapabilitySupport::Supported,
         box_persistence: CapabilitySupport::Supported,
         workspace: CapabilitySupport::Supported,
+        file_transfer: CapabilitySupport::Supported,
     };
 }
 
@@ -271,6 +272,19 @@ impl Backend for LibkrunBackend {
         if spec.box_id.is_some() && self.box_runtime.is_none() {
             return Err(BackendError::Control(
                 "run requested a BoxId but no Box store is configured".into(),
+            ));
+        }
+        if (!spec.copy_in.is_empty() || !spec.copy_out.is_empty())
+            && self.box_runtime.is_none()
+            && self.config.root_disk.is_none()
+        {
+            return Err(BackendError::Unsupported(
+                "copy-in/out with a directory root; use a managed or explicit root disk",
+            ));
+        }
+        if spec.workspace_mode == WorkspaceMode::Overlay && self.config.workspace_disk.is_none() {
+            return Err(BackendError::Unsupported(
+                "writable workspace overlay without an immutable workspace disk",
             ));
         }
         let environment = resolve_environment(spec)?;
@@ -345,9 +359,31 @@ impl Backend for LibkrunBackend {
         }
         if let Some(workspace) = &self.config.workspace_disk {
             command.arg("--workspace-disk").arg(workspace);
+            if spec.workspace_mode == WorkspaceMode::Overlay {
+                command.arg("--workspace-writable");
+            }
         }
         if let Some(proxy) = &network_proxy {
             command.arg("--network-socket").arg(&proxy.socket_path);
+        }
+        for copy in &spec.copy_in {
+            command
+                .arg("--copy-in-source")
+                .arg(&copy.source)
+                .arg("--copy-in-destination")
+                .arg(&copy.destination);
+        }
+        for copy in &spec.copy_out {
+            command
+                .arg("--copy-out-source")
+                .arg(&copy.source)
+                .arg("--copy-out-destination")
+                .arg(&copy.destination);
+        }
+        if !spec.copy_in.is_empty() || !spec.copy_out.is_empty() {
+            command
+                .arg("--copy-limit-bytes")
+                .arg(spec.copy_limit_bytes.to_string());
         }
         for (key, value) in environment {
             command.arg("--env").arg(format!("{key}={value}"));
@@ -1046,6 +1082,73 @@ mod tests {
         assert!(output.contains(debugfs.to_str().unwrap()));
         assert!(output.contains("--session-id"));
         assert!(!output.contains("--root\n"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn passes_bounded_copy_requests_to_the_protocol_helper() {
+        let state = tempfile::tempdir().unwrap();
+        let helper = state.path().join("helper");
+        let library = state.path().join("libkrun");
+        let root_disk = state.path().join("root.ext4");
+        let debugfs = state.path().join("debugfs");
+        let workspace = state.path().join("workspace.ext4");
+        let source = state.path().join("input");
+        let destination = state.path().join("output");
+        write_executable(&helper, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+        write_executable(&debugfs, "#!/bin/sh\nexit 0\n");
+        fs::write(&library, []).unwrap();
+        fs::write(&root_disk, []).unwrap();
+        fs::write(&workspace, []).unwrap();
+        fs::write(&source, b"input").unwrap();
+        let mut config = LibkrunConfig::new(&helper, &library, state.path().join("unused"))
+            .with_root_disk(&root_disk);
+        config.debugfs_path = debugfs;
+        config.workspace_disk = Some(workspace.clone());
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.copy_in.push(moraebox_core::CopyInSpec {
+            source: source.clone(),
+            destination: "/workspace/input".into(),
+        });
+        spec.copy_out.push(moraebox_core::CopyOutSpec {
+            source: "/workspace/output".into(),
+            destination: destination.clone(),
+        });
+        spec.copy_limit_bytes = 4096;
+        spec.workspace_mode = WorkspaceMode::Overlay;
+
+        let report = crate::Supervisor::new(LibkrunBackend::new(config))
+            .run(spec)
+            .await
+            .unwrap();
+        let output = String::from_utf8(
+            report
+                .output
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect(),
+        )
+        .unwrap();
+        for expected in [
+            "--copy-in-source",
+            source.to_str().unwrap(),
+            "--copy-in-destination",
+            "/workspace/input",
+            "--copy-out-source",
+            "/workspace/output",
+            "--copy-out-destination",
+            destination.to_str().unwrap(),
+            "--copy-limit-bytes",
+            "4096",
+            "--workspace-disk",
+            workspace.to_str().unwrap(),
+            "--workspace-writable",
+        ] {
+            assert!(
+                output.lines().any(|line| line == expected),
+                "missing {expected}"
+            );
+        }
     }
 
     #[cfg(unix)]

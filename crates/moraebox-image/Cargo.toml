@@ -13,15 +13,18 @@ futures-util.workspace = true
 httpdate.workspace = true
 moraebox-core = { path = "../moraebox-core", version = "0.1.0" }
 reqwest.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 tempfile.workspace = true
 
 [lints]

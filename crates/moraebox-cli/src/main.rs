@@ -10,15 +10,16 @@ use std::{
     time::Duration,
 };
 
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use moraebox_box::{
-    BaseDiskSpec, BaseDiskStore, BoxMetadata, BoxRepairReport, BoxStore, CreateBox,
+    BaseDiskSpec, BaseDiskStore, BoxMetadata, BoxQuery, BoxRepairReport, BoxSortBy, BoxState,
+    BoxStore, CreateBox, UpdateBox,
 };
 use moraebox_core::{
-    BoxId, ImagePullPolicy, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, OutputChannel, OutputReadError,
-    RunSpec, SessionState, Signal, StoragePaths, TimeoutPolicy, resolve_cache_dir,
-    resolve_state_dir,
+    BoxId, CopyInSpec, CopyOutSpec, ImagePullPolicy, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT,
+    OutputChannel, OutputReadError, RunSpec, SessionState, Signal, StoragePaths, TimeoutPolicy,
+    WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode, resolve_cache_dir, resolve_state_dir,
 };
 use moraebox_image::{
     CacheReconcileReport, CacheUsage, CachedImage, CleanReport, Credentials, ImageCache,
@@ -39,7 +40,9 @@ mod errors;
 mod interactive;
 
 use commands::{
-    execute, exit_code, parse_disk_size, parse_env, parse_kill_grace, parse_output_limit,
+    execute, exit_code, parse_box_label, parse_box_label_filter, parse_box_label_key,
+    parse_box_name, parse_box_tag, parse_copy_in, parse_copy_out, parse_disk_size, parse_env,
+    parse_kill_grace, parse_output_limit,
 };
 use errors::{CliError, CliErrorSource};
 use interactive::run_interactive;
@@ -161,6 +164,15 @@ enum BoxCommand {
     Reset(BoxResetArgs),
     /// Clone one idle Box into a new independent Box.
     Clone(BoxCloneArgs),
+    /// Assign a unique display name to one idle Box.
+    Rename(BoxRenameArgs),
+    /// Add or remove labels and tags on one idle Box.
+    Update(BoxUpdateArgs),
+    /// Export an idle Box as a verified sparse tar bundle.
+    #[command(visible_alias = "backup")]
+    Export(BoxExportArgs),
+    /// Verify a Box bundle and restore it under a new `BoxId`.
+    Import(BoxImportArgs),
     /// Preview or quarantine corrupt Box entries without deleting their data.
     #[command(visible_alias = "quarantine")]
     Repair(BoxRepairArgs),
@@ -182,7 +194,7 @@ struct RunArgs {
     /// Use an already materialized guest root directory instead of a managed image.
     #[arg(long, env = "MORAE_ROOTFS")]
     rootfs: Option<PathBuf>,
-    /// OCI registry reference; uses the configured python:3.12 default when omitted.
+    /// Registry, oci-layout:PATH, or docker-archive:PATH#REPO:TAG image reference.
     #[arg(long)]
     image: Option<String>,
     /// Image acquisition policy: cache-first, forced refresh, or cache-only.
@@ -198,6 +210,24 @@ struct RunArgs {
     /// Host directory to copy into an immutable read-only ext4 guest workspace.
     #[arg(long)]
     workspace: Option<PathBuf>,
+    /// Give /workspace a disposable writable overlay while preserving the snapshot lower.
+    #[arg(long, requires = "workspace")]
+    workspace_writable: bool,
+    /// Atomically copy the final /workspace tree to this new host path.
+    #[arg(long, requires = "workspace")]
+    workspace_copy_out: Option<PathBuf>,
+    /// Write an add/modify/delete JSON manifest to this new host path.
+    #[arg(long, requires = "workspace_writable")]
+    workspace_diff: Option<PathBuf>,
+    /// Copy HOST source to an absolute GUEST destination, formatted HOST=GUEST.
+    #[arg(long = "copy-in", value_parser = parse_copy_in)]
+    copy_in: Vec<CopyInSpec>,
+    /// Copy absolute GUEST source to a new HOST destination, formatted GUEST=HOST.
+    #[arg(long = "copy-out", value_parser = parse_copy_out)]
+    copy_out: Vec<CopyOutSpec>,
+    /// Maximum encoded bytes for each copy operation.
+    #[arg(long, default_value = "64MiB", value_parser = parse_output_limit)]
+    copy_limit: usize,
     #[arg(long, env = "MORAE_REGISTRY_USERNAME", requires = "registry_password")]
     registry_username: Option<String>,
     #[arg(
@@ -242,7 +272,7 @@ struct RunArgs {
 
 #[derive(Debug, Args)]
 struct BoxCreateArgs {
-    /// OCI registry reference; uses the configured default when omitted.
+    /// Registry, oci-layout:PATH, or docker-archive:PATH#REPO:TAG image reference.
     #[arg(long)]
     image: Option<String>,
     /// Image acquisition policy: cache-first, forced refresh, or cache-only.
@@ -259,10 +289,38 @@ struct BoxCreateArgs {
         hide_env_values = true
     )]
     registry_password: Option<String>,
+    /// Unique display name for the Box.
+    #[arg(long, value_parser = parse_box_name)]
+    name: Option<String>,
+    /// Add a key/value label as KEY=VALUE.
+    #[arg(long = "label", value_parser = parse_box_label)]
+    labels: Vec<(String, String)>,
+    /// Add a tag.
+    #[arg(long = "tag", value_parser = parse_box_tag)]
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Args)]
-struct BoxListArgs {}
+struct BoxListArgs {
+    /// Match a unique Box name exactly, case-insensitively.
+    #[arg(long, value_parser = parse_box_name)]
+    name: Option<String>,
+    /// Require a label key, optionally with an exact value: KEY or KEY=VALUE.
+    #[arg(long = "label", value_parser = parse_box_label_filter)]
+    labels: Vec<(String, Option<String>)>,
+    /// Require a tag.
+    #[arg(long = "tag", value_parser = parse_box_tag)]
+    tags: Vec<String>,
+    /// Match one lifecycle state.
+    #[arg(long, value_enum)]
+    state: Option<BoxStateArg>,
+    /// Stable Box list ordering.
+    #[arg(long, value_enum, default_value_t = BoxSortArg::Id)]
+    sort: BoxSortArg,
+    /// Reverse the selected stable order.
+    #[arg(long)]
+    reverse: bool,
+}
 
 #[derive(Debug, Args)]
 struct BoxShowArgs {
@@ -291,6 +349,86 @@ struct BoxCloneArgs {
     /// Confirm creation of a new durable Box disk.
     #[arg(long, required = true)]
     yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct BoxRenameArgs {
+    box_id: BoxId,
+    #[arg(value_parser = parse_box_name)]
+    name: String,
+}
+
+#[derive(Debug, Args)]
+struct BoxUpdateArgs {
+    box_id: BoxId,
+    /// Set a key/value label as KEY=VALUE.
+    #[arg(long = "label", value_parser = parse_box_label)]
+    set_labels: Vec<(String, String)>,
+    /// Remove a label by key.
+    #[arg(long = "remove-label", value_parser = parse_box_label_key)]
+    remove_labels: Vec<String>,
+    /// Add a tag.
+    #[arg(long = "tag", value_parser = parse_box_tag)]
+    add_tags: Vec<String>,
+    /// Remove a tag.
+    #[arg(long = "remove-tag", value_parser = parse_box_tag)]
+    remove_tags: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct BoxExportArgs {
+    box_id: BoxId,
+    /// New tar bundle path; existing files are never overwritten.
+    destination: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct BoxImportArgs {
+    /// Verified tar bundle to import under a new `BoxId`.
+    source: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BoxStateArg {
+    Ready,
+    Dirty,
+    NeedsRepair,
+}
+
+impl From<BoxStateArg> for BoxState {
+    fn from(value: BoxStateArg) -> Self {
+        match value {
+            BoxStateArg::Ready => Self::Ready,
+            BoxStateArg::Dirty => Self::Dirty,
+            BoxStateArg::NeedsRepair => Self::NeedsRepair,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum BoxSortArg {
+    Name,
+    Created,
+    Updated,
+    LastUsed,
+    PhysicalSize,
+    VirtualSize,
+    #[default]
+    Id,
+}
+
+impl From<BoxSortArg> for BoxSortBy {
+    fn from(value: BoxSortArg) -> Self {
+        match value {
+            BoxSortArg::Name => Self::Name,
+            BoxSortArg::Created => Self::Created,
+            BoxSortArg::Updated => Self::Updated,
+            BoxSortArg::LastUsed => Self::LastUsed,
+            BoxSortArg::PhysicalSize => Self::PhysicalSize,
+            BoxSortArg::VirtualSize => Self::VirtualSize,
+            BoxSortArg::Id => Self::Id,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -387,6 +525,13 @@ struct BenchmarkArgs {
     backend: String,
     #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=10_000))]
     iterations: u32,
+    /// Measurement population: mixed includes the first cold run, cold disables prepared roots,
+    /// and warm performs one unmeasured warm-up.
+    #[arg(long, value_enum, default_value_t = BenchmarkModeArg::Mixed)]
+    mode: BenchmarkModeArg,
+    /// Maximum measured runs in flight.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=256))]
+    concurrency: u16,
     #[arg(long, env = "MORAE_ROOTFS")]
     rootfs: Option<PathBuf>,
     #[arg(long, conflicts_with = "rootfs")]
@@ -420,6 +565,14 @@ struct BenchmarkArgs {
     /// Command to measure; emit output immediately to populate `command_start_p95_micros`.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum BenchmarkModeArg {
+    #[default]
+    Mixed,
+    Cold,
+    Warm,
 }
 
 #[derive(Debug, Args)]
@@ -524,6 +677,18 @@ fn command_stage(command: &Command) -> &'static str {
         Command::Box {
             command: BoxCommand::Clone(_),
         } => "box_clone",
+        Command::Box {
+            command: BoxCommand::Rename(_),
+        } => "box_rename",
+        Command::Box {
+            command: BoxCommand::Update(_),
+        } => "box_update",
+        Command::Box {
+            command: BoxCommand::Export(_),
+        } => "box_export",
+        Command::Box {
+            command: BoxCommand::Import(_),
+        } => "box_import",
         Command::Box {
             command: BoxCommand::Repair(_),
         } => "box_repair",
