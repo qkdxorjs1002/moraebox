@@ -12,7 +12,7 @@ use std::{
 };
 
 use fs2::FileExt;
-use moraebox_core::BoxId;
+use moraebox_core::{BoxId, StorageRootError, ensure_private_storage_root};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -146,6 +146,7 @@ impl BoxStore {
         request: &CreateBox,
         source_disk: &Path,
     ) -> Result<BoxMetadata, BoxStoreError> {
+        self.ensure_root()?;
         request.validate()?;
         validate_regular_file(source_disk, "source root disk")?;
         let source_size = fs::metadata(source_disk)?.len();
@@ -176,6 +177,7 @@ impl BoxStore {
     }
 
     pub fn list(&self) -> Result<Vec<BoxMetadata>, BoxStoreError> {
+        self.ensure_root()?;
         let directory = self.boxes_directory();
         if !directory.exists() {
             return Ok(Vec::new());
@@ -334,6 +336,7 @@ impl BoxStore {
     }
 
     fn checked_paths(&self, box_id: BoxId) -> Result<BoxPaths, BoxStoreError> {
+        self.ensure_root()?;
         let directory = self.box_directory(box_id);
         if !directory.exists() {
             return Err(BoxStoreError::NotFound(box_id));
@@ -363,6 +366,11 @@ impl BoxStore {
             std::process::id(),
             TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    fn ensure_root(&self) -> Result<(), BoxStoreError> {
+        ensure_private_storage_root(&self.state_root)?;
+        Ok(())
     }
 }
 
@@ -589,6 +597,8 @@ pub enum BoxStoreError {
     UnsafeFileType { label: String, path: PathBuf },
     #[error("invalid managed path: {}", .0.display())]
     InvalidPath(PathBuf),
+    #[error(transparent)]
+    StorageRoot(#[from] StorageRootError),
     #[error("system clock is before the Unix epoch")]
     ClockBeforeUnixEpoch,
     #[error("system clock value does not fit in u64 milliseconds")]
@@ -679,6 +689,43 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_tightens_state_root_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("state");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o777)).unwrap();
+        let store = BoxStore::new(&state);
+
+        assert!(store.list().unwrap().is_empty());
+        assert_eq!(
+            fs::metadata(state).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_rejects_symlink_state_root() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("target");
+        let state = temporary.path().join("state");
+        fs::create_dir(&target).unwrap();
+        symlink(target, &state).unwrap();
+        let store = BoxStore::new(&state);
+
+        assert!(matches!(
+            store.list(),
+            Err(BoxStoreError::StorageRoot(StorageRootError::UnsafeFileType(path)))
+                if path == state
+        ));
     }
 
     #[test]

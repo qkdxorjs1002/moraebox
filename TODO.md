@@ -185,7 +185,7 @@
   - file/inode count를 ext4 sizing에 반영한다.
   - cache/state 경로가 source tree 내부에 있으면 재귀 포함 전에 거부한다.
 
-- [ ] image/cache/state root를 private permission으로 만들고 owner·symlink를 검증한다.
+- [x] image/cache/state root를 private permission으로 만들고 owner·symlink를 검증한다.
 
 ### CLI와 운영 경험
 

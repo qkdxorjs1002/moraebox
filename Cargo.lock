@@ -787,8 +787,11 @@ dependencies = [
 name = "moraebox-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "nix",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "uuid",
 ]
@@ -801,6 +804,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "httpdate",
+ "moraebox-core",
  "reqwest",
  "serde",
  "serde_json",

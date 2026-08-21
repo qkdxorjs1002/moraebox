@@ -15,4 +15,7 @@ pub use spec::{
     TimeoutPolicy,
 };
 pub use state::{Lifecycle, LifecycleError, LifecycleEvent, SessionState, TerminationReason};
-pub use storage::{StoragePathError, StoragePaths, resolve_cache_dir, resolve_state_dir};
+pub use storage::{
+    StoragePathError, StoragePaths, StorageRootError, ensure_private_storage_root,
+    resolve_cache_dir, resolve_state_dir,
+};

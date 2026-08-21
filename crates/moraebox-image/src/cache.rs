@@ -7,6 +7,7 @@ use std::{
 };
 
 use fs2::FileExt;
+use moraebox_core::{StorageRootError, ensure_private_storage_root};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -857,7 +858,7 @@ impl ImageCache {
     }
 
     fn lock_path(&self, path: &Path, exclusive: bool) -> Result<CacheLock, ImageCacheError> {
-        fs::create_dir_all(&self.root)?;
+        ensure_private_storage_root(&self.root)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1566,6 +1567,8 @@ pub enum ImageCacheError {
     InvalidManifest(String),
     #[error("refusing to operate on unmanaged cache path: {}", .0.display())]
     InvalidManagedPath(PathBuf),
+    #[error(transparent)]
+    StorageRoot(#[from] StorageRootError),
     #[error("materialized rootfs is missing indexed metadata: {}", .0.display())]
     MissingRootfsMetadata(PathBuf),
     #[error("image cache JSON is invalid: {0}")]
@@ -1661,6 +1664,42 @@ mod tests {
             }
             manifest_digest
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_operations_tighten_root_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let cache = ImageCache::new(directory.path());
+
+        cache.list().unwrap();
+
+        assert_eq!(
+            fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_operations_reject_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let root = directory.path().join("cache");
+        fs::create_dir(&target).unwrap();
+        symlink(target, &root).unwrap();
+        let cache = ImageCache::new(&root);
+
+        assert!(matches!(
+            cache.list(),
+            Err(ImageCacheError::StorageRoot(StorageRootError::UnsafeFileType(path)))
+                if path == root
+        ));
     }
 
     #[test]

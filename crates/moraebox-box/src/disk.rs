@@ -7,7 +7,7 @@ use std::{
 };
 
 use fs2::FileExt;
-use moraebox_core::SessionId;
+use moraebox_core::{SessionId, ensure_private_storage_root};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -123,6 +123,7 @@ impl BaseDiskStore {
     }
 
     pub fn get(&self, spec: &BaseDiskSpec) -> Result<Option<BaseDisk>, BoxStoreError> {
+        ensure_private_storage_root(&self.cache_root)?;
         let key = spec.key()?;
         let directory = self.base_directory(&key);
         if !directory.exists() {
@@ -153,6 +154,7 @@ impl BaseDiskStore {
         rootfs: &Path,
         mke2fs: &Path,
     ) -> Result<BaseDisk, BoxStoreError> {
+        ensure_private_storage_root(&self.cache_root)?;
         spec.validate()?;
         validate_directory(rootfs, "materialized rootfs")?;
         if let Some(base) = self.get(spec)? {
@@ -289,6 +291,7 @@ impl EphemeralDiskStore {
         base: &BaseDisk,
         session_id: SessionId,
     ) -> Result<EphemeralDisk, BoxStoreError> {
+        ensure_private_storage_root(&self.runtime_root)?;
         let root = self.directory();
         secure_directory(&root)?;
         let destination = root.join(session_id.to_string());
@@ -334,6 +337,7 @@ impl EphemeralDiskStore {
     }
 
     pub fn garbage_collect(&self) -> Result<EphemeralGcReport, BoxStoreError> {
+        ensure_private_storage_root(&self.runtime_root)?;
         let root = self.directory();
         if !root.exists() {
             return Ok(EphemeralGcReport::default());
