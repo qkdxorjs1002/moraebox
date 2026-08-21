@@ -20,8 +20,9 @@ use moraebox_box::{
     BaseDiskSpec, BaseDiskStore, BoxStore, BoxStoreError, CreateBox, EphemeralDiskStore,
 };
 use moraebox_core::{
-    BoxId, OutputChunk, OutputReadError, RunSpec, SessionId, Signal, TimeoutPolicy,
-    resolve_cache_dir, resolve_state_dir,
+    BoxId, DEFAULT_KILL_GRACE, DEFAULT_OUTPUT_LIMIT, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, OutputChunk,
+    OutputReadError, RunSpec, SessionId, Signal, TimeoutPolicy, resolve_cache_dir,
+    resolve_state_dir,
 };
 use moraebox_image::{Credentials, ImageCache, Platform, digest_tree};
 use moraebox_runtime::{
@@ -1123,6 +1124,23 @@ async fn sandbox_exec_with_inline_limit(
     spec.box_id = args.box_id;
     spec.tty = args.tty;
     spec.network = args.network;
+    if let Some(output_limit) = args.output_limit_bytes {
+        if !(1..=MAX_OUTPUT_LIMIT).contains(&output_limit) {
+            return Err(ExecError::Failed(ToolError::invalid_arguments(format!(
+                "output_limit_bytes must be between 1 and {MAX_OUTPUT_LIMIT}"
+            ))));
+        }
+        spec.output_limit = output_limit;
+    }
+    if let Some(kill_grace_ms) = args.kill_grace_ms {
+        let kill_grace = Duration::from_millis(kill_grace_ms);
+        if kill_grace.is_zero() || kill_grace > MAX_KILL_GRACE {
+            return Err(ExecError::Failed(ToolError::invalid_arguments(
+                "kill_grace_ms must be between 1 and 60000",
+            )));
+        }
+        spec.kill_grace = kill_grace;
+    }
     spec.timeout = match (args.unlimited, args.timeout_ms) {
         (true, Some(_)) => {
             return Err(ExecError::Failed(ToolError::invalid_arguments(
@@ -1745,7 +1763,7 @@ fn tools_list() -> Value {
             {
                 "name": "sandbox_exec",
                 "title": "Execute in configured runtime",
-                "description": "Start a command in the configured runtime. Every call receives a new SessionId and, with libkrun, a new microVM. The first image-backed run prepares its image lazily within timeout_ms; failures use code image_prepare_failed and stage image_pull. Pass box_id only when the command should reuse that Box's persistent root filesystem. Prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. At most 32 sessions run concurrently. wait=true returns at most 1 MiB inline; when has_more is true, call sandbox_io with the returned SessionId and continuation_cursor within five minutes. Cancelled wait=true runs are cleaned. wait=false starts a session owned by this stdio connection until sandbox_remove or disconnect; completed status and output expire after five minutes. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
+                "description": "Start a command in the configured runtime. Every call receives a new SessionId and, with libkrun, a new microVM. The first image-backed run prepares its image lazily within timeout_ms; failures use code image_prepare_failed and stage image_pull. Pass box_id only when the command should reuse that Box's persistent root filesystem. Prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. output_limit_bytes bounds retained output and kill_grace_ms bounds TERM-to-force cleanup; defaults remain 64 MiB and 5000 ms. At most 32 sessions run concurrently. wait=true returns at most 1 MiB inline; when has_more is true, call sandbox_io with the returned SessionId and continuation_cursor within five minutes. Cancelled wait=true runs are cleaned. wait=false starts a session owned by this stdio connection until sandbox_remove or disconnect; completed status and output expire after five minutes. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1754,6 +1772,8 @@ fn tools_list() -> Value {
                         "box_id": { "type": "string", "format": "uuid", "description": "Persistent Box root filesystem to reuse; the microVM and SessionId remain new." },
                         "timeout_ms": { "type": "integer", "minimum": 1 },
                         "unlimited": { "type": "boolean", "default": false },
+                        "output_limit_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_OUTPUT_LIMIT, "default": DEFAULT_OUTPUT_LIMIT },
+                        "kill_grace_ms": { "type": "integer", "minimum": 1, "maximum": 60_000, "default": DEFAULT_KILL_GRACE.as_millis() },
                         "network": { "type": "boolean", "default": false },
                         "tty": { "type": "boolean", "default": false },
                         "wait": { "type": "boolean", "default": true }
@@ -1931,6 +1951,8 @@ struct ExecArgs {
     box_id: Option<BoxId>,
     timeout_ms: Option<u64>,
     unlimited: bool,
+    output_limit_bytes: Option<usize>,
+    kill_grace_ms: Option<u64>,
     network: bool,
     tty: bool,
     wait: bool,
@@ -1944,6 +1966,8 @@ impl Default for ExecArgs {
             box_id: None,
             timeout_ms: None,
             unlimited: false,
+            output_limit_bytes: None,
+            kill_grace_ms: None,
             network: false,
             tty: false,
             wait: true,
@@ -2298,6 +2322,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_schema_advertises_bounded_resource_controls() {
+        let server = test_server(SandboxSdk::new(Arc::new(ProcessBackend)));
+        let list = handle_request(
+            &server,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+
+        assert_eq!(
+            list.pointer("/result/tools/0/inputSchema/properties/output_limit_bytes/maximum"),
+            Some(&json!(MAX_OUTPUT_LIMIT))
+        );
+        assert_eq!(
+            list.pointer("/result/tools/0/inputSchema/properties/kill_grace_ms/maximum"),
+            Some(&json!(60_000))
+        );
+    }
+
+    #[tokio::test]
     async fn session_wait_and_query_tools_are_advertised() {
         let server = test_server(SandboxSdk::new(Arc::new(ProcessBackend)));
         let list = handle_request(
@@ -2394,6 +2437,33 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_applies_output_limit_and_accepts_bounded_kill_grace() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let result = sandbox_exec_with_inline_limit(
+            &sdk,
+            json!({
+                "argv": successful_command(),
+                "output_limit_bytes": 2,
+                "kill_grace_ms": 250
+            }),
+            None,
+            16,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.structured_content.get("truncated"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            result.structured_content.pointer("/output/0/text"),
+            Some(&json!("cp"))
+        );
+    }
+
     #[tokio::test]
     async fn tool_handlers_reject_schema_bypasses_before_execution() {
         let server = test_server(SandboxSdk::new(Arc::new(ProcessBackend)));
@@ -2411,6 +2481,29 @@ mod tests {
                     "timeout_ms": 10
                 }),
                 "cannot be combined",
+            ),
+            (
+                "sandbox_exec",
+                json!({ "argv": successful_command(), "output_limit_bytes": 0 }),
+                "output_limit_bytes must be between",
+            ),
+            (
+                "sandbox_exec",
+                json!({
+                    "argv": successful_command(),
+                    "output_limit_bytes": MAX_OUTPUT_LIMIT + 1
+                }),
+                "output_limit_bytes must be between",
+            ),
+            (
+                "sandbox_exec",
+                json!({ "argv": successful_command(), "kill_grace_ms": 0 }),
+                "kill_grace_ms must be between",
+            ),
+            (
+                "sandbox_exec",
+                json!({ "argv": successful_command(), "kill_grace_ms": 60_001 }),
+                "kill_grace_ms must be between",
             ),
             (
                 "sandbox_io",

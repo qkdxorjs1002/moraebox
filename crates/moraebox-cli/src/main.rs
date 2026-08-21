@@ -18,8 +18,8 @@ use moraebox_box::{
     EphemeralDiskStore,
 };
 use moraebox_core::{
-    BoxId, OutputChannel, OutputReadError, RunSpec, SessionState, Signal, StoragePaths,
-    TimeoutPolicy, resolve_cache_dir, resolve_state_dir,
+    BoxId, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, OutputChannel, OutputReadError, RunSpec, SessionState,
+    Signal, StoragePaths, TimeoutPolicy, resolve_cache_dir, resolve_state_dir,
 };
 use moraebox_image::{
     CacheReconcileReport, CacheUsage, CachedImage, CleanReport, Credentials, ImageCache,
@@ -197,6 +197,12 @@ struct RunArgs {
     /// Sandbox wall timeout, for example 30s, 1h, or none.
     #[arg(long, default_value = "1h")]
     timeout: String,
+    /// Maximum retained output, for example 8MiB or 128MB.
+    #[arg(long, default_value = "64MiB", value_parser = parse_output_limit)]
+    output_limit: usize,
+    /// Grace period between graceful termination and forced cleanup.
+    #[arg(long, default_value = "5s", value_parser = parse_kill_grace)]
+    kill_grace: Duration,
     /// Allocate a pseudo-terminal (native backend).
     #[arg(short = 't', long)]
     tty: bool,
@@ -383,6 +389,12 @@ struct BenchmarkArgs {
     cpus: u8,
     #[arg(long, default_value_t = 512)]
     memory_mib: u32,
+    /// Maximum retained output per measured run.
+    #[arg(long, default_value = "64MiB", value_parser = parse_output_limit)]
+    output_limit: usize,
+    /// Grace period between graceful termination and forced cleanup.
+    #[arg(long, default_value = "5s", value_parser = parse_kill_grace)]
+    kill_grace: Duration,
     /// Command to measure; emit output immediately to populate `command_start_p95_micros`.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
@@ -634,6 +646,8 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::
     let mut spec = RunSpec::command(args.command);
     spec.box_id = args.box_id;
     spec.timeout = parse_timeout(&args.timeout)?;
+    spec.output_limit = args.output_limit;
+    spec.kill_grace = args.kill_grace;
     spec.tty = args.tty;
     spec.inherit_env = args.inherit_env;
     spec.network = args.network;
@@ -1811,6 +1825,8 @@ async fn benchmark(
                 command,
                 args.iterations,
                 None,
+                args.output_limit,
+                args.kill_grace,
             )
             .await?
         }
@@ -1886,6 +1902,8 @@ async fn benchmark(
                 command,
                 args.iterations,
                 args.box_id,
+                args.output_limit,
+                args.kill_grace,
             )
             .await?
         }
@@ -1900,6 +1918,8 @@ async fn run_benchmark<B: Backend>(
     command: Vec<String>,
     iterations: u32,
     box_id: Option<BoxId>,
+    output_limit: usize,
+    kill_grace: Duration,
 ) -> Result<BenchmarkReport, Box<dyn std::error::Error>> {
     let mut samples = Vec::with_capacity(iterations as usize);
     let mut backend_ready_samples = Vec::with_capacity(iterations as usize);
@@ -1913,6 +1933,8 @@ async fn run_benchmark<B: Backend>(
     for _ in 0..iterations {
         let mut spec = RunSpec::command(command.clone());
         spec.box_id = box_id;
+        spec.output_limit = output_limit;
+        spec.kill_grace = kill_grace;
         let report = supervisor.run(spec).await?;
         if report.exit_code != Some(0) || report.timed_out {
             failures += 1;
@@ -2102,6 +2124,19 @@ fn platform_name(platform: &Platform) -> String {
 }
 
 fn parse_disk_size(input: &str) -> Result<u64, String> {
+    parse_byte_size(input, "disk size")
+}
+
+fn parse_output_limit(input: &str) -> Result<usize, String> {
+    let bytes = parse_byte_size(input, "output limit")?;
+    let bytes = usize::try_from(bytes).map_err(|_| "output limit is too large".to_owned())?;
+    if bytes > MAX_OUTPUT_LIMIT {
+        return Err("output limit must not exceed 1 GiB".into());
+    }
+    Ok(bytes)
+}
+
+fn parse_byte_size(input: &str, label: &str) -> Result<u64, String> {
     let input = input.trim();
     let split = input
         .find(|character: char| !character.is_ascii_digit())
@@ -2109,9 +2144,9 @@ fn parse_disk_size(input: &str) -> Result<u64, String> {
     let (number, suffix) = input.split_at(split);
     let value = number
         .parse::<u64>()
-        .map_err(|_| "disk size must start with a positive integer".to_owned())?;
+        .map_err(|_| format!("{label} must start with a positive integer"))?;
     if value == 0 {
-        return Err("disk size must be greater than zero".into());
+        return Err(format!("{label} must be greater than zero"));
     }
     let multiplier = match suffix.to_ascii_lowercase().as_str() {
         "" | "b" => 1,
@@ -2121,11 +2156,26 @@ fn parse_disk_size(input: &str) -> Result<u64, String> {
         "kb" => 1000,
         "mb" => 1000 * 1000,
         "gb" => 1000 * 1000 * 1000,
-        _ => return Err("disk size suffix must be B, KiB, MiB, GiB, KB, MB, or GB".into()),
+        _ => {
+            return Err(format!(
+                "{label} suffix must be B, KiB, MiB, GiB, KB, MB, or GB"
+            ));
+        }
     };
     value
         .checked_mul(multiplier)
-        .ok_or_else(|| "disk size is too large".into())
+        .ok_or_else(|| format!("{label} is too large"))
+}
+
+fn parse_kill_grace(input: &str) -> Result<Duration, String> {
+    let duration = humantime::parse_duration(input).map_err(|error| error.to_string())?;
+    if duration.is_zero() {
+        return Err("kill grace must be greater than zero".into());
+    }
+    if duration > MAX_KILL_GRACE {
+        return Err("kill grace must not exceed 60 seconds".into());
+    }
+    Ok(duration)
 }
 
 fn parse_timeout(input: &str) -> Result<TimeoutPolicy, Box<dyn std::error::Error>> {
@@ -2191,6 +2241,43 @@ mod tests {
             TimeoutPolicy::Limited(3_600_000)
         );
         assert_eq!(parse_timeout("none").unwrap(), TimeoutPolicy::Unlimited);
+    }
+
+    #[test]
+    fn parses_bounded_output_and_kill_grace_controls() {
+        assert_eq!(parse_output_limit("8MiB").unwrap(), 8 * 1024 * 1024);
+        assert!(parse_output_limit("0").is_err());
+        assert!(parse_output_limit("2GiB").is_err());
+        assert_eq!(
+            parse_kill_grace("250ms").unwrap(),
+            Duration::from_millis(250)
+        );
+        assert!(parse_kill_grace("0s").is_err());
+        assert!(parse_kill_grace("61s").is_err());
+
+        let defaults = Cli::try_parse_from(["morae", "run", "--", "/bin/true"]).unwrap();
+        let Command::Run(defaults) = defaults.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(defaults.output_limit, moraebox_core::DEFAULT_OUTPUT_LIMIT);
+        assert_eq!(defaults.kill_grace, moraebox_core::DEFAULT_KILL_GRACE);
+
+        let explicit = Cli::try_parse_from([
+            "morae",
+            "run",
+            "--output-limit",
+            "4KiB",
+            "--kill-grace",
+            "750ms",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let Command::Run(explicit) = explicit.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(explicit.output_limit, 4096);
+        assert_eq!(explicit.kill_grace, Duration::from_millis(750));
     }
 
     #[test]

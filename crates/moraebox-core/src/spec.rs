@@ -6,6 +6,8 @@ use uuid::Uuid;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 pub const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(5);
 pub const DEFAULT_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
+pub const MAX_KILL_GRACE: Duration = Duration::from_secs(60);
+pub const MAX_OUTPUT_LIMIT: usize = 1024 * 1024 * 1024;
 pub const DEFAULT_TTY_ROWS: u16 = 24;
 pub const DEFAULT_TTY_COLUMNS: u16 = 80;
 
@@ -152,6 +154,15 @@ impl RunSpec {
         if self.output_limit == 0 {
             return Err("output_limit must be greater than zero");
         }
+        if self.output_limit > MAX_OUTPUT_LIMIT {
+            return Err("output_limit must not exceed 1 GiB");
+        }
+        if self.kill_grace.is_zero() {
+            return Err("kill_grace must be greater than zero");
+        }
+        if self.kill_grace > MAX_KILL_GRACE {
+            return Err("kill_grace must not exceed 60 seconds");
+        }
         if self.tty && (self.tty_rows == 0 || self.tty_columns == 0) {
             return Err("PTY rows and columns must be greater than zero");
         }
@@ -199,6 +210,36 @@ mod tests {
     #[test]
     fn network_access_is_opt_in() {
         assert!(!RunSpec::command(["true"]).network);
+    }
+
+    #[test]
+    fn execution_resource_controls_are_bounded() {
+        let defaults = RunSpec::command(["true"]);
+        assert_eq!(defaults.output_limit, DEFAULT_OUTPUT_LIMIT);
+        assert_eq!(defaults.kill_grace, DEFAULT_KILL_GRACE);
+
+        let mut invalid = defaults.clone();
+        invalid.output_limit = 0;
+        assert_eq!(
+            invalid.validate(),
+            Err("output_limit must be greater than zero")
+        );
+        invalid.output_limit = MAX_OUTPUT_LIMIT + 1;
+        assert_eq!(
+            invalid.validate(),
+            Err("output_limit must not exceed 1 GiB")
+        );
+        invalid.output_limit = DEFAULT_OUTPUT_LIMIT;
+        invalid.kill_grace = Duration::ZERO;
+        assert_eq!(
+            invalid.validate(),
+            Err("kill_grace must be greater than zero")
+        );
+        invalid.kill_grace = MAX_KILL_GRACE + Duration::from_millis(1);
+        assert_eq!(
+            invalid.validate(),
+            Err("kill_grace must not exceed 60 seconds")
+        );
     }
 
     #[test]

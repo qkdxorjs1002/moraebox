@@ -78,6 +78,8 @@ morae run \
 
 기본 벽시계 타임아웃은 1시간입니다. 무제한 실행은 `--timeout none` 또는 `--timeout 0`으로 명시해야 합니다.
 
+보존 출력은 기본 64 MiB이며 실행별로 `--output-limit 8MiB`(최대 1 GiB)처럼 제한할 수 있습니다. TERM 이후 강제 정리까지의 유예 시간은 기본 5초이며 `--kill-grace 750ms`(최대 60초)로 설정합니다. MCP의 같은 옵션은 단위가 명확한 `sandbox_exec.output_limit_bytes`와 `sandbox_exec.kill_grace_ms`입니다.
+
 `--` 뒤의 값은 모두 argv로 전달됩니다. 셸을 명령으로 직접 지정한 경우에만 셸 문법을 해석합니다.
 
 ```sh

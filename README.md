@@ -97,6 +97,8 @@ morae run \
 
 The default wall-clock timeout is one hour. Unlimited execution must be explicit with `--timeout none` or `--timeout 0`.
 
+Retained output defaults to 64 MiB and can be bounded per run with `--output-limit 8MiB` (maximum 1 GiB). The TERM-to-force-cleanup grace period defaults to five seconds and can be set with `--kill-grace 750ms` (maximum 60 seconds). The same MCP controls are `sandbox_exec.output_limit_bytes` and `sandbox_exec.kill_grace_ms`; their units are explicit bytes and milliseconds.
+
 Everything after `--` is passed as argv. Shell syntax is interpreted only if a shell is the command:
 
 ```sh
