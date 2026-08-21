@@ -232,7 +232,7 @@
 
 - [x] 문자열과 `Box<dyn Error>` 중심 오류를 stage와 retryability를 보존하는 typed error로 전환한다.
 
-- [ ] 다음 회귀 테스트를 보강한다.
+- [x] 다음 회귀 테스트를 보강한다.
   - owner loss, blocked stdin, repeated stop, pump failure, output cap 초과
   - MCP concurrent IDs, cancellation, EOF, invalid schema, large output
   - mock registry digest/auth/timeout/retry/concurrent pull

@@ -207,13 +207,13 @@ morae cache clean --all --yes
 
 By default, every command uses the user-wide `~/.moraebox/cache` and `~/.moraebox/state` directories, independent of the current working directory. Use `--cache-dir`, `--state-dir`, or their environment variables only when a command should use another location. When a storage-using command finds a matching project-local `.moraebox/cache` or `.moraebox/state`, it prints an explicit-use reminder on stderr. Existing project-local data is never selected or moved automatically; for example, continue using it with `morae box list --state-dir .moraebox/state`.
 
-Cache size output distinguishes logical bytes from filesystem-allocated bytes. Rootfs sizes come from publish-time indexed metadata, so `image list` and `cache info` do not rescan every tree. Use `cache reconcile --dry-run` to detect missing, invalid, stale, or orphan metadata and `cache reconcile --yes` (also available as `cache repair --yes`) to repair it.
+Cache size output distinguishes logical bytes from filesystem-allocated bytes. Rootfs sizes come from publish-time indexed metadata, so `image list` and `cache info` do not rescan every tree. Use `cache reconcile --dry-run` to detect missing, invalid, stale, or orphan metadata and `cache reconcile --yes` (also available as `cache repair --yes`) to repair it. `cache prune` also reclaims exact moraebox rootfs staging directories left by an interrupted pull while preserving complete roots and unknown entries.
 
 Mutating cache operations require either `--dry-run` or `--yes`; durable Box mutations require `--yes`. `morae cache clean` removes rebuildable image, immutable base-disk, and ephemeral data, but never persistent Box disks under `~/.moraebox/state`. Image, Box, and cache commands support `--json` where structured output is useful.
 
 `morae box list` keeps returning healthy Boxes when another entry is corrupt and includes an `errors` array in JSON output. `morae box repair --dry-run` previews those entries; `--yes` acquires each valid Box lock and moves corrupt entries into a private `state/quarantine` batch directory. Quarantine never deletes or reconstructs disk data, and busy entries remain in place with a per-entry failure.
 
-Native CLI and MCP startup garbage-collect crash leftovers only after they are at least one hour old and their base, Box, or session lock is available. The collector recognizes only moraebox-generated `.creating`, `.deleting`, delete tombstone, and reset temporary-disk names; it leaves active, recent, quarantined, and unknown entries untouched.
+Native CLI and MCP startup garbage-collect crash leftovers only after they are at least one hour old and their base, Box, or session lock is available. The collector recognizes only moraebox-generated `.creating`, `.deleting`, delete tombstone, reset temporary-disk, and atomic Box metadata names; it leaves active, recent, quarantined, and unknown entries untouched.
 
 ### Exercise the lifecycle without isolation
 

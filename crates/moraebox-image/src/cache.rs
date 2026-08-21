@@ -790,10 +790,27 @@ impl ImageCache {
                     .map_or(true, |digest| !complete.contains(&digest))
             })
             .collect::<Vec<_>>();
+        let mut stale_rootfs_staging = Vec::new();
+        for entry in read_entries(&self.root.join("tmp/rootfs"))? {
+            let file_type = entry.file_type()?;
+            let is_managed_staging = entry
+                .file_name()
+                .to_str()
+                .is_some_and(is_rootfs_staging_name);
+            if file_type.is_dir() && !file_type.is_symlink() && is_managed_staging {
+                stale_rootfs_staging.push(entry.path());
+            }
+        }
         let incomplete_rootfs_bytes = incomplete_roots.iter().try_fold(
             0_u64,
             |total, entry| -> Result<_, ImageCacheError> {
                 Ok(total.saturating_add(rootfs_entry_logical_size(entry)?))
+            },
+        )?;
+        let stale_staging_bytes = stale_rootfs_staging.iter().try_fold(
+            0_u64,
+            |total, path| -> Result<_, ImageCacheError> {
+                Ok(total.saturating_add(path_size(path)?))
             },
         )?;
         let reclaimed_bytes = blobs_to_remove
@@ -806,7 +823,8 @@ impl ImageCache {
                     .iter()
                     .map(|record| file_size(&record.path).unwrap_or(0))
                     .sum::<u64>(),
-            );
+            )
+            .saturating_add(stale_staging_bytes);
 
         if apply {
             for (path, _) in &blobs_to_remove {
@@ -821,11 +839,14 @@ impl ImageCache {
             for record in &stale_records {
                 remove_file_if_exists(&record.path)?;
             }
+            for path in &stale_rootfs_staging {
+                remove_managed_directory(path)?;
+            }
         }
 
         Ok(PruneReport {
             oci_blobs_removed: blobs_to_remove.len(),
-            incomplete_rootfs_removed: incomplete_roots.len(),
+            incomplete_rootfs_removed: incomplete_roots.len() + stale_rootfs_staging.len(),
             stale_records_removed: stale_records.len(),
             reclaimed_bytes,
             applied: apply,
@@ -842,6 +863,7 @@ impl ImageCache {
             self.root.join("rootfs-metadata"),
             self.root.join("box-bases"),
             self.root.join("workspaces"),
+            self.root.join("tmp"),
             self.default_path(),
         ];
         let existing = paths
@@ -1333,6 +1355,26 @@ fn parse_digest(value: &str) -> Result<Digest, ImageCacheError> {
 
 fn parse_digest_hex(value: &str) -> Result<Digest, ImageCacheError> {
     parse_digest(value)
+}
+
+fn is_rootfs_staging_name(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let Some(digest) = parts.next() else {
+        return false;
+    };
+    let Some(process_id) = parts.next() else {
+        return false;
+    };
+    let Some(sequence) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && process_id.parse::<u32>().is_ok()
+        && sequence.parse::<u64>().is_ok()
 }
 
 fn is_complete_rootfs(path: &Path, digest: &Digest) -> bool {
@@ -1876,6 +1918,37 @@ mod tests {
     }
 
     #[test]
+    fn prune_recovers_exact_stale_rootfs_staging_after_power_loss() {
+        let fixture = Fixture::new();
+        let committed = fixture.add_image(Some("python:3.12"));
+        let staged_digest = Digest::from_bytes(b"interrupted rootfs");
+        let staging_root = fixture.cache.root.join("tmp/rootfs");
+        let stale = staging_root.join(format!("{}.999.1", staged_digest.hex()));
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("partial"), b"not committed").unwrap();
+        let unmanaged = staging_root.join("keep-user-entry");
+        fs::create_dir_all(&unmanaged).unwrap();
+
+        let preview = fixture.cache.prune(false).unwrap();
+        assert_eq!(preview.incomplete_rootfs_removed, 1);
+        assert!(stale.exists());
+        assert!(fixture.cache.rootfs_path(&committed).exists());
+
+        let applied = fixture.cache.prune(true).unwrap();
+        assert_eq!(applied.incomplete_rootfs_removed, 1);
+        assert!(!stale.exists());
+        assert!(unmanaged.exists());
+        assert!(fixture.cache.rootfs_path(&committed).exists());
+        assert!(
+            fixture
+                .cache
+                .resolve_reference("python:3.12", &Fixture::platform())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn clean_removes_managed_entries_and_resets_the_default() {
         let fixture = Fixture::new();
         fixture.add_image(Some("python:3.12"));
@@ -1889,6 +1962,9 @@ mod tests {
             .join("box-bases/v1/sha256/base/root.ext4");
         fs::create_dir_all(base_disk.parent().unwrap()).unwrap();
         fs::write(&base_disk, b"base").unwrap();
+        let staging = fixture.cache.root.join("tmp/rootfs/stale");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("partial"), b"partial").unwrap();
 
         let usage = fixture.cache.usage().unwrap();
         assert_eq!(usage.base_disks, 1);
@@ -1902,6 +1978,7 @@ mod tests {
         assert!(applied.applied);
         assert!(!workspace.exists());
         assert!(!base_disk.exists());
+        assert!(!staging.exists());
         assert_eq!(
             fixture.cache.default_reference().unwrap(),
             BUILTIN_DEFAULT_IMAGE

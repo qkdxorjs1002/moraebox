@@ -305,13 +305,13 @@ impl BoxStore {
                 continue;
             }
             if BoxId::from_str(&name).is_ok() {
-                Self::collect_reset_temporary_disks(&path, minimum_age, &mut report)?;
+                Self::collect_box_temporary_files(&path, minimum_age, &mut report)?;
             }
         }
         Ok(report)
     }
 
-    fn collect_reset_temporary_disks(
+    fn collect_box_temporary_files(
         box_directory: &Path,
         minimum_age: Duration,
         report: &mut GarbageCollectionReport,
@@ -323,11 +323,11 @@ impl BoxStore {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            if !is_reset_temporary_disk_name(&name) {
+            if !is_reset_temporary_disk_name(&name) && !is_atomic_metadata_temporary_name(&name) {
                 continue;
             }
             let path = entry.path();
-            validate_regular_file(&path, "reset temporary disk")?;
+            validate_regular_file(&path, "box temporary file")?;
             if garbage_collection_candidate_is_old(&path, minimum_age)? {
                 stale.push(path);
             } else {
@@ -817,6 +817,23 @@ fn is_reset_temporary_disk_name(name: &str) -> bool {
         .is_some_and(|sequence| {
             !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
         })
+}
+
+fn is_atomic_metadata_temporary_name(name: &str) -> bool {
+    let Some(value) = name
+        .strip_prefix(&format!(".{METADATA_FILE}."))
+        .and_then(|value| value.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = value.split('.');
+    let Some(process_id) = parts.next() else {
+        return false;
+    };
+    let Some(sequence) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none() && process_id.parse::<u32>().is_ok() && sequence.parse::<u64>().is_ok()
 }
 
 fn read_metadata(path: &Path, expected_id: BoxId) -> Result<BoxMetadata, BoxStoreError> {
@@ -1357,6 +1374,10 @@ mod tests {
         let box_directory = fixture.store.box_directory(created.box_id);
         let reset_temporary = box_directory.join(format!(".{ROOT_DISK_FILE}.999.tmp"));
         File::create(&reset_temporary).unwrap();
+        let metadata_temporary = box_directory.join(format!(".{METADATA_FILE}.999.1.tmp"));
+        fs::write(&metadata_temporary, br#"{"state":"#).unwrap();
+        let unmanaged_temporary = box_directory.join(format!(".{METADATA_FILE}.unknown.tmp"));
+        File::create(&unmanaged_temporary).unwrap();
 
         let creating = fixture
             .store
@@ -1374,18 +1395,22 @@ mod tests {
         secure_directory(&unknown).unwrap();
 
         let young = fixture.store.garbage_collect().unwrap();
-        assert_eq!(young.skipped_young, 3);
+        assert_eq!(young.skipped_young, 4);
+        assert_eq!(fixture.store.get(created.box_id).unwrap(), created);
 
         let stale = fixture
             .store
             .garbage_collect_older_than(Duration::ZERO)
             .unwrap();
-        assert_eq!(stale.removed, 3);
+        assert_eq!(stale.removed, 4);
         assert!(!reset_temporary.exists());
+        assert!(!metadata_temporary.exists());
+        assert!(unmanaged_temporary.exists());
         assert!(!creating.exists());
         assert!(!deleted.exists());
         assert!(unknown.exists());
         assert!(box_directory.exists());
+        assert_eq!(fixture.store.get(created.box_id).unwrap(), created);
     }
 
     #[test]

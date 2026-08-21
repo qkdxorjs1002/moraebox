@@ -182,7 +182,9 @@ morae cache clean --all --yes
 
 모든 명령은 현재 작업 디렉터리와 무관하게 사용자 전역 `~/.moraebox/cache`와 `~/.moraebox/state`를 기본으로 사용합니다. 다른 위치가 필요한 명령에만 `--cache-dir` 또는 `--state-dir`을 지정합니다. 기존 프로젝트 로컬 데이터는 자동으로 옮기지 않으며, 예를 들어 `morae box list --state-dir .moraebox/state`로 계속 사용할 수 있습니다.
 
-파괴적인 캐시 작업에는 `--dry-run` 또는 `--yes`가 필요하며 durable Box 변경에는 `--yes`가 필요합니다. `morae cache clean`은 다시 만들 수 있는 image, immutable base disk, ephemeral 데이터만 지우고 `~/.moraebox/state`의 persistent Box disk는 지우지 않습니다. 구조화된 출력이 필요한 image·Box·cache 명령은 `--json`을 지원합니다.
+파괴적인 캐시 작업에는 `--dry-run` 또는 `--yes`가 필요하며 durable Box 변경에는 `--yes`가 필요합니다. `morae cache prune`은 중단된 pull이 남긴 정확한 moraebox rootfs staging만 회수하고 완료된 root와 알 수 없는 항목은 보존합니다. `morae cache clean`은 다시 만들 수 있는 image, immutable base disk, ephemeral 데이터만 지우고 `~/.moraebox/state`의 persistent Box disk는 지우지 않습니다. 구조화된 출력이 필요한 image·Box·cache 명령은 `--json`을 지원합니다.
+
+네이티브 CLI와 MCP 시작 시에는 1시간 이상 지난 crash 잔여물만 base·Box·session lock이 비어 있을 때 회수합니다. moraebox가 만든 생성·삭제 staging, reset 임시 disk, atomic Box metadata 이름만 인식하며 active·recent·quarantine·알 수 없는 항목은 그대로 둡니다.
 
 ### 격리 없이 수명주기만 확인
 

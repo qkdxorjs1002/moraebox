@@ -270,6 +270,10 @@ pub struct RegistryClient {
     credentials: Option<Credentials>,
     allowed_credential_realms: BTreeSet<RealmOrigin>,
     limits: ImagePullLimits,
+    #[cfg(test)]
+    endpoint_base: Option<String>,
+    #[cfg(test)]
+    allow_insecure_token_realm: bool,
 }
 
 impl RegistryClient {
@@ -294,6 +298,10 @@ impl RegistryClient {
             credentials,
             allowed_credential_realms: BTreeSet::new(),
             limits: ImagePullLimits::default(),
+            #[cfg(test)]
+            endpoint_base: None,
+            #[cfg(test)]
+            allow_insecure_token_realm: false,
         })
     }
 
@@ -395,11 +403,7 @@ impl RegistryClient {
         authorization: &Authorization,
         cas: &Cas,
     ) -> Result<(Vec<u8>, Digest), RegistryError> {
-        let url = format!(
-            "https://{}/v2/{}/manifests/{selector}",
-            reference.endpoint_registry(),
-            reference.repository
-        );
+        let url = self.registry_url(reference, &format!("manifests/{selector}"));
         let selector_digest = selector
             .starts_with("sha256:")
             .then(|| Digest::from_str(selector))
@@ -480,11 +484,7 @@ impl RegistryClient {
             cas.verify(&digest).await?;
             return Ok(digest);
         }
-        let url = format!(
-            "https://{}/v2/{}/blobs/{digest}",
-            reference.endpoint_registry(),
-            reference.repository
-        );
+        let url = self.registry_url(reference, &format!("blobs/{digest}"));
         for attempt in 0..MAX_REQUEST_ATTEMPTS {
             let response = self
                 .get_authenticated(&url, reference, authorization, None)
@@ -647,7 +647,7 @@ impl RegistryClient {
         reference: &RegistryReference,
     ) -> Result<reqwest::RequestBuilder, RegistryError> {
         let challenge = parse_bearer_challenge(challenge)?;
-        let realm = validate_token_realm(&challenge.realm)?;
+        let realm = self.token_realm(&challenge.realm)?;
         let mut request = self.token_client.get(realm.clone());
         let scope = challenge.scope.unwrap_or_else(|| reference.scope());
         let mut query = vec![("scope", scope.as_str())];
@@ -666,6 +666,66 @@ impl RegistryClient {
             request = request.basic_auth(&credentials.username, Some(&credentials.password));
         }
         Ok(request)
+    }
+
+    #[allow(clippy::unused_self)]
+    fn registry_url(&self, reference: &RegistryReference, resource: &str) -> String {
+        #[cfg(test)]
+        if let Some(endpoint_base) = &self.endpoint_base {
+            return format!("{endpoint_base}/v2/{}/{resource}", reference.repository);
+        }
+        format!(
+            "https://{}/v2/{}/{resource}",
+            reference.endpoint_registry(),
+            reference.repository
+        )
+    }
+
+    #[allow(clippy::unused_self)]
+    fn token_realm(&self, value: &str) -> Result<Url, RegistryError> {
+        #[cfg(test)]
+        if self.allow_insecure_token_realm {
+            let url = Url::parse(value).map_err(|_| RegistryError::InvalidTokenRealm)?;
+            if matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.fragment().is_none()
+            {
+                return Ok(url);
+            }
+            return Err(RegistryError::InvalidTokenRealm);
+        }
+        validate_token_realm(value)
+    }
+
+    #[cfg(test)]
+    fn for_mock_registry(
+        endpoint_base: String,
+        credentials: Option<Credentials>,
+        timeout: Duration,
+    ) -> Result<Self, RegistryError> {
+        let user_agent = concat!("moraebox/", env!("CARGO_PKG_VERSION"), " test");
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .user_agent(user_agent)
+                .connect_timeout(timeout)
+                .read_timeout(timeout)
+                .timeout(timeout)
+                .build()?,
+            token_client: reqwest::Client::builder()
+                .user_agent(user_agent)
+                .redirect(redirect::Policy::none())
+                .connect_timeout(timeout)
+                .read_timeout(timeout)
+                .timeout(timeout)
+                .build()?,
+            credentials,
+            allowed_credential_realms: BTreeSet::new(),
+            limits: ImagePullLimits::default(),
+            endpoint_base: Some(endpoint_base),
+            allow_insecure_token_realm: true,
+        })
     }
 }
 
@@ -1197,15 +1257,18 @@ pub enum RegistryError {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
+        fmt::Write as _,
         io::{Cursor, Write},
         path::Path,
         sync::{
-            Arc,
+            Arc, Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering},
         },
     };
 
     use flate2::{Compression, write::GzEncoder};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
@@ -1258,6 +1321,180 @@ mod tests {
         format!(r#"Bearer realm="{realm}",service="registry.example",scope="repository:a/b:pull""#)
     }
 
+    #[derive(Clone, Debug)]
+    struct MockRequest {
+        target: String,
+        headers: BTreeMap<String, String>,
+    }
+
+    struct MockResponse {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        delay: Duration,
+    }
+
+    impl MockResponse {
+        fn new(status: u16, body: impl Into<Vec<u8>>) -> Self {
+            Self {
+                status,
+                headers: Vec::new(),
+                body: body.into(),
+                delay: Duration::ZERO,
+            }
+        }
+
+        fn header(mut self, name: &str, value: impl Into<String>) -> Self {
+            self.headers.push((name.into(), value.into()));
+            self
+        }
+
+        fn delayed(mut self, delay: Duration) -> Self {
+            self.delay = delay;
+            self
+        }
+    }
+
+    struct MockRegistry {
+        base_url: String,
+        requests: Arc<StdMutex<Vec<MockRequest>>>,
+        maximum_active: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl MockRegistry {
+        async fn start(
+            handler: impl Fn(MockRequest) -> MockResponse + Send + Sync + 'static,
+        ) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let requests = Arc::new(StdMutex::new(Vec::new()));
+            let active = Arc::new(AtomicUsize::new(0));
+            let maximum_active = Arc::new(AtomicUsize::new(0));
+            let handler = Arc::new(handler);
+            let task_requests = Arc::clone(&requests);
+            let task_active = Arc::clone(&active);
+            let task_maximum = Arc::clone(&maximum_active);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let handler = Arc::clone(&handler);
+                    let requests = Arc::clone(&task_requests);
+                    let active = Arc::clone(&task_active);
+                    let maximum = Arc::clone(&task_maximum);
+                    tokio::spawn(async move {
+                        serve_mock_request(stream, handler, requests, active, maximum).await;
+                    });
+                }
+            });
+            Self {
+                base_url: format!("http://{address}"),
+                requests,
+                maximum_active,
+                task,
+            }
+        }
+
+        fn requests(&self) -> Vec<MockRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+
+        fn maximum_active(&self) -> usize {
+            self.maximum_active.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for MockRegistry {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn serve_mock_request(
+        mut stream: tokio::net::TcpStream,
+        handler: Arc<dyn Fn(MockRequest) -> MockResponse + Send + Sync>,
+        requests: Arc<StdMutex<Vec<MockRequest>>>,
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+    ) {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            let Ok(read) = stream.read(&mut buffer).await else {
+                return;
+            };
+            if read == 0 || bytes.len().saturating_add(read) > 64 * 1024 {
+                return;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        let request_text = String::from_utf8_lossy(&bytes);
+        let mut lines = request_text.split("\r\n");
+        let Some(target) = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let headers = lines
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+            .collect();
+        let request = MockRequest { target, headers };
+        requests.lock().unwrap().push(request.clone());
+        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+        maximum.fetch_max(current, Ordering::SeqCst);
+        let response = handler(request);
+        tokio::time::sleep(response.delay).await;
+        let reason = match response.status {
+            200 => "OK",
+            401 => "Unauthorized",
+            408 => "Request Timeout",
+            429 => "Too Many Requests",
+            503 => "Service Unavailable",
+            _ => "Mock Response",
+        };
+        let mut head = format!(
+            "HTTP/1.1 {} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            response.status,
+            response.body.len()
+        );
+        for (name, value) in response.headers {
+            let _ = write!(head, "{name}: {value}\r\n");
+        }
+        head.push_str("\r\n");
+        let _ = stream.write_all(head.as_bytes()).await;
+        let _ = stream.write_all(&response.body).await;
+        let _ = stream.shutdown().await;
+        active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn empty_manifest(config: &[u8]) -> (Vec<u8>, Digest, Digest) {
+        let config_digest = Digest::from_bytes(config);
+        let manifest = ImageManifest {
+            schema_version: 2,
+            media_type: Some("application/vnd.oci.image.manifest.v1+json".into()),
+            config: Descriptor {
+                media_type: "application/vnd.oci.image.config.v1+json".into(),
+                digest: config_digest.to_string(),
+                size: u64::try_from(config.len()).unwrap(),
+                platform: None,
+            },
+            layers: Vec::new(),
+        };
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = Digest::from_bytes(&bytes);
+        (bytes, manifest_digest, config_digest)
+    }
+
     #[tokio::test]
     async fn buffered_downloads_bound_concurrency_and_preserve_descriptor_order() {
         let active = Arc::new(AtomicUsize::new(0));
@@ -1297,6 +1534,225 @@ mod tests {
         let mut headers = header::HeaderMap::new();
         headers.insert(header::RETRY_AFTER, header::HeaderValue::from_static("60"));
         assert_eq!(retry_delay(&headers, 0, now), MAX_RETRY_DELAY);
+    }
+
+    #[tokio::test]
+    async fn mock_registry_rejects_a_digest_mismatch_without_publishing_it() {
+        let body = br#"{"schemaVersion":2,"config":{},"layers":[]}"#.to_vec();
+        let actual = Digest::from_bytes(&body);
+        let served = body.clone();
+        let registry = MockRegistry::start(move |_| MockResponse::new(200, served.clone())).await;
+        let expected = Digest::from_bytes(b"different manifest");
+        let endpoint = registry.base_url.trim_start_matches("http://");
+        let reference = format!("{endpoint}/a/b@{expected}").parse().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let cas = Cas::new(directory.path());
+        let client = RegistryClient::for_mock_registry(
+            registry.base_url.clone(),
+            None,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        let error = client
+            .pull(reference, &Platform::host_linux(), &cas)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RegistryError::ManifestDigestMismatch {
+                expected: reported_expected,
+                actual: reported_actual,
+            } if reported_expected == expected && reported_actual == actual
+        ));
+        assert_eq!(registry.request_count(), 1);
+        assert!(!cas.blob_path(&actual).exists());
+    }
+
+    #[tokio::test]
+    async fn mock_registry_completes_bearer_auth_before_retrying_the_manifest() {
+        let invalid_manifest = serde_json::to_vec(&ImageManifest {
+            schema_version: 1,
+            media_type: Some("application/vnd.oci.image.manifest.v1+json".into()),
+            config: descriptor(0),
+            layers: Vec::new(),
+        })
+        .unwrap();
+        let registry = MockRegistry::start(move |request| {
+            if request.target.starts_with("/token?") {
+                return MockResponse::new(200, br#"{"token":"registry-token"}"#.to_vec())
+                    .header("Content-Type", "application/json");
+            }
+            if request.headers.get("authorization").map(String::as_str)
+                == Some("Bearer registry-token")
+            {
+                return MockResponse::new(200, invalid_manifest.clone());
+            }
+            let host = request.headers.get("host").unwrap();
+            MockResponse::new(401, Vec::new()).header(
+                "WWW-Authenticate",
+                bearer_challenge(&format!("http://{host}/token")),
+            )
+        })
+        .await;
+        let endpoint = registry.base_url.trim_start_matches("http://");
+        let reference = format!("{endpoint}/a/b:latest").parse().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let client = RegistryClient::for_mock_registry(
+            registry.base_url.clone(),
+            Some(credentials()),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        let error = client
+            .pull(
+                reference,
+                &Platform::host_linux(),
+                &Cas::new(directory.path()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RegistryError::UnsupportedSchema(1)),
+            "unexpected authentication result: {error:?}"
+        );
+        let requests = registry.requests();
+        assert_eq!(requests.len(), 3);
+        let token = requests
+            .iter()
+            .find(|request| request.target.starts_with("/token?"))
+            .unwrap();
+        assert_eq!(
+            token.headers.get("authorization").map(String::as_str),
+            Some("Basic dXNlcjpzZWNyZXQ=")
+        );
+        let manifests = requests
+            .iter()
+            .filter(|request| request.target.contains("/manifests/"))
+            .collect::<Vec<_>>();
+        assert_eq!(manifests.len(), 2);
+        assert!(!manifests[0].headers.contains_key("authorization"));
+        assert_eq!(
+            manifests[1]
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer registry-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_registry_retries_transient_status_and_bounds_timeouts() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let retry_registry = MockRegistry::start(move |_| {
+            let attempt = handler_attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt < 2 {
+                MockResponse::new(503, Vec::new()).header("Retry-After", "0")
+            } else {
+                MockResponse::new(200, b"ready".to_vec())
+            }
+        })
+        .await;
+        let retry_client = RegistryClient::for_mock_registry(
+            retry_registry.base_url.clone(),
+            None,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let response = retry_client
+            .send_retrying(
+                retry_client
+                    .client
+                    .get(format!("{}/retry", retry_registry.base_url)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_REQUEST_ATTEMPTS);
+
+        let timeout_registry = MockRegistry::start(|_| {
+            MockResponse::new(200, b"late".to_vec()).delayed(Duration::from_millis(75))
+        })
+        .await;
+        let timeout_client = RegistryClient::for_mock_registry(
+            timeout_registry.base_url.clone(),
+            None,
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        let error = timeout_client
+            .send_retrying(
+                timeout_client
+                    .client
+                    .get(format!("{}/slow", timeout_registry.base_url)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RegistryError::Http(error) if error.is_timeout()));
+        assert_eq!(timeout_registry.request_count(), MAX_REQUEST_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn concurrent_mock_registry_pulls_publish_one_verified_cas_result() {
+        let config = b"{}".to_vec();
+        let (manifest, manifest_digest, config_digest) = empty_manifest(&config);
+        let served_manifest = manifest.clone();
+        let served_manifest_digest = manifest_digest.clone();
+        let served_config = config.clone();
+        let served_config_digest = config_digest.clone();
+        let registry = MockRegistry::start(move |request| {
+            if request.target.contains("/manifests/") {
+                MockResponse::new(200, served_manifest.clone())
+                    .header("Docker-Content-Digest", served_manifest_digest.to_string())
+                    .delayed(Duration::from_millis(40))
+            } else if request
+                .target
+                .ends_with(&format!("/blobs/{served_config_digest}"))
+            {
+                MockResponse::new(200, served_config.clone()).delayed(Duration::from_millis(40))
+            } else {
+                MockResponse::new(404, Vec::new())
+            }
+        })
+        .await;
+        let endpoint = registry.base_url.trim_start_matches("http://");
+        let reference: RegistryReference = format!("{endpoint}/a/b:latest").parse().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let cas = Cas::new(directory.path());
+        let client = RegistryClient::for_mock_registry(
+            registry.base_url.clone(),
+            None,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let platform = Platform::host_linux();
+
+        let (first, second) = tokio::join!(
+            client.pull(reference.clone(), &platform, &cas),
+            client.pull(reference, &platform, &cas)
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(first.manifest_digest, manifest_digest);
+        assert_eq!(second.manifest_digest, manifest_digest);
+        assert_eq!(first.config_digest, config_digest);
+        assert_eq!(second.config_digest, config_digest);
+        cas.verify(&manifest_digest).await.unwrap();
+        cas.verify(&config_digest).await.unwrap();
+        assert!(registry.maximum_active() >= 2);
+        assert_eq!(
+            registry
+                .requests()
+                .iter()
+                .filter(|request| request.target.contains("/manifests/"))
+                .count(),
+            2
+        );
     }
 
     #[test]

@@ -222,3 +222,32 @@ pub(super) fn remove_managed_path_if_exists(path: &Path) -> Result<bool, ImageCa
         Err(error) => Err(error.into()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+
+    #[derive(Debug, Deserialize, PartialEq, Serialize)]
+    struct TestRecord {
+        generation: u64,
+    }
+
+    #[test]
+    fn interrupted_atomic_write_preserves_committed_data_and_allows_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("record.json");
+        write_json_atomic(&path, &TestRecord { generation: 1 }).unwrap();
+        let stale = directory.path().join(".record.json.999.1.tmp");
+        fs::write(&stale, br#"{"generation":"#).unwrap();
+
+        let committed: TestRecord = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(committed, TestRecord { generation: 1 });
+
+        write_json_atomic(&path, &TestRecord { generation: 2 }).unwrap();
+        let recovered: TestRecord = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(recovered, TestRecord { generation: 2 });
+        assert_eq!(fs::read(stale).unwrap(), br#"{"generation":"#);
+    }
+}
