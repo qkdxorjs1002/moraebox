@@ -11,6 +11,7 @@ name = "morae-mcp"
 path = "src/main.rs"
 
 [dependencies]
+async-trait.workspace = true
 base64.workspace = true
 clap = { workspace = true, features = ["env"] }
 moraebox-core = { path = "../moraebox-core" }

@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand};
 use moraebox_box::{
@@ -24,8 +25,9 @@ use moraebox_core::{
 };
 use moraebox_image::{Credentials, ImageCache, Platform, digest_tree};
 use moraebox_runtime::{
-    Backend, BackendError, BoxRootSource, BoxRuntimeConfig, LibkrunBackend, LibkrunConfig,
-    NativeRuntimePaths, ProcessBackend, SessionError,
+    Backend, BackendCapabilities, BackendError, BoxRootSource, BoxRuntimeConfig, LibkrunBackend,
+    LibkrunConfig, NativeRuntimePaths, ProcessBackend, RunBudget, RunStage, SessionError,
+    SpawnedSandbox, StageError,
 };
 use moraebox_sdk::{
     ExecutionPageResult, IoRequest, IoResult, MAX_IO_OUTPUT_READ_BYTES, SandboxSdk, SdkError,
@@ -60,7 +62,9 @@ const SERVER_INSTRUCTIONS: &str = concat!(
     "connection and remain available until sandbox_remove or client disconnect. Up to 32 ",
     "sessions may run at once; completed async sessions retain status and output for five ",
     "minutes unless sandbox_remove releases them sooner. sandbox_stop preserves the completed ",
-    "record for output reads. Pass box_id to continue from a persistent Box while ",
+    "record for output reads. The first image-backed run prepares its image lazily within the ",
+    "run timeout; preparation failures report image_prepare_failed at the image_pull stage. ",
+    "Pass box_id to continue from a persistent Box while ",
     "still receiving a new microVM and SessionId for every run. Use the sandbox_box_* tools ",
     "to create and manage persistent root filesystems. Only the libkrun backend provides VM isolation; the ",
     "process backend is for deterministic development and is not isolated. Host workspace ",
@@ -149,6 +153,93 @@ struct BoxServices {
     default_disk_size: u64,
 }
 
+struct LazyImageBackend {
+    config: LibkrunConfig,
+    runtime: BoxRuntimeConfig,
+    images: ImageCache,
+    reference: Option<String>,
+    platform: Platform,
+    credentials: Option<Credentials>,
+    virtual_size_bytes: u64,
+    mke2fs_path: PathBuf,
+    prepared: tokio::sync::OnceCell<LibkrunBackend>,
+}
+
+impl LazyImageBackend {
+    fn backend(&self, source: Option<BoxRootSource>) -> LibkrunBackend {
+        let mut runtime = self.runtime.clone();
+        runtime.source = source;
+        LibkrunBackend::new(self.config.clone()).with_box_runtime(runtime)
+    }
+
+    async fn prepare(&self) -> Result<LibkrunBackend, BackendError> {
+        let reference = self
+            .reference
+            .clone()
+            .map_or_else(|| self.images.default_reference(), Ok)
+            .map_err(image_prepare_error)?;
+        let prepared = self
+            .images
+            .resolve_or_pull(&reference, &self.platform, self.credentials.clone())
+            .await
+            .map_err(image_prepare_error)?;
+        Ok(self.backend(Some(BoxRootSource {
+            rootfs_path: prepared.rootfs,
+            manifest_digest: prepared.manifest_digest,
+            platform: platform_name(&self.platform),
+            virtual_size_bytes: self.virtual_size_bytes,
+            mke2fs_path: self.mke2fs_path.clone(),
+        })))
+    }
+
+    async fn prepared_backend(&self, budget: &RunBudget) -> Result<&LibkrunBackend, BackendError> {
+        match budget
+            .run(
+                RunStage::ImagePull,
+                self.prepared.get_or_try_init(|| self.prepare()),
+            )
+            .await
+        {
+            Ok(backend) => Ok(backend),
+            Err(StageError::Timeout(error)) => Err(BackendError::Timeout {
+                stage: error.stage,
+                limit: error.limit,
+            }),
+            Err(StageError::Failed { source, .. }) => Err(source),
+        }
+    }
+}
+
+fn image_prepare_error(error: impl std::fmt::Display) -> BackendError {
+    BackendError::ImagePreparation(error.to_string())
+}
+
+#[async_trait]
+impl Backend for LazyImageBackend {
+    fn name(&self) -> &'static str {
+        "libkrun"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        LibkrunBackend::CAPABILITIES
+    }
+
+    async fn spawn(
+        &self,
+        spec: &RunSpec,
+        budget: &RunBudget,
+    ) -> Result<SpawnedSandbox, BackendError> {
+        if spec.box_id.is_some() {
+            self.backend(None).spawn(spec, budget).await
+        } else {
+            self.prepared_backend(budget)
+                .await?
+                .spawn(spec, budget)
+                .await
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum ConnectionState {
     #[default]
@@ -223,7 +314,7 @@ async fn main() -> ExitCode {
             }
         };
     }
-    match create_server(server).await {
+    match create_server(server) {
         Ok(server) => match serve(server).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -263,7 +354,7 @@ fn should_show_bare_help(raw_args: &[OsString], parsed: &Args) -> bool {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error::Error>> {
+fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error::Error>> {
     let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
     let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     let platform = Platform::host_linux();
@@ -295,31 +386,11 @@ async fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error
             let library = paths.libkrun.ok_or(
                 "libkrun backend requires --libkrun, MORAE_LIBKRUN_PATH, or a supported Homebrew libkrun",
             )?;
-            let root_source = if let Some(rootfs) = args.rootfs {
-                BoxRootSource {
-                    manifest_digest: digest_tree(&rootfs)?.to_string(),
-                    rootfs_path: rootfs,
-                    platform: platform_name(&platform),
-                    virtual_size_bytes: args.disk_size,
-                    mke2fs_path: mke2fs_path.clone(),
-                }
-            } else {
-                let reference = match args.image {
-                    Some(reference) => reference,
-                    None => images.default_reference()?,
-                };
-                let prepared = images
-                    .resolve_or_pull(&reference, &platform, credentials.clone())
-                    .await?;
-                BoxRootSource {
-                    rootfs_path: prepared.rootfs,
-                    manifest_digest: prepared.manifest_digest,
-                    platform: platform_name(&platform),
-                    virtual_size_bytes: args.disk_size,
-                    mke2fs_path: mke2fs_path.clone(),
-                }
-            };
-            let mut config = LibkrunConfig::new(helper, library, &root_source.rootfs_path);
+            let root_path = args
+                .rootfs
+                .clone()
+                .unwrap_or_else(|| cache_dir.join("rootfs"));
+            let mut config = LibkrunConfig::new(helper, library, root_path);
             config.library_search_path = paths.library_search_path;
             config.gvproxy_path = paths.gvproxy;
             config.network_runtime_dir = cache_dir.join("network");
@@ -327,15 +398,37 @@ async fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error
             config.memory_mib = args.memory_mib;
             let ephemeral_disks = EphemeralDiskStore::new(cache_dir.join("runtime"));
             let _ = ephemeral_disks.garbage_collect()?;
-            Arc::new(
-                LibkrunBackend::new(config).with_box_runtime(BoxRuntimeConfig {
-                    boxes: box_store.clone(),
-                    base_disks: base_disks.clone(),
-                    ephemeral_disks,
-                    source: Some(root_source),
-                    e2fsck_path: args.e2fsck.unwrap_or_else(default_e2fsck),
-                }),
-            )
+            let runtime = BoxRuntimeConfig {
+                boxes: box_store.clone(),
+                base_disks: base_disks.clone(),
+                ephemeral_disks,
+                source: None,
+                e2fsck_path: args.e2fsck.unwrap_or_else(default_e2fsck),
+            };
+            if let Some(rootfs) = args.rootfs {
+                let source = BoxRootSource {
+                    manifest_digest: digest_tree(&rootfs)?.to_string(),
+                    rootfs_path: rootfs,
+                    platform: platform_name(&platform),
+                    virtual_size_bytes: args.disk_size,
+                    mke2fs_path: mke2fs_path.clone(),
+                };
+                let mut runtime = runtime;
+                runtime.source = Some(source);
+                Arc::new(LibkrunBackend::new(config).with_box_runtime(runtime))
+            } else {
+                Arc::new(LazyImageBackend {
+                    config,
+                    runtime,
+                    images: images.clone(),
+                    reference: args.image,
+                    platform: platform.clone(),
+                    credentials: credentials.clone(),
+                    virtual_size_bytes: args.disk_size,
+                    mke2fs_path: mke2fs_path.clone(),
+                    prepared: tokio::sync::OnceCell::new(),
+                })
+            }
         }
         _ => return Err("unsupported backend".into()),
     };
@@ -841,6 +934,13 @@ impl From<BackendError> for ToolError {
                 true,
                 format!("run timed out after {limit:?} during {stage}"),
                 "Retry with a larger timeout, or reduce the work performed by the command.",
+            ),
+            BackendError::ImagePreparation(message) => Self::new(
+                "image_prepare_failed",
+                RunStage::ImagePull.to_string(),
+                true,
+                message,
+                "Check the image reference, registry credentials, cache permissions, and network, then retry.",
             ),
             error => Self::new(
                 "backend_failure",
@@ -1617,7 +1717,7 @@ fn tools_list() -> Value {
             {
                 "name": "sandbox_exec",
                 "title": "Execute in configured runtime",
-                "description": "Start a command in the configured runtime. Every call receives a new SessionId and, with libkrun, a new microVM. Pass box_id only when the command should reuse that Box's persistent root filesystem. Prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. At most 32 sessions run concurrently. wait=true returns at most 1 MiB inline; when has_more is true, call sandbox_io with the returned SessionId and continuation_cursor within five minutes. Cancelled wait=true runs are cleaned. wait=false starts a session owned by this stdio connection until sandbox_remove or disconnect; completed status and output expire after five minutes. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
+                "description": "Start a command in the configured runtime. Every call receives a new SessionId and, with libkrun, a new microVM. The first image-backed run prepares its image lazily within timeout_ms; failures use code image_prepare_failed and stage image_pull. Pass box_id only when the command should reuse that Box's persistent root filesystem. Prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. At most 32 sessions run concurrently. wait=true returns at most 1 MiB inline; when has_more is true, call sandbox_io with the returned SessionId and continuation_cursor within five minutes. Cancelled wait=true runs are cleaned. wait=false starts a session owned by this stdio connection until sandbox_remove or disconnect; completed status and output expire after five minutes. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1950,7 +2050,6 @@ fn parse_disk_size(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use moraebox_image::Digest;
 
     #[test]
     fn connection_state_supports_stateless_and_legacy_modes() {
@@ -2567,8 +2666,7 @@ mod tests {
             mke2fs: None,
             e2fsck: None,
             disk_size: 8 * 1024 * 1024 * 1024,
-        })
-        .await;
+        });
 
         let Err(error) = result else {
             panic!("process server unexpectedly accepted a guest rootfs");
@@ -2580,33 +2678,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_image_configures_the_mcp_backend_without_network_access() {
-        let cache_dir =
-            std::env::temp_dir().join(format!("moraebox-mcp-cached-image-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&cache_dir);
-        let cache = ImageCache::new(&cache_dir);
-        let digest = Digest::from_bytes(b"cached-manifest");
-        let rootfs = cache_dir.join("rootfs/sha256").join(digest.hex());
-        std::fs::create_dir_all(&rootfs).unwrap();
-        std::fs::write(rootfs.join(".moraebox-rootfs-complete"), digest.to_string()).unwrap();
-        let platform = Platform::host_linux();
-        let lock = cache.lock_exclusive().unwrap();
-        cache
-            .record_image(&lock, "python:3.12", &digest, &platform)
-            .unwrap();
-        drop(lock);
-
-        let runtime_stub = cache_dir.join("runtime-stub");
+    async fn image_preparation_is_lazy_and_reports_tool_errors() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache_dir = temporary.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("default-image.json"), b"{").unwrap();
+        let runtime_stub = temporary.path().join("runtime-stub");
         std::fs::write(&runtime_stub, b"stub").unwrap();
-        let result = create_server(ServerArgs {
+        let server = create_server(ServerArgs {
             backend: "libkrun".into(),
             helper: Some(runtime_stub.clone()),
             libkrun: Some(runtime_stub),
             gvproxy: None,
             rootfs: None,
-            image: Some("python:3.12".into()),
+            image: None,
             cache_dir: Some(cache_dir.clone()),
-            state_dir: Some(cache_dir.join("state")),
+            state_dir: Some(temporary.path().join("state")),
             registry_username: None,
             registry_password: None,
             lib_dir: None,
@@ -2616,9 +2703,48 @@ mod tests {
             e2fsck: None,
             disk_size: 8 * 1024 * 1024 * 1024,
         })
+        .expect("server creation must not resolve the image");
+
+        let initialized = handle_request(
+            &server,
+            json!({
+                "jsonrpc":"2.0", "id":1, "method":"initialize",
+                "params":{"protocolVersion":PROTOCOL_VERSION}
+            }),
+        )
         .await;
-        assert!(result.is_ok(), "unexpected error: {:?}", result.err());
-        std::fs::remove_dir_all(cache_dir).unwrap();
+        assert_eq!(
+            initialized.pointer("/result/protocolVersion"),
+            Some(&json!(PROTOCOL_VERSION))
+        );
+
+        let failed = call(
+            &server,
+            "sandbox_exec",
+            json!({"argv": successful_command()}),
+        )
+        .await;
+        assert_eq!(failed.pointer("/result/isError"), Some(&json!(true)));
+        assert_eq!(
+            failed.pointer("/result/structuredContent/error/code"),
+            Some(&json!("image_prepare_failed"))
+        );
+        assert_eq!(
+            failed.pointer("/result/structuredContent/error/stage"),
+            Some(&json!("image_pull"))
+        );
+
+        let persistent = call(
+            &server,
+            "sandbox_exec",
+            json!({"argv": successful_command(), "box_id": BoxId::new()}),
+        )
+        .await;
+        assert_ne!(
+            persistent.pointer("/result/structuredContent/error/code"),
+            Some(&json!("image_prepare_failed")),
+            "persistent Box execution must bypass default image preparation"
+        );
     }
 
     fn test_server(sdk: SandboxSdk) -> McpServer {

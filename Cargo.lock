@@ -809,6 +809,7 @@ dependencies = [
 name = "moraebox-mcp"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
  "clap",
  "moraebox-box",

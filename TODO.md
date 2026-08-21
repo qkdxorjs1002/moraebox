@@ -153,7 +153,7 @@
 - [x] 각 tool에 `outputSchema`와 실제 side effect에 맞는 annotations를 추가한다.
   - persistent Box에서 실행하는 `sandbox_exec`와 signal/stop의 mutation을 숨기지 않는다.
 
-- [ ] MCP server 시작 시 default image를 eager pull하지 않고 protocol handshake를 먼저 받을 수 있게 한다.
+- [x] MCP server 시작 시 default image를 eager pull하지 않고 protocol handshake를 먼저 받을 수 있게 한다.
   - 최초 실행의 lazy preparation 상태와 오류를 tool result로 보고한다.
 
 - [ ] MCP install 경로를 견고하게 만든다.

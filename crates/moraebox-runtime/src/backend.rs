@@ -126,6 +126,8 @@ pub enum BackendError {
     Io(#[from] io::Error),
     #[error("backend control failed: {0}")]
     Control(String),
+    #[error("image preparation failed: {0}")]
+    ImagePreparation(String),
     #[error("run timed out after {limit:?} during {stage}")]
     Timeout { stage: RunStage, limit: Duration },
     #[error("host environment {component} for {variable} is not valid Unicode")]
