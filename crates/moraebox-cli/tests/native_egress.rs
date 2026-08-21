@@ -2,6 +2,7 @@
 
 use std::{
     env, fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     thread,
@@ -11,6 +12,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use nix::{
     errno::Errno,
+    fcntl::{FcntlArg, OFlag, fcntl},
+    pty::{Winsize, openpty},
     sys::signal::{self, Signal},
     unistd::Pid,
 };
@@ -88,6 +91,26 @@ time.sleep(1)
 "#;
 
 const SLEEP_PROBE: &str = "import time; time.sleep(60)";
+const PROTOCOL_IO_PROBE: &str = r#"
+import sys
+data = sys.stdin.buffer.read()
+sys.stdout.write("protocol-stdout:" + data.decode())
+sys.stderr.write("protocol-stderr\n")
+sys.exit(23)
+"#;
+const TTY_RESIZE_PROBE: &str = r#"
+import os, signal, sys
+
+def report_size(*_):
+    size = os.get_terminal_size(sys.stdin.fileno())
+    print(f"tty-size:{size.lines}x{size.columns}", flush=True)
+    if size.lines == 41 and size.columns == 99:
+        raise SystemExit(0)
+
+signal.signal(signal.SIGWINCH, report_size)
+report_size()
+signal.pause()
+"#;
 
 #[derive(Debug, Deserialize)]
 struct CachedImage {
@@ -396,16 +419,146 @@ fn assert_dead_report(report: &Value) {
 }
 
 fn report_output_text(report: &Value) -> String {
+    report_channel_text(report, None)
+}
+
+fn report_channel_text(report: &Value, channel: Option<&str>) -> String {
     let bytes = report["output"]
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|chunk| channel.is_none_or(|expected| chunk["channel"] == expected))
         .filter_map(|chunk| chunk["data"].as_array())
         .flatten()
         .filter_map(Value::as_u64)
         .filter_map(|byte| u8::try_from(byte).ok())
         .collect::<Vec<_>>();
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn assert_protocol_io(harness: &NativeHarness) {
+    let mut command = harness.command();
+    command
+        .args(["--timeout", "20s", "--json", "--", "python3", "-c"])
+        .arg(python_bootstrap(PROTOCOL_IO_PROBE))
+        .stdin(Stdio::piped());
+    let mut child = command.spawn().expect("spawn protocol I/O probe");
+    child
+        .stdin
+        .take()
+        .expect("protocol I/O stdin")
+        .write_all(b"stdin-through-vsock\n")
+        .expect("write protocol I/O stdin");
+    let children = wait_for_native_children(&mut child, false);
+    let output = wait_for_output(child);
+    assert_eq!(output.status.code(), Some(23));
+    let report = parse_report(&output);
+    assert_dead_report(&report);
+    assert_eq!(report["exit_code"], 23);
+    assert_eq!(report["timed_out"], false);
+    assert_eq!(
+        report_channel_text(&report, Some("stdout")),
+        "protocol-stdout:stdin-through-vsock\n"
+    );
+    assert_eq!(
+        report_channel_text(&report, Some("stderr")),
+        "protocol-stderr\n"
+    );
+    assert_children_gone(&children);
+    harness.assert_network_state_empty();
+}
+
+fn read_pty_until(reader: &mut fs::File, output: &mut Vec<u8>, marker: &str) {
+    let deadline = Instant::now() + RUN_EXIT_TIMEOUT;
+    let mut buffer = [0_u8; 4096];
+    while !String::from_utf8_lossy(output).contains(marker) {
+        match reader.read(&mut buffer) {
+            Ok(0) => panic!("PTY closed before output contained {marker:?}"),
+            Ok(count) => output.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "PTY output did not contain {marker:?}: {}",
+                    String::from_utf8_lossy(output)
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("read PTY output while waiting for {marker:?}: {error}"),
+        }
+    }
+}
+
+fn assert_tty_resize(harness: &NativeHarness) {
+    let initial = Winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let pty = openpty(Some(&initial), None).expect("open host PTY");
+    fcntl(&pty.master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).expect("make PTY nonblocking");
+    let mut master = fs::File::from(pty.master);
+    let slave = fs::File::from(pty.slave);
+    let mut command = harness.command();
+    command
+        .args([
+            "--timeout",
+            "30s",
+            "--interactive",
+            "--tty",
+            "--",
+            "python3",
+            "-c",
+        ])
+        .arg(python_bootstrap(TTY_RESIZE_PROBE))
+        .stdin(Stdio::from(
+            slave.try_clone().expect("clone PTY slave stdin"),
+        ))
+        .stdout(Stdio::from(
+            slave.try_clone().expect("clone PTY slave stdout"),
+        ))
+        .stderr(Stdio::from(slave));
+    let mut child = command.spawn().expect("spawn TTY resize probe");
+    let children = wait_for_native_children(&mut child, false);
+
+    let mut pty_output = Vec::new();
+    read_pty_until(&mut master, &mut pty_output, "tty-size:24x80");
+
+    rustix::termios::tcsetwinsize(
+        &master,
+        rustix::termios::Winsize {
+            ws_row: 41,
+            ws_col: 99,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    )
+    .expect("resize host PTY");
+    signal::kill(
+        Pid::from_raw(i32::try_from(child.id()).expect("morae PID fits i32")),
+        Signal::SIGWINCH,
+    )
+    .expect("signal host terminal resize");
+    read_pty_until(&mut master, &mut pty_output, "tty-size:41x99");
+
+    let output = wait_for_output(child);
+    let mut final_buffer = [0_u8; 4096];
+    while let Ok(count) = master.read(&mut final_buffer) {
+        if count == 0 {
+            break;
+        }
+        pty_output.extend_from_slice(&final_buffer[..count]);
+    }
+    drop(master);
+    assert!(
+        output.status.success(),
+        "TTY resize probe failed with status {}: PTY={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&pty_output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_children_gone(&children);
+    harness.assert_network_state_empty();
 }
 
 fn assert_children_gone(children: &NativeChildren) {
@@ -516,6 +669,8 @@ fn assert_helper_crash_cleanup(harness: &NativeHarness) {
 #[ignore = "requires signed Apple Silicon libkrun, gvproxy, and a ready cached image"]
 fn signed_native_egress_gate() {
     let harness = NativeHarness::new();
+    assert_protocol_io(&harness);
+    assert_tty_resize(&harness);
     assert_successful_probe(&harness, false, "network-off-blocked", NETWORK_OFF_PROBE);
     assert_successful_probe(&harness, true, "network-on-allowed", NETWORK_ON_PROBE);
     assert_timeout_cleanup(&harness);

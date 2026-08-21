@@ -8,13 +8,20 @@ const INTERACTIVE_READ_BYTES: usize = 64 * 1024;
 
 pub(super) async fn run_interactive<B>(
     backend: B,
-    spec: RunSpec,
+    mut spec: RunSpec,
     budget: RunBudget,
 ) -> Result<i32, CliErrorSource>
 where
     B: Backend + 'static,
 {
-    let _terminal = RawTerminalGuard::enter(spec.tty && io::stdin().is_terminal())?;
+    let host_terminal = spec.tty && io::stdin().is_terminal();
+    if host_terminal {
+        if let Some((rows, columns)) = terminal_window_size()? {
+            spec.tty_rows = rows;
+            spec.tty_columns = columns;
+        }
+    }
+    let _terminal = RawTerminalGuard::enter(host_terminal)?;
     let mut input = InteractiveInput::new()?;
     let mut signals = HostSignals::new()?;
     let session = SessionManager::new(Arc::new(backend))
@@ -51,10 +58,11 @@ where
                 output_result?;
             }
             signal_result = signals.recv() => {
-                let signal = signal_result?;
-                let error = session.signal(signal).await.err().filter(|_| {
-                    session.status().state != SessionState::Dead
-                });
+                let request = match signal_result? {
+                    HostEvent::Signal(signal) => session.signal(signal).await,
+                    HostEvent::Resize(rows, columns) => session.resize(rows, columns).await,
+                };
+                let error = request.err().filter(|_| session.status().state != SessionState::Dead);
                 if let Some(error) = error {
                     return Err(error.into());
                 }
@@ -66,6 +74,27 @@ where
     stdout.flush().await?;
     stderr.flush().await?;
     Ok(session_exit_code(&status))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    expect(dead_code, reason = "window-change events are available only on Unix")
+)]
+enum HostEvent {
+    Signal(Signal),
+    Resize(u16, u16),
+}
+
+#[cfg(unix)]
+fn terminal_window_size() -> io::Result<Option<(u16, u16)>> {
+    let window = rustix::termios::tcgetwinsize(io::stdin()).map_err(io::Error::from)?;
+    Ok((window.ws_row != 0 && window.ws_col != 0).then_some((window.ws_row, window.ws_col)))
+}
+
+#[cfg(not(unix))]
+fn terminal_window_size() -> io::Result<Option<(u16, u16)>> {
+    Ok(None)
 }
 
 async fn forward_interactive_input(
@@ -264,6 +293,7 @@ impl InteractiveInput {
 struct HostSignals {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
+    window_change: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
@@ -274,21 +304,38 @@ impl HostSignals {
         Ok(Self {
             interrupt: signal(SignalKind::interrupt())?,
             terminate: signal(SignalKind::terminate())?,
+            window_change: signal(SignalKind::window_change())?,
         })
     }
 
-    async fn recv(&mut self) -> io::Result<Signal> {
-        tokio::select! {
-            value = self.interrupt.recv() => signal_event(value, Signal::Interrupt),
-            value = self.terminate.recv() => signal_event(value, Signal::Terminate),
+    async fn recv(&mut self) -> io::Result<HostEvent> {
+        loop {
+            let event = tokio::select! {
+                value = self.interrupt.recv() => {
+                    signal_event(value, HostEvent::Signal(Signal::Interrupt))?
+                }
+                value = self.terminate.recv() => {
+                    signal_event(value, HostEvent::Signal(Signal::Terminate))?
+                }
+                value = self.window_change.recv() => {
+                    signal_event(value, HostEvent::Resize(0, 0))?
+                }
+            };
+            if matches!(event, HostEvent::Resize(..)) {
+                if let Some((rows, columns)) = terminal_window_size()? {
+                    return Ok(HostEvent::Resize(rows, columns));
+                }
+            } else {
+                return Ok(event);
+            }
         }
     }
 }
 
 #[cfg(unix)]
-fn signal_event(received: Option<()>, signal: Signal) -> io::Result<Signal> {
+fn signal_event(received: Option<()>, event: HostEvent) -> io::Result<HostEvent> {
     received
-        .map(|()| signal)
+        .map(|()| event)
         .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "host signal stream closed"))
 }
 
@@ -305,11 +352,11 @@ impl HostSignals {
         })
     }
 
-    async fn recv(&mut self) -> io::Result<Signal> {
+    async fn recv(&mut self) -> io::Result<HostEvent> {
         self.interrupt
             .recv()
             .await
-            .map(|()| Signal::Interrupt)
+            .map(|()| HostEvent::Signal(Signal::Interrupt))
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "host signal stream closed"))
     }
 }
@@ -323,8 +370,8 @@ impl HostSignals {
         Ok(Self)
     }
 
-    async fn recv(&mut self) -> io::Result<Signal> {
+    async fn recv(&mut self) -> io::Result<HostEvent> {
         tokio::signal::ctrl_c().await?;
-        Ok(Signal::Interrupt)
+        Ok(HostEvent::Signal(Signal::Interrupt))
     }
 }

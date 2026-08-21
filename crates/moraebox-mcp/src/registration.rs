@@ -138,6 +138,9 @@ pub struct InstallArgs {
     /// Override the e2fsck utility used to recover dirty Boxes.
     #[arg(long, env = "MORAE_E2FSCK")]
     e2fsck: Option<PathBuf>,
+    /// Override the debugfs utility used to restore the trusted guest agent.
+    #[arg(long, env = "MORAE_DEBUGFS")]
+    debugfs: Option<PathBuf>,
     /// Virtual root disk size for ephemeral runs and new Boxes.
     #[arg(long, default_value = "8GiB", value_parser = super::parse_disk_size)]
     disk_size: u64,
@@ -171,6 +174,7 @@ struct NativeRegistrationPaths {
     library_search_path: Option<PathBuf>,
     mke2fs: Option<PathBuf>,
     e2fsck: Option<PathBuf>,
+    debugfs: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -349,6 +353,7 @@ fn server_configuration_with_paths(
         ("MORAE_GVPROXY_PATH", native_paths.gvproxy.as_ref()),
         ("MORAE_MKE2FS", native_paths.mke2fs.as_ref()),
         ("MORAE_E2FSCK", native_paths.e2fsck.as_ref()),
+        ("MORAE_DEBUGFS", native_paths.debugfs.as_ref()),
     ] {
         if let Some(path) = path {
             environment.push((name, absolute_path(path)?.into_os_string()));
@@ -375,8 +380,13 @@ fn resolve_native_registration_paths(
             install.gvproxy.clone(),
         )
     });
-    let discovered_disk_tools =
-        discover.then(|| DiskToolPaths::discover(install.mke2fs.clone(), install.e2fsck.clone()));
+    let discovered_disk_tools = discover.then(|| {
+        DiskToolPaths::discover_with_debugfs(
+            install.mke2fs.clone(),
+            install.e2fsck.clone(),
+            install.debugfs.clone(),
+        )
+    });
     let helper = discovered
         .as_ref()
         .and_then(|paths| paths.helper.clone())
@@ -418,6 +428,17 @@ fn resolve_native_registration_paths(
     } else {
         install.e2fsck.as_deref().map(absolute_path).transpose()?
     };
+    let debugfs = if discover {
+        resolve_tool_path(
+            install.debugfs.as_deref(),
+            &discovered_disk_tools
+                .as_ref()
+                .expect("disk tools are discovered with native paths")
+                .debugfs_command(),
+        )?
+    } else {
+        install.debugfs.as_deref().map(absolute_path).transpose()?
+    };
     Ok(NativeRegistrationPaths {
         helper,
         libkrun,
@@ -426,6 +447,7 @@ fn resolve_native_registration_paths(
         library_search_path,
         mke2fs,
         e2fsck,
+        debugfs,
     })
 }
 
@@ -850,6 +872,7 @@ mod tests {
             lib_dir: None,
             mke2fs: None,
             e2fsck: None,
+            debugfs: None,
             disk_size: 8 * 1024 * 1024 * 1024,
             cpus: 2,
             memory_mib: 512,
@@ -1049,6 +1072,7 @@ mod tests {
         install.lib_dir = Some("lib".into());
         install.mke2fs = Some("tools/mke2fs".into());
         install.e2fsck = Some("tools/e2fsck".into());
+        install.debugfs = Some("tools/debugfs".into());
 
         let (environment, _) = server_configuration(&install).unwrap();
 

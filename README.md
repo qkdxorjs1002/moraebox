@@ -178,7 +178,7 @@ moraebox walks the host tree without following symlinks, rejects unsafe entries,
 morae run --image alpine:latest --tty --interactive -- /bin/sh
 ```
 
-PTY allocation is supported by the native backend. Live terminal resize is not implemented yet.
+PTY allocation and live terminal resize are supported by the native backend. The CLI forwards host `SIGWINCH` events through the control protocol to the guest PTY.
 
 ### Manage local storage
 
@@ -290,7 +290,13 @@ CLI / Rust SDK / MCP server
     one VMM helper process
        released libkrun ABI
              │
-   console + vsock (TSI off)
+ diagnostic console + control vsock (TSI off)
+             │
+ bounded versioned protocol
+ session · stream · sequence
+             │
+  trusted embedded guest agent
+       argv · I/O · signals · PTY
  optional virtio-net ↔ gvproxy
              │
       one Linux microVM
@@ -318,8 +324,8 @@ prepare → start → ready → running → stop → dead
 | `moraebox-sdk` | Async embedding API |
 | `moraebox-cli` | The `morae` interface with separated command and interactive I/O modules |
 | `moraebox-mcp` | MCP tool protocol, stdio transport, and agent registration |
-| `moraebox-vmm-helper` | Signed native boundary around libkrun |
-| `moraebox-protocol` | Bounded host/guest protocol types |
+| `moraebox-vmm-helper` | Signed native boundary around libkrun plus the embedded Linux guest agent |
+| `moraebox-protocol` | Bounded, versioned host/guest framing, messages, and state validation |
 
 ## Security model
 
@@ -329,6 +335,8 @@ Security-relevant defaults include:
 
 - no guest network interface unless one run explicitly opts in;
 - a control vsock with Transparent Socket Impersonation flags set to zero;
+- version, session, stream, sequence, direction, and state validation on every control message, with an 8 MiB frame limit;
+- a guest agent embedded in the signed helper and re-injected, mode-checked, and byte-verified for every root-disk lease, including persistent Boxes;
 - opt-in egress uses a per-run gvproxy virtio-net process that is cleaned up with the VM;
 - no host environment forwarding;
 - no implicit shell parsing;
@@ -352,13 +360,13 @@ moraebox does **not** claim to protect against a hostile host user, a compromise
 | VM reuse | Materialized artifacts may be cached; booted untrusted VMs are never reused |
 | Box persistence | Opt-in full root filesystem persistence; each run still uses a fresh microVM |
 | Workspaces | Read-only snapshots; writable overlays and copy-out/diff are future work |
-| Interactive I/O | PTY supported; live resize is future work |
+| Interactive I/O | PTY and live terminal resize supported over the bounded control protocol |
 
 This is an early-stage project. Review the boundaries above before using it for security-sensitive workloads.
 
 ## Build from source
 
-Rust 1.85 or newer is required.
+Rust 1.85 or newer and Go 1.23 or newer are required. The helper build cross-compiles a static Linux/arm64 guest agent with the Go standard library and embeds it in the signed host helper.
 
 ```sh
 cargo build --release --locked \
@@ -371,11 +379,13 @@ codesign --force --sign - \
   target/release/morae-vmm-helper
 ```
 
-Native execution additionally needs compatible released libkrun/libkrunfw builds, Hypervisor.framework, `mke2fs` and `e2fsck` from `e2fsprogs`, and `gvproxy` for opt-in networking. `morae doctor --json` reports base native readiness and network readiness separately, and probes the effective `--cache-dir` volume rather than an unrelated system temporary volume. Both doctor and runtime require a successful Unix datagram connection to the bound gvproxy vfkit endpoint; a path that merely exists is not ready. Startup failures retain only the last 16 KiB of gvproxy stderr for bounded diagnostics.
+Native execution additionally needs compatible released libkrun/libkrunfw builds, Hypervisor.framework, `mke2fs`, `e2fsck`, and `debugfs` from `e2fsprogs`, and `gvproxy` for opt-in networking. `debugfs` installs the trusted agent into each leased root disk without exposing a host source directory to the guest. `morae doctor --json` reports base native readiness and network readiness separately, and probes the effective `--cache-dir` volume rather than an unrelated system temporary volume. Both doctor and runtime require a successful Unix datagram connection to the bound gvproxy vfkit endpoint; a path that merely exists is not ready. Startup failures retain only the last 16 KiB of gvproxy stderr for bounded diagnostics.
 
 Native startup finishes root disk preparation before starting gvproxy. A root preparation failure therefore creates no network process, and a later helper spawn failure or cancelled network setup explicitly kills and reaps gvproxy before its runtime state is removed.
 
-Every native run repeats the same prerequisite checks reported by `morae doctor --json` before preparing a root disk or starting gvproxy. The helper must be executable, signed for the host architecture, and carry the Hypervisor entitlement. libkrun 1.19.4 and libkrunfw 5.5.0 must be signed host-architecture files whose canonical Homebrew paths prove the pinned released versions; libkrun must also export the required ABI and, for networked runs, `krun_add_net_unixgram`. An unverifiable copied or custom library is rejected with doctor-based remediation instead of reaching helper spawn.
+Every native run repeats the same prerequisite checks reported by `morae doctor --json` before preparing a root disk or starting gvproxy. The helper must be executable, signed for the host architecture, and carry the Hypervisor entitlement. libkrun 1.19.4 and libkrunfw 5.5.0 must be signed host-architecture files whose canonical Homebrew paths prove the pinned released versions; libkrun must also export `krun_add_vsock_port` and the other required ABI, plus `krun_add_net_unixgram` for networked runs. An unverifiable copied or custom library is rejected with doctor-based remediation instead of reaching helper spawn.
+
+The advanced `--rootfs /path/to/rootfs` directory mode remains a low-level compatibility path and uses libkrun's direct exec interface. Managed image and Box root-disk runs use the bounded host/guest protocol by default.
 
 CLI and MCP native execution share the `moraebox-sdk` configuration layer. It resolves disk tools and native helpers with the same override precedence, opens the same image/Box/base/ephemeral stores with startup garbage collection, and constructs image or rootfs sources with one platform, disk-size, and filesystem-tool policy. Frontends retain only command- and transport-specific choices.
 

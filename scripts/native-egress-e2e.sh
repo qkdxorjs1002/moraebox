@@ -9,6 +9,11 @@ if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
     exit 2
 fi
 
+command -v go >/dev/null 2>&1 || {
+    echo "native egress E2E requires Go to build the embedded guest agent" >&2
+    exit 2
+}
+
 cargo test -p moraebox-vmm-helper --locked
 cargo build --workspace --locked
 

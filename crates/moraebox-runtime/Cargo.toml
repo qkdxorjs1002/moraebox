@@ -15,6 +15,7 @@ serde.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+rustix = { workspace = true, features = ["termios"] }
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true

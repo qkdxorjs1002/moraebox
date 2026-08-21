@@ -24,6 +24,7 @@ const REQUIRED_LIBKRUN_SYMBOLS: &[&str] = &[
     "krun_add_disk",
     "krun_set_root_disk_remount",
     "krun_add_vsock",
+    "krun_add_vsock_port",
     "krun_add_virtio_console_default",
     "krun_start_enter",
 ];
@@ -54,6 +55,12 @@ const E2FSCK_CANDIDATES: &[&str] = &[
     "/usr/local/sbin/e2fsck",
     "/usr/sbin/e2fsck",
 ];
+const DEBUGFS_CANDIDATES: &[&str] = &[
+    "/opt/homebrew/opt/e2fsprogs/sbin/debugfs",
+    "/usr/local/opt/e2fsprogs/sbin/debugfs",
+    "/usr/local/sbin/debugfs",
+    "/usr/sbin/debugfs",
+];
 const EXPECTED_LIBKRUN_VERSION: &str = "1.19.4";
 const EXPECTED_LIBKRUNFW_VERSION: &str = "5.5.0";
 const MIN_RECOMMENDED_CACHE_FREE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -81,6 +88,8 @@ pub struct DoctorReport {
     pub gvproxy: ToolProbe,
     pub mke2fs: ToolProbe,
     pub e2fsck: ToolProbe,
+    #[serde(default)]
+    pub debugfs: ToolProbe,
     #[serde(default)]
     pub cache_volume: CacheVolumeProbe,
     #[serde(default)]
@@ -171,7 +180,7 @@ pub struct DoctorCheck {
     pub remediation: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolProbe {
     pub found: bool,
     pub path: Option<PathBuf>,
@@ -191,14 +200,25 @@ pub struct NativeRuntimePaths {
 pub struct DiskToolPaths {
     pub mke2fs: Option<PathBuf>,
     pub e2fsck: Option<PathBuf>,
+    pub debugfs: Option<PathBuf>,
 }
 
 impl DiskToolPaths {
     /// Resolve disk tools without replacing an explicit caller path.
     pub fn discover(mke2fs: Option<PathBuf>, e2fsck: Option<PathBuf>) -> Self {
+        Self::discover_with_debugfs(mke2fs, e2fsck, None)
+    }
+
+    /// Resolve disk tools, including the trusted-agent injection utility.
+    pub fn discover_with_debugfs(
+        mke2fs: Option<PathBuf>,
+        e2fsck: Option<PathBuf>,
+        debugfs: Option<PathBuf>,
+    ) -> Self {
         Self {
             mke2fs: resolve_tool_path(mke2fs, "MORAE_MKE2FS", "mke2fs", MKE2FS_CANDIDATES),
             e2fsck: resolve_tool_path(e2fsck, "MORAE_E2FSCK", "e2fsck", E2FSCK_CANDIDATES),
+            debugfs: resolve_tool_path(debugfs, "MORAE_DEBUGFS", "debugfs", DEBUGFS_CANDIDATES),
         }
     }
 
@@ -212,6 +232,12 @@ impl DiskToolPaths {
         self.e2fsck
             .clone()
             .unwrap_or_else(|| PathBuf::from("e2fsck"))
+    }
+
+    pub fn debugfs_command(&self) -> PathBuf {
+        self.debugfs
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("debugfs"))
     }
 }
 
@@ -268,10 +294,11 @@ impl DoctorReport {
     pub fn collect() -> Self {
         let paths = NativeRuntimePaths::discover_with_gvproxy(None, None, None, None);
         let cache_dir = moraebox_core::resolve_cache_dir(None).unwrap_or_else(|_| env::temp_dir());
-        Self::collect_with_paths_and_cache(
+        Self::collect_with_paths_and_cache_with_debugfs(
             paths,
             configured_path("MORAE_MKE2FS"),
             configured_path("MORAE_E2FSCK"),
+            configured_path("MORAE_DEBUGFS"),
             cache_dir,
         )
     }
@@ -281,13 +308,48 @@ impl DoctorReport {
         mke2fs_override: Option<PathBuf>,
         e2fsck_override: Option<PathBuf>,
     ) -> Self {
-        Self::collect_with_paths_and_cache(paths, mke2fs_override, e2fsck_override, env::temp_dir())
+        Self::collect_with_paths_and_debugfs(paths, mke2fs_override, e2fsck_override, None)
+    }
+
+    pub fn collect_with_paths_and_debugfs(
+        paths: NativeRuntimePaths,
+        mke2fs_override: Option<PathBuf>,
+        e2fsck_override: Option<PathBuf>,
+        debugfs_override: Option<PathBuf>,
+    ) -> Self {
+        Self::collect_with_paths_and_cache_with_debugfs(
+            paths,
+            mke2fs_override,
+            e2fsck_override,
+            debugfs_override,
+            env::temp_dir(),
+        )
     }
 
     pub fn collect_with_paths_and_cache(
         paths: NativeRuntimePaths,
         mke2fs_override: Option<PathBuf>,
         e2fsck_override: Option<PathBuf>,
+        cache_dir: PathBuf,
+    ) -> Self {
+        Self::collect_with_paths_and_cache_with_debugfs(
+            paths,
+            mke2fs_override,
+            e2fsck_override,
+            None,
+            cache_dir,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "doctor assembles one stable report from all native capability probes"
+    )]
+    pub fn collect_with_paths_and_cache_with_debugfs(
+        paths: NativeRuntimePaths,
+        mke2fs_override: Option<PathBuf>,
+        e2fsck_override: Option<PathBuf>,
+        debugfs_override: Option<PathBuf>,
         cache_dir: PathBuf,
     ) -> Self {
         let os = env::consts::OS.to_owned();
@@ -308,9 +370,14 @@ impl DoctorReport {
         let libkrunfw = probe_libkrunfw(paths.libkrunfw, &architecture);
         let krunvm = probe_tool("krunvm");
         let gvproxy = probe_tool_path(paths.gvproxy);
-        let disk_tools = DiskToolPaths::discover(mke2fs_override, e2fsck_override);
+        let disk_tools = DiskToolPaths::discover_with_debugfs(
+            mke2fs_override,
+            e2fsck_override,
+            debugfs_override,
+        );
         let mke2fs = probe_tool_path(disk_tools.mke2fs);
         let e2fsck = probe_tool_path(disk_tools.e2fsck);
+        let debugfs = probe_tool_path(disk_tools.debugfs);
         let cache_volume = probe_cache_volume(cache_dir);
         let cow_clone_supported = cache_volume.reflink_supported;
         let network_root = nearest_existing_directory(&env::temp_dir());
@@ -343,6 +410,7 @@ impl DoctorReport {
             && hypervisor_framework
             && mke2fs.found
             && e2fsck.found
+            && debugfs.found
             && cow_clone_supported == Some(true);
         let native_network_ready = native_backend_ready
             && gvproxy.found
@@ -360,6 +428,7 @@ impl DoctorReport {
             libkrun_network_api,
             &mke2fs,
             &e2fsck,
+            &debugfs,
         );
         let warnings = checks
             .iter()
@@ -383,6 +452,7 @@ impl DoctorReport {
             gvproxy,
             mke2fs,
             e2fsck,
+            debugfs,
             cache_volume,
             network,
             cow_clone_supported,
@@ -1022,6 +1092,7 @@ fn build_checks(
     libkrun_network_api: Option<bool>,
     mke2fs: &ToolProbe,
     e2fsck: &ToolProbe,
+    debugfs: &ToolProbe,
 ) -> Vec<DoctorCheck> {
     vec![
         make_check(
@@ -1102,12 +1173,12 @@ fn build_checks(
         ),
         make_check(
             "disk_tools",
-            status_for(&[Some(mke2fs.found), Some(e2fsck.found)]),
+            status_for(&[Some(mke2fs.found), Some(e2fsck.found), Some(debugfs.found)]),
             format!(
-                "mke2fs found={}, e2fsck found={}",
-                mke2fs.found, e2fsck.found
+                "mke2fs found={}, e2fsck found={}, debugfs found={}",
+                mke2fs.found, e2fsck.found, debugfs.found
             ),
-            "Install e2fsprogs or pass --mke2fs and --e2fsck explicitly.",
+            "Install e2fsprogs or pass --mke2fs, --e2fsck, and --debugfs explicitly.",
         ),
     ]
 }
@@ -1399,7 +1470,8 @@ mod tests {
         let missing_proxy = PathBuf::from("/configured/missing-gvproxy");
         let missing_mke2fs = PathBuf::from("/configured/missing-mke2fs");
         let missing_e2fsck = PathBuf::from("/configured/missing-e2fsck");
-        let report = DoctorReport::collect_with_paths(
+        let missing_debugfs = PathBuf::from("/configured/missing-debugfs");
+        let report = DoctorReport::collect_with_paths_and_debugfs(
             NativeRuntimePaths {
                 helper: Some(missing_helper.clone()),
                 libkrun: Some(missing_library.clone()),
@@ -1409,6 +1481,7 @@ mod tests {
             },
             Some(missing_mke2fs.clone()),
             Some(missing_e2fsck.clone()),
+            Some(missing_debugfs.clone()),
         );
 
         assert_eq!(report.helper_path, Some(missing_helper));
@@ -1416,6 +1489,7 @@ mod tests {
         assert_eq!(report.gvproxy.path, Some(missing_proxy));
         assert_eq!(report.mke2fs.path, Some(missing_mke2fs));
         assert_eq!(report.e2fsck.path, Some(missing_e2fsck));
+        assert_eq!(report.debugfs.path, Some(missing_debugfs));
         assert!(!report.native_backend_ready);
     }
 
@@ -1441,19 +1515,26 @@ mod tests {
 
     #[test]
     fn explicit_disk_tool_paths_take_precedence_and_commands_have_fallbacks() {
-        let paths = DiskToolPaths::discover(
+        let paths = DiskToolPaths::discover_with_debugfs(
             Some(PathBuf::from("/configured/mke2fs")),
             Some(PathBuf::from("/configured/e2fsck")),
+            Some(PathBuf::from("/configured/debugfs")),
         );
         assert_eq!(paths.mke2fs_command(), PathBuf::from("/configured/mke2fs"));
         assert_eq!(paths.e2fsck_command(), PathBuf::from("/configured/e2fsck"));
+        assert_eq!(
+            paths.debugfs_command(),
+            PathBuf::from("/configured/debugfs")
+        );
 
         let unavailable = DiskToolPaths {
             mke2fs: None,
             e2fsck: None,
+            debugfs: None,
         };
         assert_eq!(unavailable.mke2fs_command(), PathBuf::from("mke2fs"));
         assert_eq!(unavailable.e2fsck_command(), PathBuf::from("e2fsck"));
+        assert_eq!(unavailable.debugfs_command(), PathBuf::from("debugfs"));
     }
 
     #[test]
@@ -1511,6 +1592,7 @@ mod tests {
             &LibraryProbe::default(),
             &LibraryProbe::default(),
             None,
+            &missing_tool,
             &missing_tool,
             &missing_tool,
         );

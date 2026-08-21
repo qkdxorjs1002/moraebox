@@ -42,6 +42,7 @@ trap report_result EXIT
 [ "$(uname -s)" = "Darwin" ] || skip_smoke "requires macOS"
 [ "$(uname -m)" = "arm64" ] || skip_smoke "requires Apple Silicon arm64"
 command -v cargo >/dev/null 2>&1 || skip_smoke "Rust cargo is unavailable"
+command -v go >/dev/null 2>&1 || skip_smoke "Go compiler is unavailable"
 command -v codesign >/dev/null 2>&1 || skip_smoke "Apple codesign is unavailable"
 command -v brew >/dev/null 2>&1 || skip_smoke "Homebrew is unavailable"
 
@@ -56,6 +57,7 @@ missing=""
 [ -x "$gvproxy_prefix/bin/gvproxy" ] || append_missing "gvproxy"
 [ -x "$e2fsprogs_prefix/sbin/mke2fs" ] || append_missing "mke2fs"
 [ -x "$e2fsprogs_prefix/sbin/e2fsck" ] || append_missing "e2fsck"
+[ -x "$e2fsprogs_prefix/sbin/debugfs" ] || append_missing "debugfs"
 
 if [ -n "$missing" ]; then
     setup_outcome=${MORAE_NATIVE_DEPENDENCY_SETUP:-not-reported}
@@ -67,6 +69,7 @@ export MORAE_LIBKRUNFW_PATH="$libkrunfw_prefix/lib/libkrunfw.dylib"
 export MORAE_GVPROXY_PATH="$gvproxy_prefix/bin/gvproxy"
 export MORAE_MKE2FS="$e2fsprogs_prefix/sbin/mke2fs"
 export MORAE_E2FSCK="$e2fsprogs_prefix/sbin/e2fsck"
+export MORAE_DEBUGFS="$e2fsprogs_prefix/sbin/debugfs"
 export MORAE_LIB_DIR="$libkrun_prefix/lib:$libkrunfw_prefix/lib"
 
 cache_dir=${MORAE_NATIVE_E2E_CACHE_DIR:-${RUNNER_TEMP:-/private/tmp}/moraebox-native-cache}

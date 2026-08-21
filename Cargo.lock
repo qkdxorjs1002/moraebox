@@ -787,6 +787,7 @@ dependencies = [
  "moraebox-runtime",
  "moraebox-sdk",
  "nix",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -852,6 +853,7 @@ version = "0.1.0"
 dependencies = [
  "prost",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -863,6 +865,7 @@ dependencies = [
  "moraebox-box",
  "moraebox-core",
  "nix",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -892,6 +895,8 @@ dependencies = [
  "clap",
  "libc",
  "libloading",
+ "moraebox-protocol",
+ "tempfile",
  "thiserror",
 ]
 

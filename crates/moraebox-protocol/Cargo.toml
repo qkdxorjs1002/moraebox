@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 prost.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

@@ -2,15 +2,43 @@
 
 #![allow(unsafe_code)]
 
+#[cfg(unix)]
+use std::os::{
+    fd::FromRawFd as _,
+    unix::{
+        fs::PermissionsExt as _,
+        net::{UnixListener, UnixStream},
+    },
+};
 use std::{
     collections::BTreeMap,
     ffi::{CStr, CString, c_char},
+    io,
     path::{Path, PathBuf},
     process::ExitCode,
+    thread::JoinHandle,
+};
+#[cfg(unix)]
+use std::{
+    fs::{self, File},
+    io::{Read as _, Write as _},
+    process::Command,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicI32, Ordering},
+    },
 };
 
 use clap::Parser;
 use libloading::Library;
+#[cfg(unix)]
+use moraebox_protocol::{
+    EXEC_STREAM_ID, ExecRequest, Exit, Frame, FrameSequence, Hello, InboundValidator,
+    MAX_FRAME_SIZE, Output, PeerRole, ProtocolError, Resize, SignalRequest, Stdin, StdinEof,
+    WireOutputChannel, WireSignal, decode_frame, encode_frame, frame,
+};
+#[cfg(unix)]
+use tempfile::TempDir;
 use thiserror::Error;
 
 type CreateCtx = unsafe extern "C" fn() -> i32;
@@ -23,6 +51,7 @@ type SetExec =
 type SetWorkdir = unsafe extern "C" fn(u32, *const c_char) -> i32;
 type DisableImplicitVsock = unsafe extern "C" fn(u32) -> i32;
 type AddVsock = unsafe extern "C" fn(u32, u32) -> i32;
+type AddVsockPort = unsafe extern "C" fn(u32, u32, *const c_char) -> i32;
 type AddNetUnixgram = unsafe extern "C" fn(u32, *const c_char, i32, *mut u8, u32, u32) -> i32;
 type AddDisk = unsafe extern "C" fn(u32, *const c_char, *const c_char, bool) -> i32;
 type SetRootDiskRemount =
@@ -32,6 +61,13 @@ type AddVirtioConsoleDefault = unsafe extern "C" fn(u32, i32, i32, i32) -> i32;
 type StartEnter = unsafe extern "C" fn(u32) -> i32;
 
 const ROOT_TAG: &CStr = c"/dev/root";
+const CONTROL_VSOCK_PORT: u32 = 1070;
+const GUEST_AGENT_PATH: &str = "/.moraebox-agent";
+#[cfg(unix)]
+const GUEST_AGENT: &[u8] = include_bytes!(env!("MORAE_GUEST_AGENT_PATH"));
+#[cfg(unix)]
+const REQUIRED_AGENT_CAPABILITIES: [&str; 6] =
+    ["exec", "stdin", "signal", "resize", "tty", "output-v1"];
 const DEFAULT_DAX_WINDOW: u64 = 256 * 1024 * 1024;
 const NETWORK_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
 // Released libkrun 1.19.4 ABI constants from libkrun.h.
@@ -51,6 +87,12 @@ struct Args {
     /// Writable raw ext4 block device to pivot to as the guest root filesystem.
     #[arg(long, required_unless_present = "root", conflicts_with = "root")]
     root_disk: Option<PathBuf>,
+    /// Path to debugfs, used to restore the trusted guest agent before each disk boot.
+    #[arg(long, requires = "root_disk")]
+    debugfs: Option<PathBuf>,
+    /// Session identity enforced by the host/guest protocol.
+    #[arg(long, requires = "root_disk")]
+    session_id: Option<String>,
     #[arg(long, default_value_t = 2)]
     cpus: u8,
     #[arg(long, default_value_t = 512)]
@@ -66,6 +108,12 @@ struct Args {
     /// Supervisor PID. The helper self-terminates if ownership is lost.
     #[arg(long)]
     parent_pid: Option<u32>,
+    #[arg(long)]
+    tty: bool,
+    #[arg(long, default_value_t = 24)]
+    tty_rows: u16,
+    #[arg(long, default_value_t = 80)]
+    tty_cols: u16,
     #[arg(long = "env", value_parser = parse_env)]
     env: Vec<(String, String)>,
     #[arg(required = true, last = true)]
@@ -82,6 +130,10 @@ fn main() -> ExitCode {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the helper configures one ordered libkrun context before ownership transfer"
+)]
 fn run(args: Args) -> Result<i32, HelperError> {
     if args.command.is_empty() || args.command[0].is_empty() {
         return Err(HelperError::Invalid("command must not be empty"));
@@ -91,9 +143,39 @@ fn run(args: Args) -> Result<i32, HelperError> {
             "CPU and memory limits must be non-zero",
         ));
     }
+    if args.tty && (args.tty_rows == 0 || args.tty_cols == 0) {
+        return Err(HelperError::Invalid(
+            "terminal rows and columns must be non-zero",
+        ));
+    }
     if let Some(parent_pid) = args.parent_pid {
         spawn_parent_watchdog(parent_pid);
     }
+
+    let effective_command = if args.workspace_disk.is_some() {
+        workspace_command(&args.command, args.root_disk.is_some())
+    } else {
+        args.command.clone()
+    };
+    let environment = BTreeMap::from_iter(args.env);
+    let environment = environment
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    let control = if let Some(root_disk) = args.root_disk.as_deref() {
+        let debugfs = args.debugfs.as_deref().ok_or(HelperError::Invalid(
+            "--debugfs is required with --root-disk",
+        ))?;
+        let session_id = args.session_id.as_deref().ok_or(HelperError::Invalid(
+            "--session-id is required with --root-disk",
+        ))?;
+        if session_id.is_empty() {
+            return Err(HelperError::Invalid("session ID must not be empty"));
+        }
+        Some(ControlEndpoint::prepare(debugfs, root_disk)?)
+    } else {
+        None
+    };
 
     let api = KrunApi::load(&args.libkrun)?;
     let mut context = api.create_context()?;
@@ -111,13 +193,38 @@ fn run(args: Args) -> Result<i32, HelperError> {
             "exactly one of --root or --root-disk is required",
         ));
     }
-    api.configure_networking(context.id, args.network_socket.as_deref())?;
-    api.configure_console(context.id)?;
+    api.configure_networking(
+        context.id,
+        control
+            .as_ref()
+            .map(|endpoint| endpoint.socket_path.as_path()),
+        args.network_socket.as_deref(),
+    )?;
+    #[cfg(unix)]
+    let protocol_console_input = if control.is_some() {
+        Some(File::open("/dev/null")?)
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    let protocol_input_fd = protocol_console_input
+        .as_ref()
+        .map_or(0, std::os::fd::AsRawFd::as_raw_fd);
+    #[cfg(not(unix))]
+    let protocol_input_fd = 0;
+    api.configure_console(
+        context.id,
+        protocol_input_fd,
+        if control.is_some() { 2 } else { 1 },
+        2,
+    )?;
     if let Some(workspace) = args.workspace_disk.as_deref() {
         api.configure_workspace_disk(context.id, workspace)?;
     }
 
-    if let Some(cwd) = args.cwd.as_deref() {
+    if control.is_none()
+        && let Some(cwd) = args.cwd.as_deref()
+    {
         let cwd = CString::new(cwd)?;
         KrunApi::check("krun_set_workdir", unsafe {
             // SAFETY: `cwd` is NUL-terminated and remains alive during the call.
@@ -125,31 +232,55 @@ fn run(args: Args) -> Result<i32, HelperError> {
         })?;
     }
 
-    let effective_command = if args.workspace_disk.is_some() {
-        workspace_command(&args.command, args.root_disk.is_some())
+    let (executable, command, guest_environment) = if control.is_some() {
+        let session_id = args
+            .session_id
+            .as_deref()
+            .expect("control endpoint requires a session ID");
+        (
+            CString::new(GUEST_AGENT_PATH)?,
+            CStringArray::new([
+                "--port".to_owned(),
+                CONTROL_VSOCK_PORT.to_string(),
+                "--session".to_owned(),
+                session_id.to_owned(),
+            ])?,
+            CStringArray::new(std::iter::empty::<&str>())?,
+        )
     } else {
-        args.command
+        (
+            CString::new(effective_command[0].as_str())?,
+            CStringArray::new(effective_command.iter().skip(1).map(String::as_str))?,
+            CStringArray::new(environment.iter().map(String::as_str))?,
+        )
     };
-    let executable = CString::new(effective_command[0].as_str())?;
     // libkrun's injected init supplies argv[0] from `exec_path`; this array contains
     // only the user arguments that follow the executable.
-    let command = CStringArray::new(effective_command.iter().skip(1).map(String::as_str))?;
-    let environment = BTreeMap::from_iter(args.env);
-    let environment = CStringArray::new(
-        environment
-            .iter()
-            .map(|(key, value)| format!("{key}={value}")),
-    )?;
     KrunApi::check("krun_set_exec", unsafe {
         // SAFETY: all strings and pointer arrays are NUL-terminated and live through this call.
         (api.set_exec)(
             context.id,
             executable.as_ptr(),
             command.pointers.as_ptr(),
-            environment.pointers.as_ptr(),
+            guest_environment.pointers.as_ptr(),
         )
     })?;
 
+    let bridge = control
+        .map(|endpoint| {
+            endpoint.spawn(BridgeRequest {
+                session_id: args
+                    .session_id
+                    .expect("control endpoint requires a session ID"),
+                command: effective_command,
+                cwd: args.cwd.unwrap_or_default(),
+                environment,
+                tty: args.tty,
+                rows: args.tty_rows,
+                cols: args.tty_cols,
+            })
+        })
+        .transpose()?;
     context.consume();
     let result = unsafe {
         // SAFETY: the context is fully configured and ownership is transferred to libkrun.
@@ -161,6 +292,9 @@ fn run(args: Args) -> Result<i32, HelperError> {
             operation: "krun_start_enter",
             code: result,
         })
+    } else if let Some(bridge) = bridge {
+        bridge.join().map_err(|_| HelperError::BridgeThread)?;
+        Ok(result)
     } else {
         Ok(result)
     }
@@ -177,6 +311,7 @@ struct KrunApi {
     set_workdir: SetWorkdir,
     disable_implicit_vsock: Option<DisableImplicitVsock>,
     add_vsock: AddVsock,
+    add_vsock_port: Option<AddVsockPort>,
     add_net_unixgram: Option<AddNetUnixgram>,
     add_disk: Option<AddDisk>,
     set_root_disk_remount: Option<SetRootDiskRemount>,
@@ -202,6 +337,7 @@ impl KrunApi {
             set_workdir: required(&library, b"krun_set_workdir\0")?,
             disable_implicit_vsock: optional(&library, b"krun_disable_implicit_vsock\0"),
             add_vsock: required(&library, b"krun_add_vsock\0")?,
+            add_vsock_port: optional(&library, b"krun_add_vsock_port\0"),
             add_net_unixgram: optional(&library, b"krun_add_net_unixgram\0"),
             add_disk: optional(&library, b"krun_add_disk\0"),
             set_root_disk_remount: optional(&library, b"krun_set_root_disk_remount\0"),
@@ -252,12 +388,19 @@ impl KrunApi {
         })
     }
 
-    fn configure_networking(&self, context: u32, socket: Option<&Path>) -> Result<(), HelperError> {
+    fn configure_networking(
+        &self,
+        context: u32,
+        control_socket: Option<&Path>,
+        network_socket: Option<&Path>,
+    ) -> Result<(), HelperError> {
         Self::configure_networking_with(
             context,
-            socket,
+            control_socket,
+            network_socket,
             self.disable_implicit_vsock,
             self.add_vsock,
+            self.add_vsock_port,
             self.add_net_unixgram,
         )
     }
@@ -292,9 +435,11 @@ impl KrunApi {
 
     fn configure_networking_with(
         context: u32,
-        socket: Option<&Path>,
+        control_socket: Option<&Path>,
+        network_socket: Option<&Path>,
         disable_implicit_vsock: Option<DisableImplicitVsock>,
         add_vsock: AddVsock,
+        add_vsock_port: Option<AddVsockPort>,
         add_network: Option<AddNetUnixgram>,
     ) -> Result<(), HelperError> {
         if let Some(disable) = disable_implicit_vsock {
@@ -307,7 +452,15 @@ impl KrunApi {
             // SAFETY: zero is the documented no-TSI feature mask.
             add_vsock(context, 0)
         })?;
-        if let Some(socket) = socket {
+        if let Some(socket) = control_socket {
+            let add_port = add_vsock_port.ok_or(HelperError::MissingVsockPortApi)?;
+            let socket = path_to_cstring(socket)?;
+            Self::check("krun_add_vsock_port(control)", unsafe {
+                // SAFETY: the socket path is a live C string and the port is reserved by moraebox.
+                add_port(context, CONTROL_VSOCK_PORT, socket.as_ptr())
+            })?;
+        }
+        if let Some(socket) = network_socket {
             Self::configure_network_with(context, socket, add_network)?;
         }
         Ok(())
@@ -335,9 +488,18 @@ impl KrunApi {
         })
     }
 
-    fn configure_console(&self, context: u32) -> Result<(), HelperError> {
+    fn configure_console(
+        &self,
+        context: u32,
+        input_fd: i32,
+        output_fd: i32,
+        error_fd: i32,
+    ) -> Result<(), HelperError> {
         Self::configure_console_with(
             context,
+            input_fd,
+            output_fd,
+            error_fd,
             self.disable_implicit_console,
             self.add_virtio_console_default,
         )
@@ -345,6 +507,9 @@ impl KrunApi {
 
     fn configure_console_with(
         context: u32,
+        input_fd: i32,
+        output_fd: i32,
+        error_fd: i32,
         disable_implicit: Option<DisableImplicitConsole>,
         add_console: Option<AddVirtioConsoleDefault>,
     ) -> Result<(), HelperError> {
@@ -358,7 +523,7 @@ impl KrunApi {
         })?;
         Self::check("krun_add_virtio_console_default", unsafe {
             // SAFETY: descriptors 0/1/2 are owned by this helper and remain valid for VM life.
-            add_console(context, 0, 1, 2)
+            add_console(context, input_fd, output_fd, error_fd)
         })
     }
 
@@ -381,6 +546,495 @@ impl KrunApi {
             Ok(())
         }
     }
+}
+
+#[derive(Debug)]
+#[cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "the non-Unix native stub rejects the request before reading its fields"
+    )
+)]
+struct BridgeRequest {
+    session_id: String,
+    command: Vec<String>,
+    cwd: String,
+    environment: Vec<String>,
+    tty: bool,
+    rows: u16,
+    cols: u16,
+}
+
+#[cfg(unix)]
+struct ControlEndpoint {
+    _directory: TempDir,
+    listener: UnixListener,
+    socket_path: PathBuf,
+}
+
+#[cfg(unix)]
+impl ControlEndpoint {
+    fn prepare(debugfs: &Path, root_disk: &Path) -> Result<Self, HelperError> {
+        let directory = tempfile::Builder::new()
+            .prefix("morae-control-")
+            .tempdir_in("/tmp")?;
+        inject_guest_agent(debugfs, root_disk, directory.path())?;
+        let socket_path = directory.path().join("control.sock");
+        let listener = UnixListener::bind(&socket_path)?;
+        Ok(Self {
+            _directory: directory,
+            listener,
+            socket_path,
+        })
+    }
+
+    fn spawn(self, request: BridgeRequest) -> Result<JoinHandle<()>, HelperError> {
+        let signals = install_signal_relay()?;
+        std::thread::Builder::new()
+            .name("morae-vsock-control".into())
+            .spawn(move || match self.serve(request, signals) {
+                Ok(code) => std::process::exit(code),
+                Err(error) => {
+                    eprintln!("morae-vmm-helper: host/guest protocol failed: {error}");
+                    std::process::exit(125);
+                }
+            })
+            .map_err(HelperError::Io)
+    }
+
+    fn serve(self, request: BridgeRequest, signals: File) -> Result<i32, BridgeError> {
+        let (mut reader, _) = self.listener.accept()?;
+        let sender = Arc::new(Mutex::new(HostSender {
+            stream: reader.try_clone()?,
+            sequence: FrameSequence::new(&request.session_id, EXEC_STREAM_ID),
+        }));
+        let mut validator =
+            InboundValidator::new(&request.session_id, EXEC_STREAM_ID, PeerRole::Guest);
+        let hello_frame = read_protocol_frame(&mut reader)?;
+        validator.accept(&hello_frame)?;
+        let Some(frame::Payload::Hello(hello)) = hello_frame.payload.as_ref() else {
+            return Err(BridgeError::ExpectedHello);
+        };
+        validate_agent_hello(hello)?;
+
+        send_host_frame(
+            &sender,
+            frame::Payload::Exec(ExecRequest {
+                argv: request.command,
+                cwd: request.cwd,
+                env: request.environment,
+                tty: request.tty,
+                rows: u32::from(request.rows),
+                cols: u32::from(request.cols),
+            }),
+        )?;
+        spawn_stdin_forwarder(Arc::clone(&sender))?;
+        spawn_signal_forwarder(Arc::clone(&sender), signals, request.tty)?;
+
+        loop {
+            let frame = read_protocol_frame(&mut reader)?;
+            validator.accept(&frame)?;
+            match frame.payload.expect("validated frame contains a payload") {
+                frame::Payload::Output(output) => write_guest_output(&output)?,
+                frame::Payload::Exit(exit) => return protocol_exit_code(&exit),
+                frame::Payload::Shutdown(shutdown) => {
+                    return Err(BridgeError::AgentShutdown(shutdown.reason));
+                }
+                _ => return Err(BridgeError::UnexpectedGuestPayload),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn protocol_exit_code(exit: &Exit) -> Result<i32, BridgeError> {
+    if let Some(signal) = exit.signal {
+        if !(1..=127).contains(&signal) {
+            return Err(BridgeError::InvalidExit(format!(
+                "signal {signal} is outside 1..=127"
+            )));
+        }
+        if exit.code != 0 {
+            return Err(BridgeError::InvalidExit(
+                "code must be zero when signal is present".into(),
+            ));
+        }
+        return Ok(128 + signal);
+    }
+    if !(0..=255).contains(&exit.code) {
+        return Err(BridgeError::InvalidExit(format!(
+            "code {} is outside 0..=255",
+            exit.code
+        )));
+    }
+    Ok(exit.code)
+}
+
+#[cfg(not(unix))]
+struct ControlEndpoint {
+    socket_path: PathBuf,
+}
+
+#[cfg(not(unix))]
+impl ControlEndpoint {
+    fn prepare(_debugfs: &Path, _root_disk: &Path) -> Result<Self, HelperError> {
+        Err(HelperError::Unsupported(
+            "the vsock guest protocol requires a Unix host",
+        ))
+    }
+
+    fn spawn(self, _request: BridgeRequest) -> Result<JoinHandle<()>, HelperError> {
+        let _ = self;
+        Err(HelperError::Unsupported(
+            "the vsock guest protocol requires a Unix host",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn inject_guest_agent(debugfs: &Path, root_disk: &Path, staging: &Path) -> Result<(), HelperError> {
+    let root_disk = fs::canonicalize(root_disk)?;
+    let agent = staging.join("agent");
+    fs::write(&agent, GUEST_AGENT)?;
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o700))?;
+
+    let _ = run_debugfs(
+        debugfs,
+        staging,
+        &root_disk,
+        "remove previous guest agent",
+        "rm /.moraebox-agent",
+    );
+    run_debugfs(
+        debugfs,
+        staging,
+        &root_disk,
+        "write guest agent",
+        "write agent /.moraebox-agent",
+    )?;
+    run_debugfs(
+        debugfs,
+        staging,
+        &root_disk,
+        "set guest agent mode",
+        "set_inode_field /.moraebox-agent mode 0100755",
+    )?;
+    let stat = run_debugfs(
+        debugfs,
+        staging,
+        &root_disk,
+        "inspect guest agent",
+        "stat /.moraebox-agent",
+    )?;
+    let stat = String::from_utf8_lossy(&stat.stdout);
+    if !stat.contains("Mode:  0755") && !stat.contains("Mode:  0100755") {
+        return Err(HelperError::GuestAgentVerification(
+            "injected agent is not executable".into(),
+        ));
+    }
+    run_debugfs(
+        debugfs,
+        staging,
+        &root_disk,
+        "read back guest agent",
+        "dump /.moraebox-agent verified-agent",
+    )?;
+    if fs::read(staging.join("verified-agent"))? != GUEST_AGENT {
+        return Err(HelperError::GuestAgentVerification(
+            "injected agent content does not match the signed helper".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_debugfs(
+    debugfs: &Path,
+    staging: &Path,
+    root_disk: &Path,
+    operation: &'static str,
+    request: &str,
+) -> Result<std::process::Output, HelperError> {
+    let output = Command::new(debugfs)
+        .current_dir(staging)
+        .args(["-w", "-R", request])
+        .arg(root_disk)
+        .output()?;
+    if !output.status.success() {
+        return Err(HelperError::Debugfs {
+            operation,
+            status: output.status.code(),
+            stderr: bounded_diagnostic(&output.stderr),
+        });
+    }
+    Ok(output)
+}
+
+#[cfg(unix)]
+fn bounded_diagnostic(bytes: &[u8]) -> String {
+    const LIMIT: usize = 4096;
+    let start = bytes.len().saturating_sub(LIMIT);
+    String::from_utf8_lossy(&bytes[start..]).trim().to_owned()
+}
+
+#[cfg(unix)]
+struct HostSender {
+    stream: UnixStream,
+    sequence: FrameSequence,
+}
+
+#[cfg(unix)]
+impl HostSender {
+    fn send(&mut self, payload: frame::Payload) -> Result<(), BridgeError> {
+        let frame = self.sequence.next(payload)?;
+        let bytes = encode_frame(&frame)?;
+        self.stream.write_all(&bytes)?;
+        self.stream.flush()?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn send_host_frame(
+    sender: &Arc<Mutex<HostSender>>,
+    payload: frame::Payload,
+) -> Result<(), BridgeError> {
+    sender
+        .lock()
+        .map_err(|_| BridgeError::SenderPoisoned)?
+        .send(payload)
+}
+
+#[cfg(unix)]
+fn read_protocol_frame(stream: &mut UnixStream) -> Result<Frame, BridgeError> {
+    let mut header = [0_u8; 4];
+    stream.read_exact(&mut header)?;
+    let declared = u32::from_be_bytes(header) as usize;
+    if declared > MAX_FRAME_SIZE {
+        return Err(BridgeError::FrameTooLarge(declared));
+    }
+    let mut bytes = vec![0_u8; 4 + declared];
+    bytes[..4].copy_from_slice(&header);
+    stream.read_exact(&mut bytes[4..])?;
+    Ok(decode_frame(&bytes)?)
+}
+
+#[cfg(unix)]
+fn validate_agent_hello(hello: &Hello) -> Result<(), BridgeError> {
+    if hello.agent_version.is_empty() {
+        return Err(BridgeError::MissingAgentVersion);
+    }
+    let missing = REQUIRED_AGENT_CAPABILITIES
+        .iter()
+        .filter(|required| {
+            !hello
+                .capabilities
+                .iter()
+                .any(|capability| capability == **required)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(BridgeError::MissingCapabilities(missing.join(", ")))
+    }
+}
+
+#[cfg(unix)]
+fn write_guest_output(output: &Output) -> Result<(), BridgeError> {
+    match WireOutputChannel::try_from(output.channel)
+        .map_err(|_| BridgeError::InvalidOutputChannel(output.channel))?
+    {
+        WireOutputChannel::Stdout | WireOutputChannel::Tty => {
+            let mut stdout = io::stdout().lock();
+            stdout.write_all(&output.data)?;
+            stdout.flush()?;
+        }
+        WireOutputChannel::Stderr => {
+            let mut stderr = io::stderr().lock();
+            stderr.write_all(&output.data)?;
+            stderr.flush()?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_stdin_forwarder(sender: Arc<Mutex<HostSender>>) -> Result<(), BridgeError> {
+    std::thread::Builder::new()
+        .name("morae-vsock-stdin".into())
+        .spawn(move || {
+            let mut stdin = io::stdin().lock();
+            let mut buffer = vec![0_u8; 32 * 1024].into_boxed_slice();
+            loop {
+                match stdin.read(&mut buffer) {
+                    Ok(0) => {
+                        let _ = send_host_frame(&sender, frame::Payload::StdinEof(StdinEof {}));
+                        return;
+                    }
+                    Ok(count) => {
+                        if send_host_frame(
+                            &sender,
+                            frame::Payload::Stdin(Stdin {
+                                data: buffer[..count].to_vec(),
+                            }),
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => return,
+                }
+            }
+        })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_signal_forwarder(
+    sender: Arc<Mutex<HostSender>>,
+    mut signals: File,
+    tty: bool,
+) -> Result<(), BridgeError> {
+    std::thread::Builder::new()
+        .name("morae-vsock-signals".into())
+        .spawn(move || {
+            let mut signal = [0_u8; 1];
+            while signals.read_exact(&mut signal).is_ok() {
+                let payload = match i32::from(signal[0]) {
+                    libc::SIGINT => Some(frame::Payload::Signal(SignalRequest {
+                        signal: WireSignal::Interrupt as i32,
+                    })),
+                    libc::SIGTERM => Some(frame::Payload::Signal(SignalRequest {
+                        signal: WireSignal::Terminate as i32,
+                    })),
+                    libc::SIGHUP => Some(frame::Payload::Signal(SignalRequest {
+                        signal: WireSignal::Hangup as i32,
+                    })),
+                    libc::SIGWINCH if tty => terminal_size().map(|(rows, cols)| {
+                        frame::Payload::Resize(Resize {
+                            rows: u32::from(rows),
+                            cols: u32::from(cols),
+                        })
+                    }),
+                    _ => None,
+                };
+                if let Some(payload) = payload
+                    && send_host_frame(&sender, payload).is_err()
+                {
+                    return;
+                }
+            }
+        })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn terminal_size() -> Option<(u16, u16)> {
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let result = unsafe {
+        // SAFETY: fd 0 is live for the helper and points to a writable winsize structure.
+        libc::ioctl(0, libc::TIOCGWINSZ, &mut size)
+    };
+    (result == 0 && size.ws_row != 0 && size.ws_col != 0).then_some((size.ws_row, size.ws_col))
+}
+
+#[cfg(unix)]
+static SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
+#[cfg(unix)]
+extern "C" fn relay_signal(signal: libc::c_int) {
+    let fd = SIGNAL_WRITE_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let value = u8::try_from(signal).unwrap_or(0);
+        let _ = unsafe {
+            // SAFETY: the descriptor is the write end of a process-lifetime pipe and write is
+            // async-signal-safe. The one-byte buffer lives for the duration of the call.
+            libc::write(fd, (&raw const value).cast(), 1)
+        };
+    }
+}
+
+#[cfg(unix)]
+fn install_signal_relay() -> Result<File, HelperError> {
+    let mut descriptors = [-1; 2];
+    if unsafe {
+        // SAFETY: descriptors points to two valid integers for libc to initialize.
+        libc::pipe(descriptors.as_mut_ptr())
+    } != 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    for descriptor in descriptors {
+        let result = unsafe {
+            // SAFETY: both descriptors were returned by pipe and F_SETFD accepts FD_CLOEXEC.
+            libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC)
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    SIGNAL_WRITE_FD.store(descriptors[1], Ordering::Release);
+    let mut action = unsafe {
+        // SAFETY: a zeroed sigaction is initialized below before being installed.
+        std::mem::zeroed::<libc::sigaction>()
+    };
+    action.sa_sigaction = relay_signal as *const () as usize;
+    action.sa_flags = libc::SA_RESTART;
+    unsafe {
+        // SAFETY: action owns a valid signal mask and handler function.
+        libc::sigemptyset(&raw mut action.sa_mask);
+    }
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGWINCH] {
+        if unsafe {
+            // SAFETY: signal is catchable and action remains valid throughout the call.
+            libc::sigaction(signal, &raw const action, std::ptr::null_mut())
+        } != 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    let reader = unsafe {
+        // SAFETY: ownership of the read descriptor is transferred exactly once to File.
+        File::from_raw_fd(descriptors[0])
+    };
+    Ok(reader)
+}
+
+#[cfg(unix)]
+#[derive(Debug, Error)]
+enum BridgeError {
+    #[error("protocol I/O failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("invalid protocol frame: {0}")]
+    Protocol(#[from] ProtocolError),
+    #[error("guest frame size {0} exceeds the protocol limit")]
+    FrameTooLarge(usize),
+    #[error("the first guest frame was not Hello")]
+    ExpectedHello,
+    #[error("guest agent version is empty")]
+    MissingAgentVersion,
+    #[error("guest agent is missing required capabilities: {0}")]
+    MissingCapabilities(String),
+    #[error("guest sent an invalid output channel {0}")]
+    InvalidOutputChannel(i32),
+    #[error("guest sent an invalid exit status: {0}")]
+    InvalidExit(String),
+    #[error("guest sent a payload that is invalid in the running state")]
+    UnexpectedGuestPayload,
+    #[error("guest agent shut down the session: {0}")]
+    AgentShutdown(String),
+    #[error("protocol sender lock was poisoned")]
+    SenderPoisoned,
 }
 
 struct ContextGuard {
@@ -516,6 +1170,25 @@ enum HelperError {
     MissingRootDiskApi,
     #[error("libkrun does not provide krun_add_net_unixgram required for network access")]
     MissingNetworkApi,
+    #[error("libkrun does not provide krun_add_vsock_port required for guest control")]
+    MissingVsockPortApi,
+    #[cfg(not(unix))]
+    #[error("host platform is unsupported: {0}")]
+    Unsupported(&'static str),
+    #[error("helper I/O failed: {0}")]
+    Io(#[from] io::Error),
+    #[cfg(unix)]
+    #[error("debugfs failed to {operation} with status {status:?}: {stderr}")]
+    Debugfs {
+        operation: &'static str,
+        status: Option<i32>,
+        stderr: String,
+    },
+    #[cfg(unix)]
+    #[error("guest agent verification failed: {0}")]
+    GuestAgentVerification(String),
+    #[error("host/guest protocol thread panicked")]
+    BridgeThread,
     #[error("failed to load libkrun symbol: {0}")]
     Load(#[from] libloading::Error),
     #[error("string contains an interior NUL byte: {0}")]
@@ -603,6 +1276,22 @@ mod tests {
         0
     }
 
+    unsafe extern "C" fn record_add_vsock_port(
+        context: u32,
+        port: u32,
+        socket: *const c_char,
+    ) -> i32 {
+        let socket = unsafe {
+            // SAFETY: the test caller passes a live NUL-terminated control socket path.
+            CStr::from_ptr(socket)
+        };
+        if context == 9 && port == CONTROL_VSOCK_PORT && socket == c"/tmp/control.sock" {
+            let _ =
+                NETWORK_CALL_SEQUENCE.compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst);
+        }
+        0
+    }
+
     #[test]
     fn builds_null_terminated_arrays() {
         let values = CStringArray::new(["a", "b"]).unwrap();
@@ -686,6 +1375,9 @@ mod tests {
 
         KrunApi::configure_console_with(
             7,
+            0,
+            1,
+            2,
             Some(record_disable_implicit_console),
             Some(record_add_console),
         )
@@ -699,7 +1391,7 @@ mod tests {
         let _guard = CONSOLE_TEST_LOCK.lock().unwrap();
         CONSOLE_CALL_SEQUENCE.store(0, Ordering::SeqCst);
 
-        KrunApi::configure_console_with(7, None, Some(record_add_console)).unwrap();
+        KrunApi::configure_console_with(7, 0, 1, 2, None, Some(record_add_console)).unwrap();
 
         assert_eq!(CONSOLE_CALL_SEQUENCE.load(Ordering::SeqCst), 0);
     }
@@ -711,9 +1403,11 @@ mod tests {
 
         KrunApi::configure_networking_with(
             9,
+            None,
             Some(Path::new("/tmp/gvproxy.sock")),
             Some(record_disable_implicit_vsock),
             record_add_vsock,
+            None,
             Some(record_add_network),
         )
         .unwrap();
@@ -730,8 +1424,10 @@ mod tests {
         KrunApi::configure_networking_with(
             9,
             None,
+            None,
             Some(record_disable_implicit_vsock),
             record_add_vsock,
+            None,
             Some(record_add_network),
         )
         .unwrap();
@@ -740,10 +1436,125 @@ mod tests {
     }
 
     #[test]
+    fn maps_the_control_port_after_adding_a_tsi_disabled_vsock() {
+        let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+        NETWORK_CALL_SEQUENCE.store(0, Ordering::SeqCst);
+
+        KrunApi::configure_networking_with(
+            9,
+            Some(Path::new("/tmp/control.sock")),
+            None,
+            Some(record_disable_implicit_vsock),
+            record_add_vsock,
+            Some(record_add_vsock_port),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(NETWORK_CALL_SEQUENCE.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
     fn network_requires_the_released_libkrun_api() {
         assert!(matches!(
             KrunApi::configure_network_with(9, Path::new("/tmp/gvproxy.sock"), None),
             Err(HelperError::MissingNetworkApi)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embedded_guest_agent_is_a_static_linux_arm64_elf() {
+        assert_eq!(&GUEST_AGENT[..4], b"\x7fELF");
+        assert_eq!(GUEST_AGENT[4], 2, "agent must use ELF64");
+        assert_eq!(u16::from_le_bytes([GUEST_AGENT[18], GUEST_AGENT[19]]), 183);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_agent_is_written_verified_and_made_executable() {
+        let state = tempfile::tempdir().unwrap();
+        let staging = state.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        let disk = state.path().join("root.ext4");
+        fs::write(&disk, []).unwrap();
+        let debugfs = state.path().join("debugfs");
+        fs::write(
+            &debugfs,
+            "#!/bin/sh\ncase \"$3\" in\n  'stat '*) printf 'Inode: 12 Type: regular Mode:  0755\\n';;\n  'dump '*) cp agent verified-agent;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&debugfs, fs::Permissions::from_mode(0o700)).unwrap();
+
+        inject_guest_agent(&debugfs, &disk, &staging).unwrap();
+
+        assert_eq!(
+            fs::read(staging.join("verified-agent")).unwrap(),
+            GUEST_AGENT
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_frames_start_with_exec_sequence_zero() {
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let mut sender = HostSender {
+            stream: host,
+            sequence: FrameSequence::new("session", EXEC_STREAM_ID),
+        };
+        sender
+            .send(frame::Payload::Exec(ExecRequest {
+                argv: vec!["/bin/true".into()],
+                cwd: String::new(),
+                env: Vec::new(),
+                tty: false,
+                rows: 24,
+                cols: 80,
+            }))
+            .unwrap();
+
+        let frame = read_protocol_frame(&mut guest).unwrap();
+        assert_eq!(frame.sequence, 0);
+        assert_eq!(frame.session_id, "session");
+        assert!(matches!(frame.payload, Some(frame::Payload::Exec(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hello_requires_every_execution_capability() {
+        let error = validate_agent_hello(&Hello {
+            agent_version: "test".into(),
+            capabilities: vec!["exec".into()],
+        })
+        .unwrap_err();
+        assert!(matches!(error, BridgeError::MissingCapabilities(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protocol_exit_status_controls_helper_status() {
+        assert_eq!(
+            protocol_exit_code(&Exit {
+                code: 23,
+                signal: None,
+            })
+            .unwrap(),
+            23
+        );
+        assert_eq!(
+            protocol_exit_code(&Exit {
+                code: 0,
+                signal: Some(15),
+            })
+            .unwrap(),
+            143
+        );
+        assert!(
+            protocol_exit_code(&Exit {
+                code: 1,
+                signal: Some(15),
+            })
+            .is_err()
+        );
     }
 }

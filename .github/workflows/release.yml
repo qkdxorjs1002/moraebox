@@ -404,6 +404,7 @@ jobs:
               license "Apache-2.0"
 
               depends_on "rust" => :build
+              depends_on "go" => :build
               depends_on arch: :arm64
               depends_on "e2fsprogs"
               depends_on "gvproxy"

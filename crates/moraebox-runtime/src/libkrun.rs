@@ -47,6 +47,7 @@ pub struct LibkrunConfig {
     pub libkrunfw_path: Option<PathBuf>,
     pub root_path: PathBuf,
     pub root_disk: Option<PathBuf>,
+    pub debugfs_path: PathBuf,
     pub library_search_path: Option<PathBuf>,
     pub vcpus: u8,
     pub memory_mib: u32,
@@ -92,6 +93,7 @@ impl LibkrunConfig {
             libkrunfw_path,
             root_path: root_path.into(),
             root_disk: None,
+            debugfs_path: PathBuf::from("debugfs"),
             library_search_path: None,
             vcpus: 2,
             memory_mib: 512,
@@ -159,6 +161,12 @@ impl LibkrunConfig {
             return Err(BackendError::Control(format!(
                 "root filesystem does not exist: {}",
                 self.root_path.display()
+            )));
+        }
+        if (managed_root || self.root_disk.is_some()) && !self.debugfs_path.is_file() {
+            return Err(BackendError::Control(format!(
+                "debugfs does not exist: {}",
+                self.debugfs_path.display()
             )));
         }
         if let Some(path) = self.workspace_disk.as_ref().filter(|path| !path.is_file()) {
@@ -248,6 +256,10 @@ impl Backend for LibkrunBackend {
         Self::CAPABILITIES
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "native spawn preserves the ordered preparation and cleanup boundary"
+    )]
     async fn spawn(
         &self,
         spec: &RunSpec,
@@ -303,7 +315,13 @@ impl Backend for LibkrunBackend {
         let mut command = Command::new(&self.config.helper_path);
         command.arg("--libkrun").arg(&self.config.library_path);
         if let Some(root_disk) = prepared_root.disk_path() {
-            command.arg("--root-disk").arg(root_disk);
+            command
+                .arg("--root-disk")
+                .arg(root_disk)
+                .arg("--debugfs")
+                .arg(&self.config.debugfs_path)
+                .arg("--session-id")
+                .arg(spec.session_id.to_string());
         } else {
             command.arg("--root").arg(&self.config.root_path);
         }
@@ -316,6 +334,14 @@ impl Backend for LibkrunBackend {
             .arg(std::process::id().to_string());
         if let Some(cwd) = &spec.cwd {
             command.arg("--cwd").arg(cwd);
+        }
+        if spec.tty {
+            command
+                .arg("--tty")
+                .arg("--tty-rows")
+                .arg(spec.tty_rows.to_string())
+                .arg("--tty-cols")
+                .arg(spec.tty_columns.to_string());
         }
         if let Some(workspace) = &self.config.workspace_disk {
             command.arg("--workspace-disk").arg(workspace);
@@ -611,7 +637,10 @@ fn spawn_piped(
         stdout_channel: OutputChannel::Stdout,
         stderr,
         exit,
-        controller: Box::new(LibkrunController { pid: Arc::new(pid) }),
+        controller: Box::new(LibkrunController {
+            pid: Arc::new(pid),
+            terminal: None,
+        }),
         startup: StartupMetrics::default(),
     })
 }
@@ -636,6 +665,7 @@ fn spawn_pty(
     let pty = openpty(&window, None).map_err(std::io::Error::from)?;
     let master = File::from(pty.master);
     let master_reader = master.try_clone()?;
+    let controller_master = master.try_clone()?;
     let slave = File::from(pty.slave);
     command.stdin(Stdio::from(slave.try_clone()?));
     command.stdout(Stdio::from(slave.try_clone()?));
@@ -650,7 +680,10 @@ fn spawn_pty(
         stdout_channel: OutputChannel::Tty,
         stderr: None,
         exit,
-        controller: Box::new(LibkrunController { pid: Arc::new(pid) }),
+        controller: Box::new(LibkrunController {
+            pid: Arc::new(pid),
+            terminal: Some(Arc::new(controller_master)),
+        }),
         startup: StartupMetrics::default(),
     })
 }
@@ -721,6 +754,14 @@ struct LibkrunController {
         )
     )]
     pid: Arc<u32>,
+    #[cfg(unix)]
+    terminal: Option<Arc<std::fs::File>>,
+    #[cfg(not(unix))]
+    #[expect(
+        dead_code,
+        reason = "terminal resizing is unsupported by the non-Unix native stub"
+    )]
+    terminal: Option<Arc<()>>,
 }
 
 impl Drop for LibkrunController {
@@ -766,6 +807,44 @@ impl BackendController for LibkrunController {
             Err(BackendError::Unsupported(
                 "libkrun helper signals on this platform",
             ))
+        }
+    }
+
+    async fn resize(&self, rows: u16, cols: u16) -> Result<(), BackendError> {
+        #[cfg(unix)]
+        {
+            use nix::{
+                errno::Errno,
+                sys::signal::{Signal as NixSignal, kill},
+                unistd::Pid,
+            };
+            use rustix::termios::{Winsize, tcsetwinsize};
+
+            let terminal = self
+                .terminal
+                .as_ref()
+                .ok_or(BackendError::Unsupported("terminal resize"))?;
+            tcsetwinsize(
+                terminal.as_ref(),
+                Winsize {
+                    ws_row: rows,
+                    ws_col: cols,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                },
+            )
+            .map_err(|error| BackendError::Control(error.to_string()))?;
+            let raw_pid = i32::try_from(*self.pid)
+                .map_err(|error| BackendError::Control(error.to_string()))?;
+            match kill(Pid::from_raw(-raw_pid), NixSignal::SIGWINCH) {
+                Ok(()) | Err(Errno::ESRCH) => Ok(()),
+                Err(error) => Err(BackendError::Control(error.to_string())),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (rows, cols);
+            Err(BackendError::Unsupported("terminal resize"))
         }
     }
 }
@@ -942,11 +1021,14 @@ mod tests {
         let library = state.path().join("libkrun");
         let root = state.path().join("unused-root");
         let root_disk = state.path().join("root.ext4");
+        let debugfs = state.path().join("debugfs");
         write_executable(&helper, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+        write_executable(&debugfs, "#!/bin/sh\nexit 0\n");
         fs::write(&library, []).unwrap();
         fs::write(&root_disk, []).unwrap();
 
-        let config = LibkrunConfig::new(helper, library, root).with_root_disk(&root_disk);
+        let mut config = LibkrunConfig::new(helper, library, root).with_root_disk(&root_disk);
+        config.debugfs_path = debugfs.clone();
         let report = crate::Supervisor::new(LibkrunBackend::new(config))
             .run(RunSpec::command(["/usr/bin/true"]))
             .await
@@ -960,6 +1042,9 @@ mod tests {
 
         assert!(output.contains("--root-disk"));
         assert!(output.contains(root_disk.to_str().unwrap()));
+        assert!(output.contains("--debugfs"));
+        assert!(output.contains(debugfs.to_str().unwrap()));
+        assert!(output.contains("--session-id"));
         assert!(!output.contains("--root\n"));
     }
 
@@ -1735,6 +1820,7 @@ mod tests {
         helper: PathBuf,
         library: PathBuf,
         e2fsck: PathBuf,
+        debugfs: PathBuf,
         boxes: BoxStore,
     }
 
@@ -1745,8 +1831,10 @@ mod tests {
             let helper = state.path().join("helper");
             let library = state.path().join("libkrun");
             let e2fsck = state.path().join("e2fsck");
+            let debugfs = state.path().join("debugfs");
             write_executable(&helper, helper_script);
             write_executable(&e2fsck, e2fsck_script);
+            write_executable(&debugfs, "#!/bin/sh\nexit 0\n");
             fs::write(&library, []).unwrap();
             let boxes = BoxStore::new(state.path().join("state"));
             Self {
@@ -1754,6 +1842,7 @@ mod tests {
                 helper,
                 library,
                 e2fsck,
+                debugfs,
                 boxes,
             }
         }
@@ -1793,11 +1882,12 @@ mod tests {
         }
 
         fn backend(&self, source: Option<(BoxRootSource, PathBuf)>) -> LibkrunBackend {
-            let config = LibkrunConfig::new(
+            let mut config = LibkrunConfig::new(
                 &self.helper,
                 &self.library,
                 self.state.path().join("unused-root"),
             );
+            config.debugfs_path.clone_from(&self.debugfs);
             let runtime = BoxRuntimeConfig {
                 boxes: self.boxes.clone(),
                 base_disks: BaseDiskStore::new(self.state.path().join("cache")),

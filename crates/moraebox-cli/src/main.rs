@@ -86,6 +86,9 @@ struct GlobalOptions {
     /// Path to e2fsck; auto-detected when omitted.
     #[arg(long, global = true, env = "MORAE_E2FSCK")]
     e2fsck: Option<PathBuf>,
+    /// Path to debugfs; auto-detected when omitted.
+    #[arg(long, global = true, env = "MORAE_DEBUGFS")]
+    debugfs: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]

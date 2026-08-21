@@ -2064,6 +2064,7 @@ mod tests {
             memory_mib: 512,
             mke2fs: None,
             e2fsck: None,
+            debugfs: None,
             disk_size: 8 * 1024 * 1024 * 1024,
         });
 
@@ -2100,6 +2101,7 @@ mod tests {
             memory_mib: 512,
             mke2fs: None,
             e2fsck: None,
+            debugfs: None,
             disk_size: 8 * 1024 * 1024 * 1024,
         })
         .expect("server creation must not resolve the image");

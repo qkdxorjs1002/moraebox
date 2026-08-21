@@ -168,6 +168,7 @@ impl NativeSandboxConfig {
             .library_search_path
             .clone_from(&self.native_paths.library_search_path);
         config.gvproxy_path.clone_from(&self.native_paths.gvproxy);
+        config.debugfs_path = self.disk_tools.debugfs_command();
         config.network_runtime_dir = storage.cache_dir().join("network");
         config.workspace_disk = workspace_disk;
         config.vcpus = self.vcpus;
@@ -242,6 +243,7 @@ mod tests {
         DiskToolPaths {
             mke2fs: Some("/native/mke2fs".into()),
             e2fsck: Some("/native/e2fsck".into()),
+            debugfs: Some("/native/debugfs".into()),
         }
     }
 
@@ -285,6 +287,7 @@ mod tests {
             storage.cache_dir().join("network")
         );
         assert_eq!(config.workspace_disk, Some("/workspace".into()));
+        assert_eq!(config.debugfs_path, PathBuf::from("/native/debugfs"));
         assert_eq!((config.vcpus, config.memory_mib), (4, 1024));
     }
 

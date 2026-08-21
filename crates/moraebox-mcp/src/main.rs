@@ -139,6 +139,9 @@ struct ServerArgs {
     /// Path to e2fsck; auto-detected when omitted.
     #[arg(long, env = "MORAE_E2FSCK")]
     e2fsck: Option<PathBuf>,
+    /// Path to debugfs; auto-detected when omitted.
+    #[arg(long, env = "MORAE_DEBUGFS")]
+    debugfs: Option<PathBuf>,
     /// Virtual root disk size for ephemeral image-backed runs and new Boxes.
     #[arg(long, default_value = "8GiB", value_parser = parse_disk_size)]
     disk_size: u64,
@@ -339,7 +342,11 @@ fn create_server(args: ServerArgs) -> Result<McpServer, McpServerError> {
         || BaseDiskStore::new(&cache_dir),
         |storage| storage.base_disks().clone(),
     );
-    let disk_tools = DiskToolPaths::discover(args.mke2fs.clone(), args.e2fsck.clone());
+    let disk_tools = DiskToolPaths::discover_with_debugfs(
+        args.mke2fs.clone(),
+        args.e2fsck.clone(),
+        args.debugfs.clone(),
+    );
     let mke2fs_path = disk_tools.mke2fs_command();
     let backend: Arc<dyn Backend> = match args.backend.as_str() {
         "process" => {

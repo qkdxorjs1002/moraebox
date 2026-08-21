@@ -173,10 +173,11 @@ fn doctor(args: &DoctorArgs, global: &GlobalOptions) -> Result<i32, CliErrorSour
         global.gvproxy.clone(),
     );
     let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
-    let report = DoctorReport::collect_with_paths_and_cache(
+    let report = DoctorReport::collect_with_paths_and_cache_with_debugfs(
         paths,
         global.mke2fs.clone(),
         global.e2fsck.clone(),
+        global.debugfs.clone(),
         cache_dir,
     );
     if global.json {
@@ -336,7 +337,11 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, CliErrorSourc
     } else {
         None
     };
-    let disk_tools = DiskToolPaths::discover(global.mke2fs.clone(), global.e2fsck.clone());
+    let disk_tools = DiskToolPaths::discover_with_debugfs(
+        global.mke2fs.clone(),
+        global.e2fsck.clone(),
+        global.debugfs.clone(),
+    );
     let mke2fs = disk_tools.mke2fs_command();
 
     let workspace = if let Some(source) = args.workspace.as_deref() {
@@ -584,7 +589,12 @@ async fn box_create(args: BoxCreateArgs, global: &GlobalOptions) -> Result<i32, 
     let base = BaseDiskStore::new(&cache_dir).prepare(
         &spec,
         &prepared.rootfs,
-        &DiskToolPaths::discover(global.mke2fs.clone(), global.e2fsck.clone()).mke2fs_command(),
+        &DiskToolPaths::discover_with_debugfs(
+            global.mke2fs.clone(),
+            global.e2fsck.clone(),
+            global.debugfs.clone(),
+        )
+        .mke2fs_command(),
     )?;
     let metadata = BoxStore::new(state_dir).create(
         &CreateBox::new(
@@ -1080,7 +1090,11 @@ async fn benchmark(args: BenchmarkArgs, global: &GlobalOptions) -> Result<i32, C
             } else {
                 None
             };
-            let disk_tools = DiskToolPaths::discover(global.mke2fs.clone(), global.e2fsck.clone());
+            let disk_tools = DiskToolPaths::discover_with_debugfs(
+                global.mke2fs.clone(),
+                global.e2fsck.clone(),
+                global.debugfs.clone(),
+            );
             let storage = ManagedStorage::open(&cache_dir, &state_dir)?;
             let native = NativeSandboxConfig::discover(
                 NativeRuntimeOverrides {
