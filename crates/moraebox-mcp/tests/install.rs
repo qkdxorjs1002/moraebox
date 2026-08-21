@@ -9,6 +9,7 @@ fn mcp_command() -> Command {
         "MORAE_ROOTFS",
         "MORAE_HELPER_PATH",
         "MORAE_LIBKRUN_PATH",
+        "MORAE_LIBKRUNFW_PATH",
         "MORAE_GVPROXY_PATH",
         "MORAE_LIB_DIR",
         "MORAE_MKE2FS",

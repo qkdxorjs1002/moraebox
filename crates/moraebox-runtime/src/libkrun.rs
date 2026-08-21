@@ -24,7 +24,7 @@ use tokio::{
 use crate::{
     Backend, BackendCapabilities, BackendController, BackendError, CapabilitySupport,
     IsolationLevel, RootMode, RunBudget, RunStage, SpawnedSandbox, StartupMetrics,
-    environment::resolve_environment,
+    doctor::validate_native_runtime_for_spawn, environment::resolve_environment,
 };
 
 const NETWORK_PROXY_START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -36,6 +36,7 @@ pub(crate) const NETWORK_PROXY_STDERR_LIMIT: usize = 16 * 1024;
 pub struct LibkrunConfig {
     pub helper_path: PathBuf,
     pub library_path: PathBuf,
+    pub libkrunfw_path: Option<PathBuf>,
     pub root_path: PathBuf,
     pub root_disk: Option<PathBuf>,
     pub library_search_path: Option<PathBuf>,
@@ -44,6 +45,8 @@ pub struct LibkrunConfig {
     pub workspace_disk: Option<PathBuf>,
     pub gvproxy_path: Option<PathBuf>,
     pub network_runtime_dir: PathBuf,
+    #[cfg(test)]
+    enforce_native_preflight: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -70,9 +73,15 @@ impl LibkrunConfig {
         library_path: impl Into<PathBuf>,
         root_path: impl Into<PathBuf>,
     ) -> Self {
+        let library_path = library_path.into();
+        let libkrunfw_path = library_path
+            .parent()
+            .map(|directory| directory.join("libkrunfw.dylib"))
+            .filter(|path| path.is_file());
         Self {
             helper_path: helper_path.into(),
-            library_path: library_path.into(),
+            library_path,
+            libkrunfw_path,
             root_path: root_path.into(),
             root_disk: None,
             library_search_path: None,
@@ -81,6 +90,8 @@ impl LibkrunConfig {
             workspace_disk: None,
             gvproxy_path: None,
             network_runtime_dir: PathBuf::from(".moraebox/network"),
+            #[cfg(test)]
+            enforce_native_preflight: false,
         }
     }
 
@@ -90,7 +101,13 @@ impl LibkrunConfig {
         self
     }
 
-    fn validate(&self, managed_root: bool) -> Result<(), BackendError> {
+    #[must_use]
+    pub fn with_libkrunfw(mut self, path: impl Into<PathBuf>) -> Self {
+        self.libkrunfw_path = Some(path.into());
+        self
+    }
+
+    fn validate(&self, managed_root: bool, network: bool) -> Result<(), BackendError> {
         if self.vcpus == 0 {
             return Err(BackendError::InvalidSpec("vCPU count must be non-zero"));
         }
@@ -107,6 +124,19 @@ impl LibkrunConfig {
                     path.display()
                 )));
             }
+        }
+        #[cfg(test)]
+        let enforce_native_preflight = self.enforce_native_preflight;
+        #[cfg(not(test))]
+        let enforce_native_preflight = true;
+        if enforce_native_preflight {
+            validate_native_runtime_for_spawn(
+                &self.helper_path,
+                &self.library_path,
+                self.libkrunfw_path.as_deref(),
+                network,
+            )
+            .map_err(|error| BackendError::Control(error.to_string()))?;
         }
         if managed_root {
             // A managed Box lease supplies the root disk immediately before helper spawn.
@@ -197,7 +227,8 @@ impl Backend for LibkrunBackend {
         budget: &RunBudget,
     ) -> Result<SpawnedSandbox, BackendError> {
         spec.validate().map_err(BackendError::InvalidSpec)?;
-        self.config.validate(self.box_runtime.is_some())?;
+        self.config
+            .validate(self.box_runtime.is_some(), spec.network)?;
         if spec.box_id.is_some() && self.box_runtime.is_none() {
             return Err(BackendError::Control(
                 "run requested a BoxId but no Box store is configured".into(),
@@ -1042,7 +1073,7 @@ mod tests {
     #[test]
     fn rejects_missing_native_paths() {
         let config = LibkrunConfig::new("missing-helper", "missing-lib", "missing-root");
-        assert!(config.validate(false).is_err());
+        assert!(config.validate(false, false).is_err());
     }
 
     #[test]
@@ -1464,6 +1495,46 @@ mod tests {
 
         let ephemeral = runtime_root.join("ephemeral-boxes");
         assert_eq!(fs::read_dir(ephemeral).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_preflight_failure_precedes_root_and_network_side_effects() {
+        let fixture = ManagedFixture::new("#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let rootfs = fixture.state.path().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        fs::write(rootfs.join("payload"), b"rootfs").unwrap();
+        let mke2fs = fixture.state.path().join("observed-mke2fs");
+        write_executable(&mke2fs, "#!/bin/sh\nprintf ran > \"$0.ran\"\nexit 9\n");
+        let source = BoxRootSource {
+            rootfs_path: rootfs,
+            manifest_digest: "sha256:preflight-order".into(),
+            platform: "linux/arm64".into(),
+            virtual_size_bytes: MANAGED_TEST_DISK_BYTES,
+            mke2fs_path: mke2fs.clone(),
+        };
+        let gvproxy = fixture.state.path().join("gvproxy");
+        write_executable(
+            &gvproxy,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nwhile :; do /bin/sleep 1; done\n",
+        );
+        let mut backend = fixture.backend(Some((
+            source,
+            fixture.state.path().join("ephemeral-runtime"),
+        )));
+        backend.config.enforce_native_preflight = true;
+        backend.config.gvproxy_path = Some(gvproxy.clone());
+        backend.config.network_runtime_dir = fixture.state.path().join("network");
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.network = true;
+
+        let error = match backend.spawn(&spec, &RunBudget::new(spec.timeout)).await {
+            Ok(_) => panic!("invalid native prerequisites must fail before spawn"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("native runtime preflight failed"));
+        assert!(!mke2fs.with_extension("ran").exists());
+        assert!(!gvproxy.with_extension("pid").exists());
     }
 
     #[cfg(unix)]

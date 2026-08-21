@@ -187,6 +187,12 @@ pub struct NativeRuntimePaths {
     pub library_search_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("native runtime preflight failed: {details}")]
+pub(crate) struct NativeRuntimePreflightError {
+    details: String,
+}
+
 impl NativeRuntimePaths {
     /// Resolve native runtime paths without overriding explicit caller configuration.
     pub fn discover(
@@ -284,22 +290,28 @@ impl DoctorReport {
             .path
             .as_deref()
             .and_then(|path| library_has_symbol(path, "krun_add_net_unixgram"));
-        let native_backend_ready = host_supported
+        let native_runtime_ready = validate_native_runtime_probes(
+            host_supported,
+            &helper,
+            hypervisor_entitlement,
+            &libkrun,
+            &libkrunfw,
+            false,
+            None,
+        )
+        .is_ok();
+        let native_network_abi_ready = validate_native_runtime_probes(
+            host_supported,
+            &helper,
+            hypervisor_entitlement,
+            &libkrun,
+            &libkrunfw,
+            true,
+            libkrun_network_api,
+        )
+        .is_ok();
+        let native_backend_ready = native_runtime_ready
             && hypervisor_framework
-            && hypervisor_entitlement
-            && helper.regular_file
-            && helper.executable == Some(true)
-            && helper.architecture_matches == Some(true)
-            && helper.code_signature_valid == Some(true)
-            && libkrun.found
-            && libkrun.required_symbols_present == Some(true)
-            && libkrun.version_matches == Some(true)
-            && libkrun.architecture_matches == Some(true)
-            && libkrun.code_signature_valid == Some(true)
-            && libkrunfw.found
-            && libkrunfw.version_matches == Some(true)
-            && libkrunfw.architecture_matches == Some(true)
-            && libkrunfw.code_signature_valid == Some(true)
             && mke2fs.found
             && e2fsck.found
             && cow_clone_supported == Some(true);
@@ -308,7 +320,7 @@ impl DoctorReport {
             && network.helper_executable
             && network.helper_architecture_matches == Some(true)
             && network.socket_created == Some(true)
-            && libkrun_network_api == Some(true);
+            && native_network_abi_ready;
         let checks = build_checks(
             &cache_volume,
             &network,
@@ -351,6 +363,130 @@ impl DoctorReport {
             checks,
             warnings,
         }
+    }
+}
+
+pub(crate) fn validate_native_runtime_for_spawn(
+    helper_path: &Path,
+    libkrun_path: &Path,
+    libkrunfw_path: Option<&Path>,
+    require_network_api: bool,
+) -> Result<(), NativeRuntimePreflightError> {
+    let host_architecture = env::consts::ARCH;
+    let helper = probe_native_binary(Some(helper_path), host_architecture, true);
+    let hypervisor_entitlement =
+        helper.regular_file && binary_has_hypervisor_entitlement(helper_path);
+    let libkrun = probe_libkrun(Some(libkrun_path.to_path_buf()), host_architecture);
+    let libkrunfw = probe_libkrunfw(libkrunfw_path.map(Path::to_path_buf), host_architecture);
+    let network_api = require_network_api
+        .then(|| library_has_symbol(libkrun_path, "krun_add_net_unixgram"))
+        .flatten();
+    validate_native_runtime_probes(
+        env::consts::OS == "macos" && host_architecture == "aarch64",
+        &helper,
+        hypervisor_entitlement,
+        &libkrun,
+        &libkrunfw,
+        require_network_api,
+        network_api,
+    )
+}
+
+fn validate_native_runtime_probes(
+    host_supported: bool,
+    helper: &NativeBinaryProbe,
+    hypervisor_entitlement: bool,
+    libkrun: &LibraryProbe,
+    libkrunfw: &LibraryProbe,
+    require_network_api: bool,
+    network_api: Option<bool>,
+) -> Result<(), NativeRuntimePreflightError> {
+    let mut issues = Vec::new();
+    if !host_supported {
+        issues.push("native libkrun execution requires Apple Silicon macOS".to_owned());
+    }
+    validate_helper_probe(helper, hypervisor_entitlement, &mut issues);
+    validate_library_probe("libkrun", libkrun, EXPECTED_LIBKRUN_VERSION, &mut issues);
+    validate_library_probe(
+        "libkrunfw",
+        libkrunfw,
+        EXPECTED_LIBKRUNFW_VERSION,
+        &mut issues,
+    );
+    if require_network_api && network_api != Some(true) {
+        issues.push(
+            "libkrun does not expose the released krun_add_net_unixgram network ABI".to_owned(),
+        );
+    }
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        issues.push(
+            "run `morae doctor --json` and install or sign the pinned native dependencies"
+                .to_owned(),
+        );
+        Err(NativeRuntimePreflightError {
+            details: issues.join("; "),
+        })
+    }
+}
+
+fn validate_helper_probe(
+    helper: &NativeBinaryProbe,
+    hypervisor_entitlement: bool,
+    issues: &mut Vec<String>,
+) {
+    if !helper.regular_file {
+        issues.push("morae-vmm-helper is not a regular file".to_owned());
+        return;
+    }
+    if helper.executable != Some(true) {
+        issues.push("morae-vmm-helper is not executable".to_owned());
+    }
+    if helper.architecture_matches != Some(true) {
+        issues.push("morae-vmm-helper architecture does not match the host".to_owned());
+    }
+    if helper.code_signature_valid != Some(true) {
+        issues.push("morae-vmm-helper code signature is invalid or unverifiable".to_owned());
+    }
+    if !hypervisor_entitlement {
+        issues.push("morae-vmm-helper lacks the Hypervisor entitlement".to_owned());
+    }
+}
+
+fn validate_library_probe(
+    name: &str,
+    probe: &LibraryProbe,
+    expected_version: &str,
+    issues: &mut Vec<String>,
+) {
+    if !probe.found {
+        issues.push(format!(
+            "{name} is not a regular file or its path was not resolved"
+        ));
+        return;
+    }
+    if probe.required_symbols_present != Some(true) {
+        let missing = if probe.missing_symbols.is_empty() {
+            String::new()
+        } else {
+            format!(": missing {}", probe.missing_symbols.join(", "))
+        };
+        issues.push(format!(
+            "{name} does not expose the required released ABI{missing}"
+        ));
+    }
+    if probe.version_matches != Some(true) {
+        issues.push(format!(
+            "{name} version is {} but the pinned released version is {expected_version}",
+            probe.version.as_deref().unwrap_or("unverifiable")
+        ));
+    }
+    if probe.architecture_matches != Some(true) {
+        issues.push(format!("{name} architecture does not match the host"));
+    }
+    if probe.code_signature_valid != Some(true) {
+        issues.push(format!("{name} code signature is invalid or unverifiable"));
     }
 }
 
@@ -1173,6 +1309,62 @@ mod tests {
         assert!(!probe.found);
         assert_eq!(probe.path, Some(path));
         assert_eq!(probe.required_symbols_present, None);
+    }
+
+    #[test]
+    fn native_preflight_requires_pinned_released_probes() {
+        let helper = NativeBinaryProbe {
+            path: Some(PathBuf::from("/native/morae-vmm-helper")),
+            regular_file: true,
+            executable: Some(true),
+            architecture: Some("arm64".into()),
+            architecture_matches: Some(true),
+            code_signature_valid: Some(true),
+        };
+        let library = |name: &str, version: &str| LibraryProbe {
+            found: true,
+            path: Some(PathBuf::from(format!("/native/{name}.dylib"))),
+            required_symbols_present: Some(true),
+            missing_symbols: Vec::new(),
+            version: Some(version.into()),
+            version_matches: Some(true),
+            architecture: Some("arm64".into()),
+            architecture_matches: Some(true),
+            code_signature_valid: Some(true),
+        };
+        let libkrun = library("libkrun", EXPECTED_LIBKRUN_VERSION);
+        let libkrunfw = library("libkrunfw", EXPECTED_LIBKRUNFW_VERSION);
+
+        assert!(
+            validate_native_runtime_probes(
+                true,
+                &helper,
+                true,
+                &libkrun,
+                &libkrunfw,
+                true,
+                Some(true),
+            )
+            .is_ok()
+        );
+
+        let mut unverifiable = libkrun;
+        unverifiable.version = None;
+        unverifiable.version_matches = None;
+        let error = validate_native_runtime_probes(
+            true,
+            &helper,
+            true,
+            &unverifiable,
+            &libkrunfw,
+            true,
+            Some(false),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("libkrun version is unverifiable"));
+        assert!(error.contains("krun_add_net_unixgram"));
+        assert!(error.contains("morae doctor --json"));
     }
 
     #[test]

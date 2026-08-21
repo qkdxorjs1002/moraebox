@@ -398,6 +398,7 @@ fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error::Erro
                 .clone()
                 .unwrap_or_else(|| cache_dir.join("rootfs"));
             let mut config = LibkrunConfig::new(helper, library, root_path);
+            config.libkrunfw_path = paths.libkrunfw;
             config.library_search_path = paths.library_search_path;
             config.gvproxy_path = paths.gvproxy;
             config.network_runtime_dir = cache_dir.join("network");

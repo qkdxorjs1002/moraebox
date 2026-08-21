@@ -121,6 +121,7 @@ type ServerConfiguration = (Environment, Vec<OsString>);
 struct NativeRegistrationPaths {
     helper: Option<PathBuf>,
     libkrun: Option<PathBuf>,
+    libkrunfw: Option<PathBuf>,
     gvproxy: Option<PathBuf>,
     library_search_path: Option<PathBuf>,
     mke2fs: Option<PathBuf>,
@@ -301,6 +302,7 @@ fn server_configuration_with_paths(
     for (name, path) in [
         ("MORAE_HELPER_PATH", native_paths.helper.as_ref()),
         ("MORAE_LIBKRUN_PATH", native_paths.libkrun.as_ref()),
+        ("MORAE_LIBKRUNFW_PATH", native_paths.libkrunfw.as_ref()),
         ("MORAE_GVPROXY_PATH", native_paths.gvproxy.as_ref()),
         ("MORAE_MKE2FS", native_paths.mke2fs.as_ref()),
         ("MORAE_E2FSCK", native_paths.e2fsck.as_ref()),
@@ -338,6 +340,9 @@ fn resolve_native_registration_paths(
         .as_ref()
         .and_then(|paths| paths.libkrun.clone())
         .or_else(|| install.libkrun.clone());
+    let libkrunfw = discovered
+        .as_ref()
+        .and_then(|paths| paths.libkrunfw.clone());
     let gvproxy = discovered
         .as_ref()
         .and_then(|paths| paths.gvproxy.clone())
@@ -359,6 +364,7 @@ fn resolve_native_registration_paths(
     Ok(NativeRegistrationPaths {
         helper,
         libkrun,
+        libkrunfw,
         gvproxy,
         library_search_path,
         mke2fs,
@@ -871,6 +877,22 @@ mod tests {
         assert!(
             environment.contains(&("MORAE_GVPROXY_PATH", OsString::from("/opt/tools/gvproxy")))
         );
+    }
+
+    #[test]
+    fn discovered_libkrunfw_path_is_registered_as_environment() {
+        let install = install_args(Agent::Codex);
+        let native_paths = NativeRegistrationPaths {
+            libkrunfw: Some("/opt/native/libkrunfw.dylib".into()),
+            ..NativeRegistrationPaths::default()
+        };
+
+        let (environment, _) = server_configuration_with_paths(&install, &native_paths).unwrap();
+
+        assert!(environment.contains(&(
+            "MORAE_LIBKRUNFW_PATH",
+            OsString::from("/opt/native/libkrunfw.dylib")
+        )));
     }
 
     #[test]

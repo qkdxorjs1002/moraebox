@@ -2257,6 +2257,7 @@ fn native_config(
         required_path(root, root_description)?
     };
     let mut config = LibkrunConfig::new(helper, library, root);
+    config.libkrunfw_path = paths.libkrunfw;
     config.library_search_path = paths.library_search_path;
     config.gvproxy_path = paths.gvproxy;
     Ok(config)

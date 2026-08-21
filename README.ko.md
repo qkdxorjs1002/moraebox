@@ -342,6 +342,8 @@ codesign --force --sign - \
 
 네이티브 시작은 root disk 준비를 끝낸 뒤 gvproxy를 실행합니다. 따라서 root 준비 실패는 network process를 만들지 않으며, 이후 helper spawn 실패나 취소된 network setup은 runtime state를 제거하기 전에 gvproxy를 명시적으로 종료하고 reap합니다.
 
+모든 네이티브 실행은 root disk 준비나 gvproxy 시작 전에 `morae doctor --json`과 같은 선행 조건을 다시 검사합니다. helper는 실행 가능하고 host architecture용으로 서명되어 Hypervisor entitlement를 가져야 합니다. libkrun 1.19.4와 libkrunfw 5.5.0은 서명된 host architecture 파일이어야 하며 canonical Homebrew 경로로 고정된 정식 버전을 증명해야 합니다. libkrun은 필수 ABI와, 네트워크 실행에서는 `krun_add_net_unixgram`도 제공해야 합니다. 검증할 수 없는 복사본이나 custom library는 helper spawn까지 진행하지 않고 doctor 기반 remediation과 함께 거부합니다.
+
 ## 개발
 
 ```sh

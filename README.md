@@ -375,6 +375,8 @@ Native execution additionally needs compatible released libkrun/libkrunfw builds
 
 Native startup finishes root disk preparation before starting gvproxy. A root preparation failure therefore creates no network process, and a later helper spawn failure or cancelled network setup explicitly kills and reaps gvproxy before its runtime state is removed.
 
+Every native run repeats the same prerequisite checks reported by `morae doctor --json` before preparing a root disk or starting gvproxy. The helper must be executable, signed for the host architecture, and carry the Hypervisor entitlement. libkrun 1.19.4 and libkrunfw 5.5.0 must be signed host-architecture files whose canonical Homebrew paths prove the pinned released versions; libkrun must also export the required ABI and, for networked runs, `krun_add_net_unixgram`. An unverifiable copied or custom library is rejected with doctor-based remediation instead of reaching helper spawn.
+
 ## Development
 
 ```sh
