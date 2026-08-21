@@ -354,7 +354,7 @@ impl LibkrunBackend {
         }
         runtime
             .boxes
-            .set_state(&mut lease, BoxState::Dirty)
+            .begin_writable_use(&mut lease)
             .map_err(box_backend_error)?;
         Ok((
             PreparedRoot::Managed(ManagedRootLease::Persistent {
@@ -482,7 +482,7 @@ impl ManagedRootLease {
 
     fn mark_clean(&mut self) -> Result<(), BoxStoreError> {
         if let Self::Persistent { store, lease } = self {
-            store.set_state(lease, BoxState::Ready)?;
+            store.finish_clean_use(lease)?;
         }
         Ok(())
     }
@@ -508,14 +508,10 @@ async fn repair_dirty_box(
         .kill_on_drop(true);
     let output = command.output().await?;
     if matches!(output.status.code(), Some(0 | 1)) {
-        store
-            .set_state(lease, BoxState::Ready)
-            .map_err(box_backend_error)?;
+        store.finish_repair(lease).map_err(box_backend_error)?;
         return Ok(());
     }
-    store
-        .set_state(lease, BoxState::NeedsRepair)
-        .map_err(box_backend_error)?;
+    store.mark_needs_repair(lease).map_err(box_backend_error)?;
     Err(BackendError::Control(format!(
         "e2fsck could not repair Box {} (status {:?}): {}",
         lease.id(),
@@ -1052,13 +1048,35 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn helper_spawn_failure_leaves_a_durable_dirty_state() {
+        let fixture = ManagedFixture::new("#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let (box_id, _) = fixture.create_box();
+        let backend = fixture.backend(None);
+        fixture.make_helper_non_executable();
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.box_id = Some(box_id);
+
+        assert!(
+            backend
+                .spawn(&spec, &RunBudget::new(spec.timeout))
+                .await
+                .is_err()
+        );
+
+        let reopened = BoxStore::new(fixture.boxes.state_root());
+        assert_eq!(reopened.get(box_id).unwrap().state, BoxState::Dirty);
+        assert!(reopened.try_acquire(box_id).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn dirty_box_runs_e2fsck_before_the_next_helper() {
         let fixture = ManagedFixture::new(
             "#!/bin/sh\nexit 0\n",
             "#!/bin/sh\nprintf repaired > \"$0.called\"\nexit 1\n",
         );
         let (box_id, _) = fixture.create_box();
-        fixture.set_box_state(box_id, BoxState::Dirty);
+        fixture.mark_box_dirty(box_id);
         let backend = fixture.backend(None);
         let mut spec = RunSpec::command(["/usr/bin/true"]);
         spec.box_id = Some(box_id);
@@ -1071,10 +1089,36 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn repaired_box_is_dirty_again_before_helper_spawn() {
+        let fixture = ManagedFixture::new(
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nprintf repaired > \"$0.called\"\nexit 1\n",
+        );
+        let (box_id, _) = fixture.create_box();
+        fixture.mark_box_dirty(box_id);
+        let backend = fixture.backend(None);
+        fixture.make_helper_non_executable();
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.box_id = Some(box_id);
+
+        assert!(
+            backend
+                .spawn(&spec, &RunBudget::new(spec.timeout))
+                .await
+                .is_err()
+        );
+
+        assert!(fixture.e2fsck.with_extension("called").exists());
+        let reopened = BoxStore::new(fixture.boxes.state_root());
+        assert_eq!(reopened.get(box_id).unwrap().state, BoxState::Dirty);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn failed_repair_blocks_the_box() {
         let fixture = ManagedFixture::new("#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 4\n");
         let (box_id, _) = fixture.create_box();
-        fixture.set_box_state(box_id, BoxState::Dirty);
+        fixture.mark_box_dirty(box_id);
         let backend = fixture.backend(None);
         let mut spec = RunSpec::command(["/usr/bin/true"]);
         spec.box_id = Some(box_id);
@@ -1099,7 +1143,7 @@ mod tests {
             "#!/bin/sh\nwhile :; do /bin/sleep 1; done\n",
         );
         let (box_id, _) = fixture.create_box();
-        fixture.set_box_state(box_id, BoxState::Dirty);
+        fixture.mark_box_dirty(box_id);
         let backend = fixture.backend(None);
         let mut spec = RunSpec::command(["/usr/bin/true"]);
         spec.box_id = Some(box_id);
@@ -1441,9 +1485,15 @@ mod tests {
             (metadata.box_id, path)
         }
 
-        fn set_box_state(&self, box_id: moraebox_core::BoxId, state: BoxState) {
+        fn mark_box_dirty(&self, box_id: moraebox_core::BoxId) {
             let mut lease = self.boxes.try_acquire(box_id).unwrap();
-            self.boxes.set_state(&mut lease, state).unwrap();
+            self.boxes.begin_writable_use(&mut lease).unwrap();
+        }
+
+        fn make_helper_non_executable(&self) {
+            let mut permissions = fs::metadata(&self.helper).unwrap().permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(&self.helper, permissions).unwrap();
         }
 
         fn backend(&self, source: Option<(BoxRootSource, PathBuf)>) -> LibkrunBackend {

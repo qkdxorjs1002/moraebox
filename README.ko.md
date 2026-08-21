@@ -139,6 +139,8 @@ morae box delete "$BOX_ID" --yes
 
 `BoxId`는 persistent root filesystem 계보를 식별하며 VM identity나 인증 수단이 아닙니다. `morae run --box`도 매번 새 microVM과 `SessionId`를 만들고 Box disk의 파일만 이어받습니다. 서로 다른 Box는 독립된 disk를 사용하며 같은 Box의 두 번째 writer는 즉시 실패합니다. `--box`는 `--image`, `--rootfs`, `--workspace`와 함께 사용할 수 없고, 격리 없는 `process` 백엔드는 이를 거부합니다.
 
+writable Box disk를 guest에 연결하기 전에 moraebox는 `Dirty` metadata를 원자적으로 기록하고 file과 parent directory를 모두 flush합니다. clean helper shutdown만 Box를 `Ready`로 되돌립니다. host crash, timeout, signal, helper 실패 또는 spawn 실패는 `Dirty`를 유지하므로 다음 실행은 Box lease를 잡은 상태에서 `e2fsck -p`를 수행합니다. 복구 성공은 disk를 다시 사용하기 전에 기록되며, 복구할 수 없는 filesystem은 `NeedsRepair`로 표시하고 실행을 차단합니다.
+
 ### 읽기 전용 워크스페이스 연결
 
 ```sh

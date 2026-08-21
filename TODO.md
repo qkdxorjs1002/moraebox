@@ -216,7 +216,7 @@
 
 - [x] crash 후 남은 `.creating`, `.deleting`, 임시 disk와 tombstone을 age/lock 기준으로 안전하게 GC한다.
 
-- [ ] writable Box 실행 전 `Dirty` 상태를 durable하게 기록하고 clean shutdown/e2fsck 이후에만 `Ready`로 전환한다.
+- [x] writable Box 실행 전 `Dirty` 상태를 durable하게 기록하고 clean shutdown/e2fsck 이후에만 `Ready`로 전환한다.
 
 - [ ] gvproxy readiness를 경로 존재가 아닌 socket handshake로 확인하고 bounded stderr diagnostics를 보존한다.
 

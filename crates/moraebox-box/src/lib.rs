@@ -459,21 +459,53 @@ impl BoxStore {
         })
     }
 
-    pub fn set_state(&self, lease: &mut BoxLease, state: BoxState) -> Result<(), BoxStoreError> {
-        let expected = self.box_directory(lease.id());
-        if lease.directory != expected {
+    /// Durably records that a writable Box is about to be exposed to a guest.
+    pub fn begin_writable_use(&self, lease: &mut BoxLease) -> Result<(), BoxStoreError> {
+        self.transition_state(lease, BoxState::Ready, BoxState::Dirty)
+    }
+
+    /// Durably records that the helper completed a clean writable Box run.
+    pub fn finish_clean_use(&self, lease: &mut BoxLease) -> Result<(), BoxStoreError> {
+        self.transition_state(lease, BoxState::Dirty, BoxState::Ready)
+    }
+
+    /// Durably records that `e2fsck` successfully recovered a dirty Box.
+    pub fn finish_repair(&self, lease: &mut BoxLease) -> Result<(), BoxStoreError> {
+        self.transition_state(lease, BoxState::Dirty, BoxState::Ready)
+    }
+
+    /// Durably blocks a dirty Box after `e2fsck` could not repair it.
+    pub fn mark_needs_repair(&self, lease: &mut BoxLease) -> Result<(), BoxStoreError> {
+        self.transition_state(lease, BoxState::Dirty, BoxState::NeedsRepair)
+    }
+
+    fn transition_state(
+        &self,
+        lease: &mut BoxLease,
+        expected: BoxState,
+        state: BoxState,
+    ) -> Result<(), BoxStoreError> {
+        let expected_directory = self.box_directory(lease.id());
+        if lease.directory != expected_directory {
             return Err(BoxStoreError::CorruptStore(
                 "box lease belongs to another store".into(),
             ));
         }
-        lease.metadata.state = state;
-        lease.metadata.updated_at_unix_ms = now_unix_millis()?;
-        let metadata = lease.directory.join(METADATA_FILE);
-        if state == BoxState::NeedsRepair {
-            write_json_atomic(&metadata, &lease.metadata)
-        } else {
-            write_json_atomic_transient(&metadata, &lease.metadata)
+        if lease.metadata.state != expected {
+            return Err(BoxStoreError::InvalidStateTransition {
+                box_id: lease.id(),
+                expected,
+                actual: lease.metadata.state,
+                next: state,
+            });
         }
+        let mut next_metadata = lease.metadata.clone();
+        next_metadata.state = state;
+        next_metadata.updated_at_unix_ms = now_unix_millis()?;
+        let metadata = lease.directory.join(METADATA_FILE);
+        write_json_atomic(&metadata, &next_metadata)?;
+        lease.metadata = next_metadata;
+        Ok(())
     }
 
     pub fn delete(&self, box_id: BoxId) -> Result<BoxMetadata, BoxStoreError> {
@@ -664,7 +696,9 @@ impl BoxEntryError {
             BoxStoreError::Io(source) if source.kind() == io::ErrorKind::NotFound => {
                 BoxEntryErrorCode::MissingData
             }
-            BoxStoreError::CorruptStore(_) => BoxEntryErrorCode::CorruptStore,
+            BoxStoreError::CorruptStore(_) | BoxStoreError::InvalidStateTransition { .. } => {
+                BoxEntryErrorCode::CorruptStore
+            }
             BoxStoreError::NeedsRepair(_)
             | BoxStoreError::BaseDiskBusy { .. }
             | BoxStoreError::Mke2fs { .. }
@@ -816,20 +850,6 @@ fn read_metadata(path: &Path, expected_id: BoxId) -> Result<BoxMetadata, BoxStor
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), BoxStoreError> {
-    write_json_atomic_with_durability(path, value, true)
-}
-
-fn write_json_atomic_transient(path: &Path, value: &impl Serialize) -> Result<(), BoxStoreError> {
-    // Rename makes state transitions atomic for process and parent-loss recovery. Structural
-    // metadata writes remain fsync-backed; per-run state avoids a storage flush on the hot path.
-    write_json_atomic_with_durability(path, value, false)
-}
-
-fn write_json_atomic_with_durability(
-    path: &Path,
-    value: &impl Serialize,
-    durable: bool,
-) -> Result<(), BoxStoreError> {
     let parent = path
         .parent()
         .ok_or_else(|| BoxStoreError::InvalidPath(path.into()))?;
@@ -849,15 +869,11 @@ fn write_json_atomic_with_durability(
         .open(&temporary)?;
     file.write_all(&bytes)?;
     file.write_all(b"\n")?;
-    if durable {
-        file.sync_all()?;
-    }
-    drop(file);
     set_file_permissions(&temporary)?;
+    file.sync_all()?;
+    drop(file);
     fs::rename(&temporary, path)?;
-    if durable {
-        sync_parent(path)?;
-    }
+    sync_parent(path)?;
     Ok(())
 }
 
@@ -961,6 +977,15 @@ pub enum BoxStoreError {
     },
     #[error("box requires repair before it can run: {0}")]
     NeedsRepair(BoxId),
+    #[error(
+        "invalid state transition for Box {box_id}: expected {expected:?}, found {actual:?}, cannot transition to {next:?}"
+    )]
+    InvalidStateTransition {
+        box_id: BoxId,
+        expected: BoxState,
+        actual: BoxState,
+        next: BoxState,
+    },
     #[error("base disk preparation is busy at {}: {source}", .path.display())]
     BaseDiskBusy {
         path: PathBuf,
@@ -1203,15 +1228,12 @@ mod tests {
     }
 
     #[test]
-    fn records_state_changes_while_the_lease_is_held() {
+    fn records_writable_state_changes_while_the_lease_is_held() {
         let fixture = Fixture::new();
         let created = fixture.create();
         let mut lease = fixture.store.try_acquire(created.box_id).unwrap();
 
-        fixture
-            .store
-            .set_state(&mut lease, BoxState::Dirty)
-            .unwrap();
+        fixture.store.begin_writable_use(&mut lease).unwrap();
         drop(lease);
 
         assert_eq!(
@@ -1225,16 +1247,53 @@ mod tests {
         let fixture = Fixture::new();
         let created = fixture.create();
         let mut lease = fixture.store.try_acquire(created.box_id).unwrap();
-        fixture
-            .store
-            .set_state(&mut lease, BoxState::NeedsRepair)
-            .unwrap();
+        fixture.store.begin_writable_use(&mut lease).unwrap();
+        fixture.store.mark_needs_repair(&mut lease).unwrap();
         drop(lease);
 
         assert!(matches!(
             fixture.store.try_acquire(created.box_id),
             Err(BoxStoreError::NeedsRepair(box_id)) if box_id == created.box_id
         ));
+    }
+
+    #[test]
+    fn only_allows_explicit_writable_state_transitions() {
+        let fixture = Fixture::new();
+        let created = fixture.create();
+        let mut lease = fixture.store.try_acquire(created.box_id).unwrap();
+
+        assert!(matches!(
+            fixture.store.finish_clean_use(&mut lease),
+            Err(BoxStoreError::InvalidStateTransition {
+                box_id,
+                expected: BoxState::Dirty,
+                actual: BoxState::Ready,
+                next: BoxState::Ready,
+            }) if box_id == created.box_id
+        ));
+
+        fixture.store.begin_writable_use(&mut lease).unwrap();
+        fixture.store.finish_clean_use(&mut lease).unwrap();
+        fixture.store.begin_writable_use(&mut lease).unwrap();
+        fixture.store.finish_repair(&mut lease).unwrap();
+        assert_eq!(lease.metadata().state, BoxState::Ready);
+    }
+
+    #[test]
+    fn failed_durable_publish_does_not_change_the_lease_state() {
+        let fixture = Fixture::new();
+        let created = fixture.create();
+        let mut lease = fixture.store.try_acquire(created.box_id).unwrap();
+        let metadata = fixture
+            .store
+            .box_directory(created.box_id)
+            .join(METADATA_FILE);
+        fs::remove_file(&metadata).unwrap();
+        fs::create_dir(&metadata).unwrap();
+
+        assert!(fixture.store.begin_writable_use(&mut lease).is_err());
+        assert_eq!(lease.metadata().state, BoxState::Ready);
     }
 
     #[test]

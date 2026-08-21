@@ -160,6 +160,8 @@ morae box delete "$BOX_ID" --yes
 
 `BoxId` identifies a persistent root filesystem lineage, not a VM or an authentication credential. Every `morae run --box` still creates a new microVM and `SessionId`; only files on that Box disk continue. Different Boxes have independent disks, and a second writer for the same Box fails immediately. `--box` cannot be combined with `--image`, `--rootfs`, or `--workspace`, and the non-isolating `process` backend rejects it.
 
+Before a writable Box disk is exposed to a guest, moraebox atomically records `Dirty` metadata and flushes both the file and its parent directory. Only a clean helper shutdown returns it to `Ready`. A host crash, timeout, signal, helper failure, or failed spawn leaves it `Dirty`, so the next run executes `e2fsck -p` while holding the Box lease. Successful repair is recorded before the disk can be used again; an unrecoverable filesystem is marked `NeedsRepair` and blocked.
+
 ### Attach a read-only workspace
 
 ```sh
