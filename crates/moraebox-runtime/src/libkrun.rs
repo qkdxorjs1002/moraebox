@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     io,
     path::{Path, PathBuf},
     process::Stdio,
@@ -205,17 +206,6 @@ impl Backend for LibkrunBackend {
         let environment = resolve_environment(spec)?;
 
         let mut startup = StartupMetrics::default();
-        let network_proxy = if spec.network {
-            let started = Instant::now();
-            let proxy = budget
-                .run(RunStage::NetworkSetup, NetworkProxy::start(&self.config))
-                .await
-                .map_err(BackendError::from)?;
-            startup.network_setup_micros = Some(elapsed_micros(started));
-            Some(proxy)
-        } else {
-            None
-        };
         let root_started = Instant::now();
         let (prepared_root, root_startup) = match budget
             .run(RunStage::RootPrepare, self.prepare_root(spec, budget))
@@ -237,6 +227,18 @@ impl Backend for LibkrunBackend {
         startup.base_prepare_micros = root_startup.base_prepare_micros;
         startup.disk_clone_micros = root_startup.disk_clone_micros;
         startup.repair_micros = root_startup.repair_micros;
+
+        let network_proxy = if spec.network {
+            let started = Instant::now();
+            let proxy = budget
+                .run(RunStage::NetworkSetup, NetworkProxy::start(&self.config))
+                .await
+                .map_err(BackendError::from)?;
+            startup.network_setup_micros = Some(elapsed_micros(started));
+            Some(proxy)
+        } else {
+            None
+        };
 
         let mut command = Command::new(&self.config.helper_path);
         command.arg("--libkrun").arg(&self.config.library_path);
@@ -281,15 +283,8 @@ impl Backend for LibkrunBackend {
         }
 
         let helper_started = Instant::now();
-        let mut spawned = budget
-            .run_sync(RunStage::HelperSpawn, || {
-                if spec.tty {
-                    spawn_pty(command, spec, network_proxy, prepared_root.into_lease())
-                } else {
-                    spawn_piped(command, network_proxy, prepared_root.into_lease())
-                }
-            })
-            .map_err(BackendError::from)?;
+        let mut spawned =
+            Self::spawn_helper(command, spec, prepared_root, network_proxy, budget).await?;
         startup.helper_spawn_micros = Some(elapsed_micros(helper_started));
         spawned.startup = startup;
         Ok(spawned)
@@ -297,6 +292,37 @@ impl Backend for LibkrunBackend {
 }
 
 impl LibkrunBackend {
+    async fn spawn_helper(
+        command: Command,
+        spec: &RunSpec,
+        prepared_root: PreparedRoot,
+        mut network_proxy: Option<NetworkProxy>,
+        budget: &RunBudget,
+    ) -> Result<SpawnedSandbox, BackendError> {
+        let spawn_result = budget.run_sync(RunStage::HelperSpawn, || {
+            let root_lease = prepared_root.into_lease();
+            if spec.tty {
+                spawn_pty(command, spec, &mut network_proxy, root_lease)
+            } else {
+                spawn_piped(command, &mut network_proxy, root_lease)
+            }
+        });
+        match spawn_result {
+            Ok(spawned) => Ok(spawned),
+            Err(error) => {
+                let mut error = BackendError::from(error);
+                if let Some(proxy) = network_proxy.take()
+                    && let Err(cleanup) = proxy.stop().await
+                {
+                    error = BackendError::Control(format!(
+                        "{error}; failed to reap gvproxy after helper spawn failure: {cleanup}"
+                    ));
+                }
+                Err(error)
+            }
+        }
+    }
+
     async fn prepare_root(
         &self,
         spec: &RunSpec,
@@ -534,7 +560,7 @@ fn box_backend_error(error: BoxStoreError) -> BackendError {
 
 fn spawn_piped(
     mut command: Command,
-    network_proxy: Option<NetworkProxy>,
+    network_proxy: &mut Option<NetworkProxy>,
     root_lease: Option<ManagedRootLease>,
 ) -> Result<SpawnedSandbox, BackendError> {
     command.stdin(Stdio::piped());
@@ -549,7 +575,7 @@ fn spawn_piped(
         .map(|reader| Box::pin(reader) as _)
         .ok_or_else(|| BackendError::Control("helper stdout pipe was not created".into()))?;
     let stderr = child.stderr.take().map(|reader| Box::pin(reader) as _);
-    let exit = managed_exit(child, network_proxy, root_lease);
+    let exit = managed_exit(child, network_proxy.take(), root_lease);
     Ok(SpawnedSandbox {
         stdin,
         stdout,
@@ -565,7 +591,7 @@ fn spawn_piped(
 fn spawn_pty(
     mut command: Command,
     spec: &RunSpec,
-    network_proxy: Option<NetworkProxy>,
+    network_proxy: &mut Option<NetworkProxy>,
     root_lease: Option<ManagedRootLease>,
 ) -> Result<SpawnedSandbox, BackendError> {
     use std::fs::File;
@@ -588,7 +614,7 @@ fn spawn_pty(
 
     let child = command.spawn()?;
     let pid = child.id().ok_or(BackendError::MissingProcessId)?;
-    let exit = managed_exit(child, network_proxy, root_lease);
+    let exit = managed_exit(child, network_proxy.take(), root_lease);
     Ok(SpawnedSandbox {
         stdin: Some(Box::pin(tokio::fs::File::from_std(master))),
         stdout: Box::pin(tokio::fs::File::from_std(master_reader)),
@@ -604,7 +630,7 @@ fn spawn_pty(
 fn spawn_pty(
     _command: Command,
     _spec: &RunSpec,
-    _network_proxy: Option<NetworkProxy>,
+    _network_proxy: &mut Option<NetworkProxy>,
     _root_lease: Option<ManagedRootLease>,
 ) -> Result<SpawnedSandbox, BackendError> {
     Err(BackendError::Unsupported("PTY on this platform"))
@@ -662,14 +688,21 @@ fn elapsed_micros(started: Instant) -> u64 {
 
 #[derive(Debug)]
 struct NetworkProxy {
-    child: Child,
-    stderr: BoundedStderr,
-    state: TempDir,
+    child: Option<Child>,
+    stderr: Option<BoundedStderr>,
+    state: Option<TempDir>,
     socket_path: PathBuf,
 }
 
 impl NetworkProxy {
     async fn start(config: &LibkrunConfig) -> Result<Self, BackendError> {
+        Self::start_observed(config, |_| {}).await
+    }
+
+    async fn start_observed(
+        config: &LibkrunConfig,
+        observe_spawn: impl FnOnce(Option<u32>),
+    ) -> Result<Self, BackendError> {
         let executable = config.network_proxy_path()?;
         let state = create_network_state(config)?;
         let socket_path = state.path().join("gvproxy.sock");
@@ -693,55 +726,119 @@ impl NetworkProxy {
         let mut child = command
             .spawn()
             .map_err(|error| BackendError::Control(format!("failed to start gvproxy: {error}")))?;
+        observe_spawn(child.id());
         let stderr = child
             .stderr
             .take()
             .ok_or_else(|| BackendError::Control("gvproxy stderr pipe was not created".into()))?;
-        let stderr = BoundedStderr::spawn(stderr);
+        let mut proxy = Self {
+            child: Some(child),
+            stderr: Some(BoundedStderr::spawn(stderr)),
+            state: Some(state),
+            socket_path,
+        };
         let started = Instant::now();
         loop {
-            if let Some(status) = child.try_wait()? {
-                let diagnostics = stderr.finish().await.map_err(BackendError::Io)?;
-                return Err(BackendError::Control(format!(
+            if let Some(status) = proxy.child_mut()?.try_wait()? {
+                let diagnostics = proxy.finish_stderr().await.map_err(BackendError::Io)?;
+                let mut message = format!(
                     "gvproxy exited before its vfkit endpoint was ready: {status}{}",
                     stderr_diagnostics(&diagnostics)
-                )));
+                );
+                if let Err(error) = proxy.stop().await {
+                    let _ = write!(message, "; cleanup failed: {error}");
+                }
+                return Err(BackendError::Control(message));
             }
-            let probe_error = match probe_vfkit_endpoint(&socket_path) {
+            let probe_error = match probe_vfkit_endpoint(&proxy.socket_path) {
                 Ok(()) => break,
                 Err(error) => error.to_string(),
             };
             if started.elapsed() >= NETWORK_PROXY_START_TIMEOUT {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                let diagnostics = stderr.finish().await.map_err(BackendError::Io)?;
-                return Err(BackendError::Control(format!(
+                let diagnostics = proxy.finish_stderr().await.map_err(BackendError::Io)?;
+                let mut message = format!(
                     "gvproxy vfkit endpoint was not connectable within 5 seconds; last socket error: {probe_error}{}",
                     stderr_diagnostics(&diagnostics)
-                )));
+                );
+                if let Err(error) = proxy.stop().await {
+                    let _ = write!(message, "; cleanup failed: {error}");
+                }
+                return Err(BackendError::Control(message));
             }
             sleep(NETWORK_PROXY_POLL_INTERVAL).await;
         }
 
-        Ok(Self {
-            child,
-            stderr,
-            state,
-            socket_path,
-        })
+        Ok(proxy)
     }
 
     async fn stop(mut self) -> io::Result<()> {
-        if self.child.try_wait()?.is_none()
-            && let Err(error) = self.child.start_kill()
-            && self.child.try_wait()?.is_none()
-        {
-            return Err(error);
-        }
-        let _ = self.child.wait().await?;
-        self.stderr.abort();
-        self.state.close()
+        cleanup_network_proxy(self.child.take(), self.stderr.take(), self.state.take()).await
     }
+
+    fn child_mut(&mut self) -> io::Result<&mut Child> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("gvproxy child is no longer owned"))
+    }
+
+    async fn finish_stderr(&mut self) -> io::Result<Vec<u8>> {
+        let Some(stderr) = self.stderr.take() else {
+            return Ok(Vec::new());
+        };
+        stderr.finish().await
+    }
+}
+
+impl Drop for NetworkProxy {
+    fn drop(&mut self) {
+        let child = self.child.take();
+        let stderr = self.stderr.take();
+        let state = self.state.take();
+        if child.is_none() && stderr.is_none() && state.is_none() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = cleanup_network_proxy(child, stderr, state).await;
+            });
+        } else {
+            if let Some(mut child) = child {
+                let _ = child.start_kill();
+            }
+            if let Some(stderr) = stderr {
+                stderr.abort();
+            }
+            drop(state);
+        }
+    }
+}
+
+async fn cleanup_network_proxy(
+    child: Option<Child>,
+    stderr: Option<BoundedStderr>,
+    state: Option<TempDir>,
+) -> io::Result<()> {
+    let child_result = if let Some(mut child) = child {
+        stop_network_child(&mut child).await
+    } else {
+        Ok(())
+    };
+    if let Some(stderr) = stderr {
+        stderr.abort();
+    }
+    let state_result = state.map_or(Ok(()), TempDir::close);
+    child_result?;
+    state_result
+}
+
+async fn stop_network_child(child: &mut Child) -> io::Result<()> {
+    if child.try_wait()?.is_none()
+        && let Err(error) = child.start_kill()
+        && child.try_wait()?.is_none()
+    {
+        return Err(error);
+    }
+    child.wait().await.map(|_| ())
 }
 
 #[derive(Debug)]
@@ -1367,6 +1464,128 @@ mod tests {
 
         let ephemeral = runtime_root.join("ephemeral-boxes");
         assert_eq!(fs::read_dir(ephemeral).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn root_preparation_failure_never_starts_the_network_proxy() {
+        let fixture = ManagedFixture::new("#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let rootfs = fixture.state.path().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        fs::write(rootfs.join("payload"), b"rootfs").unwrap();
+        let mke2fs = fixture.state.path().join("failing-mke2fs");
+        write_executable(&mke2fs, "#!/bin/sh\nexit 9\n");
+        let source = BoxRootSource {
+            rootfs_path: rootfs,
+            manifest_digest: "sha256:root-failure".into(),
+            platform: "linux/arm64".into(),
+            virtual_size_bytes: MANAGED_TEST_DISK_BYTES,
+            mke2fs_path: mke2fs,
+        };
+        let gvproxy = fixture.state.path().join("gvproxy");
+        write_executable(
+            &gvproxy,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nwhile :; do /bin/sleep 1; done\n",
+        );
+        let mut backend = fixture.backend(Some((
+            source,
+            fixture.state.path().join("ephemeral-runtime"),
+        )));
+        backend.config.gvproxy_path = Some(gvproxy.clone());
+        backend.config.network_runtime_dir = fixture.state.path().join("network");
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.network = true;
+
+        assert!(
+            backend
+                .spawn(&spec, &RunBudget::new(spec.timeout))
+                .await
+                .is_err()
+        );
+        assert!(!gvproxy.with_extension("pid").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn helper_spawn_failure_awaits_network_proxy_cleanup() {
+        use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+
+        let state = tempfile::tempdir().unwrap();
+        let helper = state.path().join("helper");
+        let gvproxy = state.path().join("gvproxy");
+        let library = state.path().join("libkrun");
+        let root = state.path().join("root");
+        let network_runtime_dir = state.path().join("network");
+        write_executable(&helper, "#!/bin/sh\nexit 0\n");
+        let mut permissions = fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&helper, permissions).unwrap();
+        write_executable(
+            &gvproxy,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nprintf '%s' \"${2#unixgram://}\" > \"$0.socket\"\nwhile :; do /bin/sleep 1; done\n",
+        );
+        fs::write(&library, []).unwrap();
+        fs::create_dir(&root).unwrap();
+        let mut config = LibkrunConfig::new(helper, library, root);
+        config.gvproxy_path = Some(gvproxy.clone());
+        config.network_runtime_dir = network_runtime_dir.clone();
+        let backend = LibkrunBackend::new(config);
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.network = true;
+        let endpoint = spawn_fake_vfkit_endpoint(gvproxy.with_extension("socket"));
+
+        assert!(
+            backend
+                .spawn(&spec, &RunBudget::new(spec.timeout))
+                .await
+                .is_err()
+        );
+        let endpoint = endpoint.await.unwrap();
+        let pid = read_pid(&gvproxy.with_extension("pid"));
+        assert_eq!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
+        assert_eq!(fs::read_dir(&network_runtime_dir).unwrap().count(), 0);
+        drop(endpoint);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn network_setup_cancellation_reaps_the_proxy() {
+        use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+
+        let state = tempfile::tempdir().unwrap();
+        let helper = state.path().join("helper");
+        let gvproxy = state.path().join("gvproxy");
+        let library = state.path().join("libkrun");
+        let root = state.path().join("root");
+        let network_runtime_dir = state.path().join("network");
+        write_executable(&helper, "#!/bin/sh\nexit 0\n");
+        write_executable(
+            &gvproxy,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nwhile :; do /bin/sleep 1; done\n",
+        );
+        fs::write(&library, []).unwrap();
+        fs::create_dir(&root).unwrap();
+        let mut config = LibkrunConfig::new(helper, library, root);
+        config.gvproxy_path = Some(gvproxy.clone());
+        config.network_runtime_dir = network_runtime_dir.clone();
+        let (pid_tx, pid_rx) = tokio::sync::oneshot::channel();
+        let mut start = Box::pin(NetworkProxy::start_observed(&config, move |pid| {
+            let _ = pid_tx.send(pid);
+        }));
+        let pid = tokio::select! {
+            pid = pid_rx => pid.unwrap().expect("spawned gvproxy must have a process id"),
+            result = &mut start => panic!("network proxy became ready before cancellation: {result:?}"),
+        };
+        drop(start);
+        let pid = i32::try_from(pid).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while kill(Pid::from_raw(pid), None) != Err(Errno::ESRCH) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled network setup must reap gvproxy");
+        assert_eq!(fs::read_dir(network_runtime_dir).unwrap().count(), 0);
     }
 
     #[cfg(unix)]

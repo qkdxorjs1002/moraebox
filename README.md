@@ -373,6 +373,8 @@ codesign --force --sign - \
 
 Native execution additionally needs compatible released libkrun/libkrunfw builds, Hypervisor.framework, `mke2fs` and `e2fsck` from `e2fsprogs`, and `gvproxy` for opt-in networking. `morae doctor --json` reports base native readiness and network readiness separately, and probes the effective `--cache-dir` volume rather than an unrelated system temporary volume. Both doctor and runtime require a successful Unix datagram connection to the bound gvproxy vfkit endpoint; a path that merely exists is not ready. Startup failures retain only the last 16 KiB of gvproxy stderr for bounded diagnostics.
 
+Native startup finishes root disk preparation before starting gvproxy. A root preparation failure therefore creates no network process, and a later helper spawn failure or cancelled network setup explicitly kills and reaps gvproxy before its runtime state is removed.
+
 ## Development
 
 ```sh

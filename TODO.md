@@ -220,7 +220,7 @@
 
 - [x] gvproxy readiness를 경로 존재가 아닌 socket handshake로 확인하고 bounded stderr diagnostics를 보존한다.
 
-- [ ] root disk 준비가 끝난 뒤 network proxy를 시작하고 중간 실패에도 proxy process를 reap한다.
+- [x] root disk 준비가 끝난 뒤 network proxy를 시작하고 중간 실패에도 proxy process를 reap한다.
 
 - [ ] helper/libkrun/libkrunfw의 architecture, executable permission, code signature, 실제 released ABI/version을 `doctor`와 spawn 전에 검증한다.
 

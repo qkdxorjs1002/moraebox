@@ -340,6 +340,8 @@ codesign --force --sign - \
 
 네이티브 실행에는 호환되는 정식 libkrun/libkrunfw 빌드, Hypervisor.framework, `e2fsprogs`의 `mke2fs`와 `e2fsck`, 선택형 네트워크 사용 시 `gvproxy`가 필요합니다. `morae doctor --json`은 기본 네이티브 준비 상태와 네트워크 준비 상태를 구분해 보고합니다. doctor와 runtime은 gvproxy가 bind한 vfkit Unix datagram endpoint에 실제로 연결되어야 준비 완료로 인정하며, 경로만 존재하는 경우는 거부합니다. 시작 실패 진단에는 gvproxy stderr의 마지막 16 KiB만 보존합니다.
 
+네이티브 시작은 root disk 준비를 끝낸 뒤 gvproxy를 실행합니다. 따라서 root 준비 실패는 network process를 만들지 않으며, 이후 helper spawn 실패나 취소된 network setup은 runtime state를 제거하기 전에 gvproxy를 명시적으로 종료하고 reap합니다.
+
 ## 개발
 
 ```sh
