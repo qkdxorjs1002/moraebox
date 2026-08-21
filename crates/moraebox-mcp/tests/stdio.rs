@@ -87,6 +87,26 @@ fn stdio_rejects_schema_bypass_arguments() {
         let response = read_response(&responses);
         assert_eq!(response.get("id"), request.get("id"));
         assert_eq!(response.pointer("/result/isError"), Some(&json!(true)));
+        assert_eq!(
+            response.pointer("/result/structuredContent/error/code"),
+            Some(&json!("invalid_arguments"))
+        );
+        assert_eq!(
+            response.pointer("/result/structuredContent/error/stage"),
+            Some(&json!("request_validation"))
+        );
+        assert_eq!(
+            response.pointer("/result/structuredContent/error/retryable"),
+            Some(&json!(false))
+        );
+        for field in ["message", "remediation"] {
+            assert!(
+                response
+                    .pointer(&format!("/result/structuredContent/error/{field}"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            );
+        }
     }
     drop(stdin);
     assert!(wait_for_child(&mut child).success());
@@ -411,8 +431,8 @@ fn explicit_remove_stops_and_forgets_a_session_idempotently() {
         }),
     );
     assert_eq!(
-        read_response(&responses).pointer("/result/isError"),
-        Some(&json!(true))
+        read_response(&responses).pointer("/result/structuredContent/error/code"),
+        Some(&json!("session_not_found"))
     );
 
     drop(stdin);

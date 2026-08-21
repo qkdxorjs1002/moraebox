@@ -14,20 +14,22 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand};
-use moraebox_box::{BaseDiskSpec, BaseDiskStore, BoxStore, CreateBox, EphemeralDiskStore};
+use moraebox_box::{
+    BaseDiskSpec, BaseDiskStore, BoxStore, BoxStoreError, CreateBox, EphemeralDiskStore,
+};
 use moraebox_core::{
-    BoxId, OutputChunk, RunSpec, SessionId, Signal, TimeoutPolicy, resolve_cache_dir,
-    resolve_state_dir,
+    BoxId, OutputChunk, OutputReadError, RunSpec, SessionId, Signal, TimeoutPolicy,
+    resolve_cache_dir, resolve_state_dir,
 };
 use moraebox_image::{Credentials, ImageCache, Platform, digest_tree};
 use moraebox_runtime::{
-    Backend, BoxRootSource, BoxRuntimeConfig, LibkrunBackend, LibkrunConfig, NativeRuntimePaths,
-    ProcessBackend,
+    Backend, BackendError, BoxRootSource, BoxRuntimeConfig, LibkrunBackend, LibkrunConfig,
+    NativeRuntimePaths, ProcessBackend, SessionError,
 };
 use moraebox_sdk::{
     ExecutionPageResult, IoRequest, IoResult, MAX_IO_OUTPUT_READ_BYTES, SandboxSdk, SdkError,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
@@ -548,7 +550,7 @@ async fn call_tool(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let result: Result<ToolOutput, String> = match name {
+    let result: Result<ToolOutput, ToolError> = match name {
         "sandbox_exec" => match sandbox_exec(&server.sdk, arguments, cancellation).await {
             Ok(value) => Ok(value),
             Err(ExecError::Cancelled) => {
@@ -587,10 +589,7 @@ async fn call_tool(
     };
     match result {
         Ok(value) => success(id, tool_result(value, false)),
-        Err(error) => success(
-            id,
-            tool_result(ToolOutput::mirrored(json!({ "error": error })), true),
-        ),
+        Err(error) => success(id, tool_result(error.output(), true)),
     }
 }
 
@@ -619,14 +618,270 @@ impl ToolOutput {
 #[derive(Debug)]
 enum ExecError {
     Cancelled,
-    Failed(String),
+    Failed(ToolError),
 }
 
 impl From<SdkError> for ExecError {
     fn from(error: SdkError) -> Self {
         match error {
             SdkError::RequestCancelled => Self::Cancelled,
-            error => Self::Failed(error.to_string()),
+            error => Self::Failed(error.into()),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ToolError {
+    code: &'static str,
+    stage: String,
+    retryable: bool,
+    message: String,
+    remediation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    earliest_cursor: Option<u64>,
+}
+
+impl ToolError {
+    fn new(
+        code: &'static str,
+        stage: impl Into<String>,
+        retryable: bool,
+        message: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            stage: stage.into(),
+            retryable,
+            message: message.into(),
+            remediation: remediation.into(),
+            earliest_cursor: None,
+        }
+    }
+
+    fn invalid_arguments(message: impl Into<String>) -> Self {
+        Self::new(
+            "invalid_arguments",
+            "request_validation",
+            false,
+            message,
+            "Correct the tool arguments and call the tool again.",
+        )
+    }
+
+    fn internal(stage: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(
+            "internal_error",
+            stage,
+            false,
+            message,
+            "Inspect the MCP server diagnostics and retry after correcting the server configuration.",
+        )
+    }
+
+    fn output(self) -> ToolOutput {
+        let content_text = format!(
+            "{} during {}: {} Remediation: {}",
+            self.code, self.stage, self.message, self.remediation
+        );
+        ToolOutput::summarized(json!({ "error": self }), content_text)
+    }
+}
+
+impl From<OutputReadError> for ToolError {
+    fn from(error: OutputReadError) -> Self {
+        match error {
+            OutputReadError::CursorExpired {
+                requested,
+                earliest,
+            } => {
+                let mut envelope = Self::new(
+                    "cursor_expired",
+                    "output_read",
+                    true,
+                    format!(
+                        "output cursor {requested} expired; earliest retained cursor is {earliest}"
+                    ),
+                    format!("Retry sandbox_io with cursor={earliest}."),
+                );
+                envelope.earliest_cursor = Some(earliest);
+                envelope
+            }
+            OutputReadError::CursorAhead { requested, next } => Self::new(
+                "cursor_ahead",
+                "output_read",
+                true,
+                format!("output cursor {requested} is ahead of next cursor {next}"),
+                format!("Retry sandbox_io with cursor={next}, or wait for more output."),
+            ),
+        }
+    }
+}
+
+impl From<BackendError> for ToolError {
+    fn from(error: BackendError) -> Self {
+        match error {
+            BackendError::InvalidSpec(message) => Self::invalid_arguments(message),
+            BackendError::Unsupported(capability) => Self::new(
+                "unsupported_capability",
+                "backend_capability",
+                false,
+                format!("backend does not support {capability}"),
+                "Change the arguments or select a backend that supports this capability.",
+            ),
+            BackendError::Timeout { stage, limit } => Self::new(
+                "timeout",
+                stage.to_string(),
+                true,
+                format!("run timed out after {limit:?} during {stage}"),
+                "Retry with a larger timeout, or reduce the work performed by the command.",
+            ),
+            error => Self::new(
+                "backend_failure",
+                "backend",
+                true,
+                error.to_string(),
+                "Check backend readiness and configuration, then retry the operation.",
+            ),
+        }
+    }
+}
+
+impl From<SessionError> for ToolError {
+    fn from(error: SessionError) -> Self {
+        match error {
+            SessionError::Backend(error) => error.into(),
+            SessionError::Output(error) => error.into(),
+            SessionError::Io(error) => Self::new(
+                "session_io_failure",
+                format!("{}_io", error.stream),
+                false,
+                error.to_string(),
+                "Remove the failed session and start a new sandbox session.",
+            ),
+            SessionError::SessionClosed => Self::new(
+                "session_closed",
+                "session_io",
+                false,
+                "session is no longer available",
+                "Start a new sandbox session and use its SessionId.",
+            ),
+            SessionError::StdinWriteTooLarge { requested, maximum } => Self::new(
+                "stdin_too_large",
+                "stdin_write",
+                false,
+                format!(
+                    "stdin write is {requested} bytes, exceeding the {maximum}-byte queue limit"
+                ),
+                format!("Send stdin in chunks no larger than {maximum} bytes."),
+            ),
+            SessionError::OutputReadTooLarge { requested, maximum } => Self::new(
+                "output_read_too_large",
+                "output_read",
+                false,
+                format!(
+                    "output read is {requested} bytes, exceeding the {maximum}-byte request limit"
+                ),
+                format!("Set max_bytes to at most {maximum}."),
+            ),
+            error => Self::new(
+                "session_failure",
+                "session_control",
+                false,
+                error.to_string(),
+                "Remove the failed session and start a new sandbox session.",
+            ),
+        }
+    }
+}
+
+impl From<BoxStoreError> for ToolError {
+    fn from(error: BoxStoreError) -> Self {
+        let message = error.to_string();
+        match error {
+            BoxStoreError::NotFound(_) => Self::new(
+                "box_not_found",
+                "box_lookup",
+                false,
+                message,
+                "Use sandbox_box_list to select an existing BoxId.",
+            ),
+            BoxStoreError::Busy { .. } | BoxStoreError::BaseDiskBusy { .. } => Self::new(
+                "box_busy",
+                "box_lock",
+                true,
+                message,
+                "Wait for the current Box operation to finish, then retry.",
+            ),
+            BoxStoreError::NeedsRepair(_) => Self::new(
+                "box_needs_repair",
+                "box_repair",
+                false,
+                message,
+                "Reset or recreate the Box before running it again.",
+            ),
+            BoxStoreError::Io(_) => Self::new(
+                "box_io_failure",
+                "box_storage",
+                true,
+                message,
+                "Check storage availability and permissions, then retry.",
+            ),
+            error => Self::new(
+                "box_failure",
+                "box_storage",
+                false,
+                error.to_string(),
+                "Inspect the Box metadata and storage, then reset or recreate the Box.",
+            ),
+        }
+    }
+}
+
+impl From<SdkError> for ToolError {
+    fn from(error: SdkError) -> Self {
+        match error {
+            SdkError::Session(error) => error.into(),
+            SdkError::UnknownSession(session_id) => Self::new(
+                "session_not_found",
+                "session_lookup",
+                false,
+                format!("unknown sandbox session {session_id}"),
+                "Start a new sandbox session and use its SessionId.",
+            ),
+            SdkError::SessionLimitExceeded { maximum } => Self::new(
+                "session_limit_exceeded",
+                "session_start",
+                true,
+                format!("active sandbox session limit reached (maximum {maximum})"),
+                "Stop or remove an existing session, then retry.",
+            ),
+            SdkError::OutputReadTooLarge { requested, maximum } => Self::new(
+                "output_read_too_large",
+                "output_read",
+                false,
+                format!("output read is {requested} bytes, exceeding the {maximum}-byte SDK limit"),
+                format!("Set max_bytes to at most {maximum}."),
+            ),
+            SdkError::OutputReadEmpty => {
+                Self::invalid_arguments("output read must request at least one byte")
+            }
+            SdkError::RequestCancelled => Self::new(
+                "request_cancelled",
+                "request",
+                true,
+                "sandbox request was cancelled",
+                "Call the tool again if the operation is still required.",
+            ),
+            SdkError::BoxStore(error) => error.into(),
+            SdkError::BoxStoreNotConfigured => Self::new(
+                "box_store_unavailable",
+                "box_storage",
+                false,
+                "Box store is not configured for this SDK instance",
+                "Configure the MCP server state directory before using Box tools.",
+            ),
+            error => Self::internal("sdk", error.to_string()),
         }
     }
 }
@@ -651,10 +906,12 @@ async fn sandbox_exec_with_inline_limit(
     cancellation: Option<oneshot::Receiver<()>>,
     inline_output_bytes: usize,
 ) -> Result<ToolOutput, ExecError> {
-    let args: ExecArgs =
-        serde_json::from_value(arguments).map_err(|error| ExecError::Failed(error.to_string()))?;
+    let args: ExecArgs = serde_json::from_value(arguments)
+        .map_err(|error| ExecError::Failed(ToolError::invalid_arguments(error.to_string())))?;
     if args.argv.is_empty() {
-        return Err(ExecError::Failed("argv must contain an executable".into()));
+        return Err(ExecError::Failed(ToolError::invalid_arguments(
+            "argv must contain an executable",
+        )));
     }
     let mut spec = RunSpec::command(args.argv);
     spec.box_id = args.box_id;
@@ -662,16 +919,16 @@ async fn sandbox_exec_with_inline_limit(
     spec.network = args.network;
     spec.timeout = match (args.unlimited, args.timeout_ms) {
         (true, Some(_)) => {
-            return Err(ExecError::Failed(
-                "unlimited=true cannot be combined with timeout_ms".into(),
-            ));
+            return Err(ExecError::Failed(ToolError::invalid_arguments(
+                "unlimited=true cannot be combined with timeout_ms",
+            )));
         }
         (true, None) => TimeoutPolicy::Unlimited,
         (false, Some(milliseconds)) if milliseconds > 0 => TimeoutPolicy::Limited(milliseconds),
         (false, Some(_)) => {
-            return Err(ExecError::Failed(
-                "timeout_ms must be greater than zero".into(),
-            ));
+            return Err(ExecError::Failed(ToolError::invalid_arguments(
+                "timeout_ms must be greater than zero",
+            )));
         }
         (false, None) => TimeoutPolicy::default(),
     };
@@ -704,10 +961,12 @@ async fn sandbox_exec_with_inline_limit(
     }
 }
 
-async fn sandbox_io(sdk: &SandboxSdk, arguments: Value) -> Result<Value, String> {
-    let args: IoArgs = serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+async fn sandbox_io(sdk: &SandboxSdk, arguments: Value) -> Result<Value, ToolError> {
+    let args: IoArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
     validate_io_args(&args)?;
-    let session_id = SessionId::from_str(&args.session_id).map_err(|error| error.to_string())?;
+    let session_id = SessionId::from_str(&args.session_id)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
     let stdin = decode_bounded_stdin(args.stdin_base64)?;
     let resize = args.rows.zip(args.columns);
     let signal = args.signal.as_deref().map(parse_signal).transpose()?;
@@ -723,74 +982,77 @@ async fn sandbox_io(sdk: &SandboxSdk, arguments: Value) -> Result<Value, String>
                 signal,
             },
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     Ok(io_json(&result))
 }
 
-fn validate_io_args(args: &IoArgs) -> Result<(), String> {
+fn validate_io_args(args: &IoArgs) -> Result<(), ToolError> {
     if !(1..=MAX_IO_OUTPUT_READ_BYTES).contains(&args.max_bytes) {
-        return Err(format!(
+        return Err(ToolError::invalid_arguments(format!(
             "max_bytes must be between 1 and {MAX_IO_OUTPUT_READ_BYTES}"
-        ));
+        )));
     }
     match (args.rows, args.columns) {
         (None, None) => Ok(()),
         (Some(rows), Some(columns)) if rows > 0 && columns > 0 => Ok(()),
-        (Some(_), Some(_)) => Err("rows and columns must be greater than zero".into()),
-        _ => Err("rows and columns must be provided together".into()),
+        (Some(_), Some(_)) => Err(ToolError::invalid_arguments(
+            "rows and columns must be greater than zero",
+        )),
+        _ => Err(ToolError::invalid_arguments(
+            "rows and columns must be provided together",
+        )),
     }
 }
 
-fn decode_bounded_stdin(input: Option<String>) -> Result<Option<Vec<u8>>, String> {
+fn decode_bounded_stdin(input: Option<String>) -> Result<Option<Vec<u8>>, ToolError> {
     let Some(input) = input else {
         return Ok(None);
     };
     if input.len() > MAX_MCP_STDIN_BASE64_CHARS {
-        return Err(format!(
+        return Err(ToolError::invalid_arguments(format!(
             "stdin_base64 exceeds the {MAX_MCP_STDIN_BYTES}-byte decoded input limit"
-        ));
+        )));
     }
-    let decoded = STANDARD.decode(input).map_err(|error| error.to_string())?;
+    let decoded = STANDARD
+        .decode(input)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
     if decoded.len() > MAX_MCP_STDIN_BYTES {
-        return Err(format!(
+        return Err(ToolError::invalid_arguments(format!(
             "stdin_base64 decodes to {} bytes, exceeding the {MAX_MCP_STDIN_BYTES}-byte limit",
             decoded.len()
-        ));
+        )));
     }
     Ok(Some(decoded))
 }
 
-async fn sandbox_stop(sdk: &SandboxSdk, arguments: Value) -> Result<Value, String> {
-    let args: StopArgs = serde_json::from_value(arguments).map_err(|error| error.to_string())?;
-    let session_id = SessionId::from_str(&args.session_id).map_err(|error| error.to_string())?;
-    let status = sdk
-        .stop(session_id)
-        .await
-        .map_err(|error| error.to_string())?;
+async fn sandbox_stop(sdk: &SandboxSdk, arguments: Value) -> Result<Value, ToolError> {
+    let args: StopArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    let session_id = SessionId::from_str(&args.session_id)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    let status = sdk.stop(session_id).await?;
     Ok(json!({ "status": status }))
 }
 
-async fn sandbox_remove(sdk: &SandboxSdk, arguments: Value) -> Result<Value, String> {
-    let args: StopArgs = serde_json::from_value(arguments).map_err(|error| error.to_string())?;
-    let session_id = SessionId::from_str(&args.session_id).map_err(|error| error.to_string())?;
-    let status = sdk
-        .remove(session_id)
-        .await
-        .map_err(|error| error.to_string())?;
+async fn sandbox_remove(sdk: &SandboxSdk, arguments: Value) -> Result<Value, ToolError> {
+    let args: StopArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    let session_id = SessionId::from_str(&args.session_id)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    let status = sdk.remove(session_id).await?;
     match status {
         Some(status) => Ok(json!({ "removed": true, "status": status })),
         None => Ok(json!({ "removed": false })),
     }
 }
 
-async fn sandbox_box_create(server: &McpServer, arguments: Value) -> Result<Value, String> {
-    let args: BoxCreateArgs =
-        serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+async fn sandbox_box_create(server: &McpServer, arguments: Value) -> Result<Value, ToolError> {
+    let args: BoxCreateArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
     let reference = args
         .image
         .map_or_else(|| server.boxes.images.default_reference(), Ok)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
     let prepared = server
         .boxes
         .images
@@ -800,12 +1062,22 @@ async fn sandbox_box_create(server: &McpServer, arguments: Value) -> Result<Valu
             server.boxes.credentials.clone(),
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            ToolError::new(
+                "image_prepare_failed",
+                "image_pull",
+                true,
+                error.to_string(),
+                "Check the image reference, registry credentials, and network, then retry.",
+            )
+        })?;
     let disk_size = args
         .disk_size_bytes
         .unwrap_or(server.boxes.default_disk_size);
     if disk_size == 0 {
-        return Err("disk_size_bytes must be greater than zero".into());
+        return Err(ToolError::invalid_arguments(
+            "disk_size_bytes must be greater than zero",
+        ));
     }
     let base_spec = BaseDiskSpec::new(
         prepared.manifest_digest.clone(),
@@ -818,8 +1090,12 @@ async fn sandbox_box_create(server: &McpServer, arguments: Value) -> Result<Valu
     let base =
         tokio::task::spawn_blocking(move || base_disks.prepare(&base_spec, &rootfs, &mke2fs))
             .await
-            .map_err(|error| format!("base disk task failed: {error}"))?
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                ToolError::internal(
+                    "base_disk_prepare",
+                    format!("base disk task failed: {error}"),
+                )
+            })??;
     let metadata = server
         .sdk
         .create_box(
@@ -830,52 +1106,39 @@ async fn sandbox_box_create(server: &McpServer, arguments: Value) -> Result<Valu
             ),
             base.disk_path().to_path_buf(),
         )
-        .await
-        .map_err(|error| error.to_string())?;
-    serde_json::to_value(metadata).map_err(|error| error.to_string())
+        .await?;
+    serde_json::to_value(metadata)
+        .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
 }
 
-async fn sandbox_box_list(server: &McpServer, arguments: Value) -> Result<Value, String> {
-    let _: EmptyArgs = serde_json::from_value(arguments).map_err(|error| error.to_string())?;
-    let boxes = server
-        .sdk
-        .list_boxes()
-        .await
-        .map_err(|error| error.to_string())?;
+async fn sandbox_box_list(server: &McpServer, arguments: Value) -> Result<Value, ToolError> {
+    let _: EmptyArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    let boxes = server.sdk.list_boxes().await?;
     Ok(json!({ "boxes": boxes }))
 }
 
-async fn sandbox_box_get(server: &McpServer, arguments: Value) -> Result<Value, String> {
-    let args: BoxIdArgs = serde_json::from_value(arguments).map_err(|error| error.to_string())?;
-    let metadata = server
-        .sdk
-        .get_box(args.box_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    serde_json::to_value(metadata).map_err(|error| error.to_string())
+async fn sandbox_box_get(server: &McpServer, arguments: Value) -> Result<Value, ToolError> {
+    let args: BoxIdArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    let metadata = server.sdk.get_box(args.box_id).await?;
+    serde_json::to_value(metadata)
+        .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
 }
 
-async fn sandbox_box_delete(server: &McpServer, arguments: Value) -> Result<Value, String> {
-    let args: ConfirmedBoxArgs =
-        serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+async fn sandbox_box_delete(server: &McpServer, arguments: Value) -> Result<Value, ToolError> {
+    let args: ConfirmedBoxArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
     require_confirmation(args.confirm)?;
-    let metadata = server
-        .sdk
-        .delete_box(args.box_id)
-        .await
-        .map_err(|error| error.to_string())?;
+    let metadata = server.sdk.delete_box(args.box_id).await?;
     Ok(json!({ "deleted": metadata.box_id }))
 }
 
-async fn sandbox_box_reset(server: &McpServer, arguments: Value) -> Result<Value, String> {
-    let args: ConfirmedBoxArgs =
-        serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+async fn sandbox_box_reset(server: &McpServer, arguments: Value) -> Result<Value, ToolError> {
+    let args: ConfirmedBoxArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
     require_confirmation(args.confirm)?;
-    let current = server
-        .sdk
-        .get_box(args.box_id)
-        .await
-        .map_err(|error| error.to_string())?;
+    let current = server.sdk.get_box(args.box_id).await?;
     let spec = BaseDiskSpec::new(
         current.manifest_digest,
         current.platform,
@@ -884,39 +1147,45 @@ async fn sandbox_box_reset(server: &McpServer, arguments: Value) -> Result<Value
     let base_disks = server.boxes.base_disks.clone();
     let base = tokio::task::spawn_blocking(move || base_disks.get(&spec))
         .await
-        .map_err(|error| format!("base disk task failed: {error}"))?
-        .map_err(|error| error.to_string())?
+        .map_err(|error| {
+            ToolError::internal("base_disk_lookup", format!("base disk task failed: {error}"))
+        })??
         .ok_or_else(|| {
-            format!(
+            ToolError::new(
+                "base_disk_not_found",
+                "base_disk_lookup",
+                false,
+                format!(
                 "the immutable base disk for Box {} is not cached; recreate the image-backed Box instead",
                 args.box_id
+                ),
+                "Recreate the image-backed Box to restore its immutable base disk.",
             )
         })?;
     let metadata = server
         .sdk
         .reset_box(args.box_id, base.disk_path().to_path_buf())
-        .await
-        .map_err(|error| error.to_string())?;
-    serde_json::to_value(metadata).map_err(|error| error.to_string())
+        .await?;
+    serde_json::to_value(metadata)
+        .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
 }
 
-async fn sandbox_box_clone(server: &McpServer, arguments: Value) -> Result<Value, String> {
-    let args: ConfirmedBoxArgs =
-        serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+async fn sandbox_box_clone(server: &McpServer, arguments: Value) -> Result<Value, ToolError> {
+    let args: ConfirmedBoxArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
     require_confirmation(args.confirm)?;
-    let metadata = server
-        .sdk
-        .clone_box(args.box_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    serde_json::to_value(metadata).map_err(|error| error.to_string())
+    let metadata = server.sdk.clone_box(args.box_id).await?;
+    serde_json::to_value(metadata)
+        .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
 }
 
-fn require_confirmation(confirmed: bool) -> Result<(), String> {
+fn require_confirmation(confirmed: bool) -> Result<(), ToolError> {
     if confirmed {
         Ok(())
     } else {
-        Err("confirm must be true for this Box operation".into())
+        Err(ToolError::invalid_arguments(
+            "confirm must be true for this Box operation",
+        ))
     }
 }
 
@@ -973,13 +1242,15 @@ fn chunks_json(chunks: &[OutputChunk]) -> Vec<Value> {
         .collect()
 }
 
-fn parse_signal(value: &str) -> Result<Signal, String> {
+fn parse_signal(value: &str) -> Result<Signal, ToolError> {
     match value.to_ascii_uppercase().as_str() {
         "INT" | "SIGINT" => Ok(Signal::Interrupt),
         "TERM" | "SIGTERM" => Ok(Signal::Terminate),
         "KILL" | "SIGKILL" => Ok(Signal::Kill),
         "HUP" | "SIGHUP" => Ok(Signal::Hangup),
-        _ => Err(format!("unsupported signal {value}")),
+        _ => Err(ToolError::invalid_arguments(format!(
+            "unsupported signal {value}"
+        ))),
     }
 }
 
@@ -1545,10 +1816,20 @@ mod tests {
             )
             .await;
             assert_eq!(response.pointer("/result/isError"), Some(&json!(true)));
-            let message = response
+            let envelope = response
                 .pointer("/result/structuredContent/error")
-                .and_then(Value::as_str)
+                .and_then(Value::as_object)
                 .unwrap();
+            assert_eq!(envelope.get("code"), Some(&json!("invalid_arguments")));
+            assert_eq!(envelope.get("stage"), Some(&json!("request_validation")));
+            assert_eq!(envelope.get("retryable"), Some(&json!(false)));
+            assert!(
+                envelope
+                    .get("remediation")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            );
+            let message = envelope.get("message").and_then(Value::as_str).unwrap();
             assert!(
                 message.contains(expected),
                 "expected {expected:?} in {message:?}"
@@ -1560,13 +1841,52 @@ mod tests {
     fn stdin_decoder_rejects_encoded_and_decoded_oversize_inputs() {
         let oversized = STANDARD.encode(vec![0_u8; MAX_MCP_STDIN_BYTES + 1]);
         let error = decode_bounded_stdin(Some(oversized)).unwrap_err();
-        assert!(error.contains("decoded input limit") || error.contains("decodes to"));
+        assert!(
+            error.message.contains("decoded input limit") || error.message.contains("decodes to")
+        );
+        assert_eq!(error.code, "invalid_arguments");
 
         let encoded_oversize = "A".repeat(MAX_MCP_STDIN_BASE64_CHARS + 1);
         assert!(
             decode_bounded_stdin(Some(encoded_oversize))
                 .unwrap_err()
+                .message
                 .contains("decoded input limit")
+        );
+    }
+
+    #[test]
+    fn cursor_expiry_error_includes_recovery_cursor() {
+        let output = ToolError::from(SdkError::Session(SessionError::Output(
+            OutputReadError::CursorExpired {
+                requested: 4,
+                earliest: 12,
+            },
+        )))
+        .output();
+
+        assert_eq!(
+            output.structured_content.pointer("/error/code"),
+            Some(&json!("cursor_expired"))
+        );
+        assert_eq!(
+            output.structured_content.pointer("/error/stage"),
+            Some(&json!("output_read"))
+        );
+        assert_eq!(
+            output.structured_content.pointer("/error/retryable"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            output.structured_content.pointer("/error/earliest_cursor"),
+            Some(&json!(12))
+        );
+        assert!(
+            output
+                .structured_content
+                .pointer("/error/remediation")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.contains("cursor=12"))
         );
     }
 
@@ -1601,9 +1921,13 @@ mod tests {
 
         assert_eq!(call.pointer("/result/isError"), Some(&json!(true)));
         assert!(
-            call.pointer("/result/structuredContent/error")
+            call.pointer("/result/structuredContent/error/message")
                 .and_then(Value::as_str)
                 .is_some_and(|error| error.contains("without VM isolation"))
+        );
+        assert_eq!(
+            call.pointer("/result/structuredContent/error/code"),
+            Some(&json!("unsupported_capability"))
         );
     }
 
@@ -1624,9 +1948,13 @@ mod tests {
 
         assert_eq!(call.pointer("/result/isError"), Some(&json!(true)));
         assert!(
-            call.pointer("/result/structuredContent/error")
+            call.pointer("/result/structuredContent/error/message")
                 .and_then(Value::as_str)
                 .is_some_and(|error| error.contains("Box persistence"))
+        );
+        assert_eq!(
+            call.pointer("/result/structuredContent/error/code"),
+            Some(&json!("unsupported_capability"))
         );
     }
 

@@ -141,7 +141,7 @@
   - unknown field, `max_bytes`, stdin decoded size, rows/columns pair, TTY dimensions를 검증한다.
   - `unlimited=true`와 `timeout_ms` 동시 지정은 ambiguity 오류로 처리한다.
 
-- [ ] stable tool error envelope를 정의한다.
+- [x] stable tool error envelope를 정의한다.
   - `code`, `stage`, `retryable`, `message`, `remediation`을 제공한다.
   - cursor 만료에는 `earliest_cursor`를 포함한다.
 
