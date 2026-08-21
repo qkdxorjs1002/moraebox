@@ -338,6 +338,14 @@ cargo test --workspace
 
 Native macOS changes also require `morae doctor --json` and the real-backend smoke suite when the signed helper and native dependencies are available. CI runs the portable quality gate on macOS, Linux, and Windows.
 
+On Apple Silicon macOS, run the signed network security gate after the portable checks:
+
+```sh
+scripts/native-egress-e2e.sh
+```
+
+The gate ad-hoc signs the debug helper with `assets/moraebox-vmm.entitlements`, requires a ready default cached image, and verifies network-off DNS/TCP/UDP denial, network-on egress, and cleanup after timeout, cancellation, and helper failure. Set `MORAE_NATIVE_E2E_IMAGE` to select another ready cached image, or `MORAE_NATIVE_E2E_CACHE_DIR` for a non-default cache. `MORAE_EGRESS_HOST` and `MORAE_EGRESS_UDP_DNS` override the external TCP/DNS probe targets when required by the test environment.
+
 Bug reports and focused pull requests are welcome. Please include the backend, host platform, exact command, and `morae doctor --json` output when reporting native runtime problems. Remove local paths or other sensitive values before sharing diagnostics.
 
 ## License

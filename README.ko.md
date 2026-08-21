@@ -337,6 +337,14 @@ cargo test --workspace
 
 네이티브 macOS 변경에는 `morae doctor --json`과, 서명된 helper 및 네이티브 의존성을 사용할 수 있을 때 실제 백엔드 smoke suite도 필요합니다. CI는 macOS, Linux, Windows에서 이식 가능한 품질 게이트를 실행합니다.
 
+Apple Silicon macOS에서는 이식 가능한 검사를 마친 뒤 서명된 네트워크 보안 게이트를 실행합니다.
+
+```sh
+scripts/native-egress-e2e.sh
+```
+
+이 게이트는 debug helper를 `assets/moraebox-vmm.entitlements`로 ad-hoc 서명하고, 준비된 기본 캐시 이미지를 사용해 network-off DNS/TCP/UDP 차단, network-on egress, timeout·취소·helper 실패 후 정리를 검증합니다. 다른 준비된 캐시 이미지는 `MORAE_NATIVE_E2E_IMAGE`, 기본값이 아닌 캐시는 `MORAE_NATIVE_E2E_CACHE_DIR`로 지정할 수 있습니다. 테스트 환경에서 외부 TCP/DNS 대상 변경이 필요하면 `MORAE_EGRESS_HOST`와 `MORAE_EGRESS_UDP_DNS`를 사용합니다.
+
 버그 리포트와 범위가 명확한 pull request를 환영합니다. 네이티브 런타임 문제를 보고할 때는 백엔드, 호스트 플랫폼, 정확한 명령, `morae doctor --json` 출력을 포함해 주세요. 진단 정보를 공유하기 전에 로컬 경로나 민감한 값은 제거해야 합니다.
 
 ## 라이선스

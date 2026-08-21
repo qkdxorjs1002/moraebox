@@ -104,7 +104,7 @@
 
 ### Native network security gate
 
-- [ ] signed native stack에서 실제 egress E2E suite를 추가한다.
+- [x] signed native stack에서 실제 egress E2E suite를 추가한다.
   - network-off: DNS와 TCP/UDP egress가 실패해야 한다.
   - network-on: DNS와 허용된 외부 접속이 성공해야 한다.
   - control vsock의 모든 TSI feature flag가 0인지 확인한다.
