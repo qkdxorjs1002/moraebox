@@ -10,7 +10,8 @@ use std::{
     time::Duration,
 };
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use moraebox_box::{
     BaseDiskSpec, BaseDiskStore, BoxMetadata, BoxStore, CreateBox, EphemeralDiskStore,
 };
@@ -38,8 +39,41 @@ use tokio::io::AsyncWriteExt;
     about = "Disposable microVM sandbox for coding agents"
 )]
 struct Cli {
+    #[command(flatten)]
+    global: GlobalOptions,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, Args)]
+struct GlobalOptions {
+    /// Cache root. CLI value overrides `MORAE_CACHE_DIR`, then ~/.moraebox/cache is used.
+    #[arg(long, global = true, env = "MORAE_CACHE_DIR")]
+    cache_dir: Option<PathBuf>,
+    /// State root. CLI value overrides `MORAE_STATE_DIR`, then ~/.moraebox/state is used.
+    #[arg(long, global = true, env = "MORAE_STATE_DIR")]
+    state_dir: Option<PathBuf>,
+    /// Emit structured JSON where the selected command supports it.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Override the automatically discovered signed VMM helper.
+    #[arg(long, global = true, env = "MORAE_HELPER_PATH")]
+    helper: Option<PathBuf>,
+    /// Override the automatically discovered libkrun library.
+    #[arg(long, global = true, env = "MORAE_LIBKRUN_PATH")]
+    libkrun: Option<PathBuf>,
+    /// Override the automatically discovered gvproxy network helper.
+    #[arg(long, global = true, env = "MORAE_GVPROXY_PATH")]
+    gvproxy: Option<PathBuf>,
+    /// Override the automatically discovered libkrun dependency directories.
+    #[arg(long, global = true, env = "MORAE_LIB_DIR")]
+    lib_dir: Option<PathBuf>,
+    /// Path to mke2fs; auto-detected when omitted.
+    #[arg(long, global = true, env = "MORAE_MKE2FS")]
+    mke2fs: Option<PathBuf>,
+    /// Path to e2fsck; auto-detected when omitted.
+    #[arg(long, global = true, env = "MORAE_E2FSCK")]
+    e2fsck: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -65,6 +99,8 @@ enum Command {
     },
     /// Measure cached one-shot sandbox latency.
     Benchmark(Box<BenchmarkArgs>),
+    /// Generate shell completion code on stdout.
+    Completion(CompletionArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -114,8 +150,6 @@ enum BoxCommand {
 
 #[derive(Debug, Args)]
 struct DoctorArgs {
-    #[arg(long)]
-    json: bool,
     /// Return a failure exit status unless the native backend is ready.
     #[arg(long)]
     strict: bool,
@@ -127,15 +161,6 @@ struct RunArgs {
     /// Execution backend. `process` is deterministic but is not isolated.
     #[arg(long, default_value = "libkrun", value_parser = ["process", "libkrun"])]
     backend: String,
-    /// Override the automatically discovered signed VMM helper.
-    #[arg(long, env = "MORAE_HELPER_PATH")]
-    helper: Option<PathBuf>,
-    /// Override the automatically discovered libkrun library.
-    #[arg(long, env = "MORAE_LIBKRUN_PATH")]
-    libkrun: Option<PathBuf>,
-    /// Override the automatically discovered gvproxy network helper.
-    #[arg(long, env = "MORAE_GVPROXY_PATH")]
-    gvproxy: Option<PathBuf>,
     /// Use an already materialized guest root directory instead of a managed image.
     #[arg(long, env = "MORAE_ROOTFS")]
     rootfs: Option<PathBuf>,
@@ -145,9 +170,6 @@ struct RunArgs {
     /// Reuse the persistent root filesystem identified by this `BoxId`.
     #[arg(long = "box", conflicts_with_all = ["rootfs", "image", "workspace"])]
     box_id: Option<BoxId>,
-    /// Override the automatically discovered libkrun dependency directories.
-    #[arg(long, env = "MORAE_LIB_DIR")]
-    lib_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 2)]
     cpus: u8,
     #[arg(long, default_value_t = 512)]
@@ -155,12 +177,6 @@ struct RunArgs {
     /// Host directory to copy into an immutable read-only ext4 guest workspace.
     #[arg(long)]
     workspace: Option<PathBuf>,
-    /// Cache root; defaults to ~/.moraebox/cache.
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
-    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
-    #[arg(long)]
-    state_dir: Option<PathBuf>,
     #[arg(long, env = "MORAE_REGISTRY_USERNAME", requires = "registry_password")]
     registry_username: Option<String>,
     #[arg(
@@ -170,12 +186,6 @@ struct RunArgs {
         hide_env_values = true
     )]
     registry_password: Option<String>,
-    /// Path to mke2fs; auto-detected when omitted.
-    #[arg(long, env = "MORAE_MKE2FS")]
-    mke2fs: Option<PathBuf>,
-    /// Path to e2fsck; auto-detected when omitted.
-    #[arg(long, env = "MORAE_E2FSCK")]
-    e2fsck: Option<PathBuf>,
     /// Virtual root disk size for an ephemeral image-backed run.
     #[arg(long, default_value = "8GiB", value_parser = parse_disk_size)]
     disk_size: u64,
@@ -199,9 +209,6 @@ struct RunArgs {
     /// Add one guest environment value as KEY=VALUE.
     #[arg(short = 'e', long = "env", value_parser = parse_env)]
     env: Vec<(String, String)>,
-    /// Emit the structured final report rather than replaying raw output.
-    #[arg(long)]
-    json: bool,
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
@@ -211,16 +218,8 @@ struct BoxCreateArgs {
     /// OCI registry reference; uses the configured default when omitted.
     #[arg(long)]
     image: Option<String>,
-    /// Cache root; defaults to ~/.moraebox/cache.
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
-    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
-    #[arg(long)]
-    state_dir: Option<PathBuf>,
     #[arg(long, default_value = "8GiB", value_parser = parse_disk_size)]
     disk_size: u64,
-    #[arg(long, env = "MORAE_MKE2FS")]
-    mke2fs: Option<PathBuf>,
     #[arg(long, env = "MORAE_REGISTRY_USERNAME", requires = "registry_password")]
     registry_username: Option<String>,
     #[arg(
@@ -230,77 +229,43 @@ struct BoxCreateArgs {
         hide_env_values = true
     )]
     registry_password: Option<String>,
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Args)]
-struct BoxListArgs {
-    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
-    #[arg(long)]
-    state_dir: Option<PathBuf>,
-    #[arg(long)]
-    json: bool,
-}
+struct BoxListArgs {}
 
 #[derive(Debug, Args)]
 struct BoxShowArgs {
     box_id: BoxId,
-    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
-    #[arg(long)]
-    state_dir: Option<PathBuf>,
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Args)]
 struct BoxDeleteArgs {
     box_id: BoxId,
-    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
-    #[arg(long)]
-    state_dir: Option<PathBuf>,
     /// Confirm permanent deletion of the Box disk.
     #[arg(long, required = true)]
     yes: bool,
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Args)]
 struct BoxResetArgs {
     box_id: BoxId,
-    /// Cache root; defaults to ~/.moraebox/cache.
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
-    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
-    #[arg(long)]
-    state_dir: Option<PathBuf>,
     /// Confirm replacement of every change in the Box disk.
     #[arg(long, required = true)]
     yes: bool,
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Args)]
 struct BoxCloneArgs {
     box_id: BoxId,
-    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
-    #[arg(long)]
-    state_dir: Option<PathBuf>,
     /// Confirm creation of a new durable Box disk.
     #[arg(long, required = true)]
     yes: bool,
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Args)]
 struct ImagePullArgs {
     reference: String,
-    /// Cache root; defaults to ~/.moraebox/cache.
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
     #[arg(long, default_value = "linux")]
     os: String,
     #[arg(long)]
@@ -314,31 +279,18 @@ struct ImagePullArgs {
         hide_env_values = true
     )]
     registry_password: Option<String>,
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Args)]
-struct ImageListArgs {
-    /// Cache root; defaults to ~/.moraebox/cache.
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
-    #[arg(long)]
-    json: bool,
-}
+struct ImageListArgs {}
 
 #[derive(Debug, Args)]
 struct ImageRemoveArgs {
     /// Registry reference or sha256 manifest digest.
     target: String,
-    /// Cache root; defaults to ~/.moraebox/cache.
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
     /// Show what would be removed without changing the cache.
     #[arg(long)]
     dry_run: bool,
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -349,58 +301,34 @@ struct ImageDefaultArgs {
     /// Remove the override and return to the built-in python:3.12 default.
     #[arg(long)]
     unset: bool,
-    /// Cache root; defaults to ~/.moraebox/cache.
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Args)]
-struct CacheInfoArgs {
-    /// Cache root; defaults to ~/.moraebox/cache.
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
-    #[arg(long)]
-    json: bool,
-}
+struct CacheInfoArgs {}
 
 #[derive(Debug, Args)]
 struct CacheReconcileArgs {
-    /// Cache root; defaults to ~/.moraebox/cache.
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
     /// Check and report changes without updating metadata.
     #[arg(long, conflicts_with = "yes")]
     dry_run: bool,
     /// Repair rootfs metadata and remove orphan metadata without prompting.
     #[arg(long)]
     yes: bool,
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Args)]
 struct CachePruneArgs {
-    /// Cache root; defaults to ~/.moraebox/cache.
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
     /// Show what would be removed without changing the cache.
     #[arg(long, conflicts_with = "yes")]
     dry_run: bool,
     /// Apply the destructive cache operation without prompting.
     #[arg(long)]
     yes: bool,
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Args)]
 #[allow(clippy::struct_excessive_bools)]
 struct CacheCleanArgs {
-    /// Cache root; defaults to ~/.moraebox/cache.
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
     /// Confirm that every managed cache category is in scope.
     #[arg(long, required = true)]
     all: bool,
@@ -410,8 +338,6 @@ struct CacheCleanArgs {
     /// Apply the destructive cache operation without prompting.
     #[arg(long)]
     yes: bool,
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -421,26 +347,12 @@ struct BenchmarkArgs {
     backend: String,
     #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=10_000))]
     iterations: u32,
-    #[arg(long, env = "MORAE_HELPER_PATH")]
-    helper: Option<PathBuf>,
-    #[arg(long, env = "MORAE_LIBKRUN_PATH")]
-    libkrun: Option<PathBuf>,
     #[arg(long, env = "MORAE_ROOTFS")]
     rootfs: Option<PathBuf>,
     #[arg(long, conflicts_with = "rootfs")]
     image: Option<String>,
     #[arg(long = "box", conflicts_with_all = ["rootfs", "image"])]
     box_id: Option<BoxId>,
-    /// Cache root; defaults to ~/.moraebox/cache.
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
-    /// Persistent Box metadata root; defaults to ~/.moraebox/state.
-    #[arg(long)]
-    state_dir: Option<PathBuf>,
-    #[arg(long, env = "MORAE_MKE2FS")]
-    mke2fs: Option<PathBuf>,
-    #[arg(long, env = "MORAE_E2FSCK")]
-    e2fsck: Option<PathBuf>,
     #[arg(long, default_value = "8GiB", value_parser = parse_disk_size)]
     disk_size: u64,
     #[arg(long, env = "MORAE_REGISTRY_USERNAME", requires = "registry_password")]
@@ -452,8 +364,6 @@ struct BenchmarkArgs {
         hide_env_values = true
     )]
     registry_password: Option<String>,
-    #[arg(long, env = "MORAE_LIB_DIR")]
-    lib_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 2)]
     cpus: u8,
     #[arg(long, default_value_t = 512)]
@@ -461,6 +371,12 @@ struct BenchmarkArgs {
     /// Command to measure; emit output immediately to populate `command_start_p95_micros`.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct CompletionArgs {
+    /// Shell whose completion code should be generated.
+    shell: Shell,
 }
 
 #[tokio::main]
@@ -488,58 +404,75 @@ where
 }
 
 async fn execute(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
-    match cli.command {
-        Command::Doctor(args) => doctor(&args),
-        Command::Run(args) => run(*args).await,
+    let Cli { global, command } = cli;
+    match command {
+        Command::Doctor(args) => doctor(&args, &global),
+        Command::Run(args) => run(*args, &global).await,
         Command::Image {
             command: ImageCommand::Pull(args),
-        } => image_pull(args).await,
+        } => image_pull(args, &global).await,
         Command::Image {
             command: ImageCommand::List(args),
-        } => image_list(&args),
+        } => image_list(&args, &global),
         Command::Image {
             command: ImageCommand::Remove(args),
-        } => image_remove(&args),
+        } => image_remove(&args, &global),
         Command::Image {
             command: ImageCommand::Default(args),
-        } => image_default(&args),
+        } => image_default(&args, &global),
         Command::Cache {
             command: CacheCommand::Info(args),
-        } => cache_info(&args),
+        } => cache_info(&args, &global),
         Command::Cache {
             command: CacheCommand::Reconcile(args),
-        } => cache_reconcile(&args),
+        } => cache_reconcile(&args, &global),
         Command::Cache {
             command: CacheCommand::Prune(args),
-        } => cache_prune(&args),
+        } => cache_prune(&args, &global),
         Command::Cache {
             command: CacheCommand::Clean(args),
-        } => cache_clean(&args),
+        } => cache_clean(&args, &global),
         Command::Box {
             command: BoxCommand::Create(args),
-        } => box_create(args).await,
+        } => box_create(args, &global).await,
         Command::Box {
             command: BoxCommand::List(args),
-        } => box_list(&args),
+        } => box_list(&args, &global),
         Command::Box {
             command: BoxCommand::Show(args),
-        } => box_show(&args),
+        } => box_show(&args, &global),
         Command::Box {
             command: BoxCommand::Delete(args),
-        } => box_delete(&args),
+        } => box_delete(&args, &global),
         Command::Box {
             command: BoxCommand::Reset(args),
-        } => box_reset(&args),
+        } => box_reset(&args, &global),
         Command::Box {
             command: BoxCommand::Clone(args),
-        } => box_clone(&args),
-        Command::Benchmark(args) => benchmark(*args).await,
+        } => box_clone(&args, &global),
+        Command::Benchmark(args) => benchmark(*args, &global).await,
+        Command::Completion(args) => {
+            completion(&args);
+            Ok(0)
+        }
     }
 }
 
-fn doctor(args: &DoctorArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let report = DoctorReport::collect();
-    if args.json {
+fn completion(args: &CompletionArgs) {
+    let mut command = Cli::command();
+    clap_complete::generate(args.shell, &mut command, "morae", &mut io::stdout());
+}
+
+fn doctor(args: &DoctorArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::error::Error>> {
+    let paths = NativeRuntimePaths::discover_with_gvproxy(
+        global.helper.clone(),
+        global.libkrun.clone(),
+        global.lib_dir.clone(),
+        global.gvproxy.clone(),
+    );
+    let report =
+        DoctorReport::collect_with_paths(paths, global.mke2fs.clone(), global.e2fsck.clone());
+    if global.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("host: {}/{}", report.os, report.architecture);
@@ -592,8 +525,8 @@ fn doctor(args: &DoctorArgs) -> Result<i32, Box<dyn std::error::Error>> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    if args.interactive && args.json {
+async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::error::Error>> {
+    if args.interactive && global.json {
         return Err("--interactive cannot be combined with --json".into());
     }
     let mut spec = RunSpec::command(args.command);
@@ -622,15 +555,15 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     }
     validate_network_option(capabilities, spec.network)?;
     validate_tty_option(capabilities, spec.tty)?;
-    let progress = CliProgress::new(args.json);
+    let progress = CliProgress::new(global.json);
     let budget = RunBudget::new(spec.timeout).with_progress(move |stage| {
         progress.runtime(stage);
     });
     let cache_dir = (args.backend == "libkrun")
-        .then(|| resolve_cache_dir(args.cache_dir.as_deref()))
+        .then(|| resolve_cache_dir(global.cache_dir.as_deref()))
         .transpose()?;
     let state_dir = (args.backend == "libkrun")
-        .then(|| resolve_state_dir(args.state_dir.as_deref()))
+        .then(|| resolve_state_dir(global.state_dir.as_deref()))
         .transpose()?;
     if let Some(source) = args.workspace.as_deref() {
         if !capabilities.workspace.is_supported() {
@@ -684,7 +617,7 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let mke2fs = args.mke2fs.unwrap_or_else(default_mke2fs);
+    let mke2fs = global.mke2fs.clone().unwrap_or_else(default_mke2fs);
 
     let workspace = if let Some(source) = args.workspace.as_deref() {
         let cache_dir = cache_dir
@@ -751,10 +684,10 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
                 return Err("libkrun run requires an image, rootfs, or BoxId".into());
             };
             let mut config = native_config(
-                args.helper,
-                args.libkrun,
-                args.lib_dir,
-                args.gvproxy,
+                global.helper.clone(),
+                global.libkrun.clone(),
+                global.lib_dir.clone(),
+                global.gvproxy.clone(),
                 root_source
                     .as_ref()
                     .map(|source| source.rootfs_path.clone()),
@@ -774,7 +707,7 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
                 base_disks: BaseDiskStore::new(cache_dir),
                 ephemeral_disks,
                 source: root_source,
-                e2fsck_path: args.e2fsck.unwrap_or_else(default_e2fsck),
+                e2fsck_path: global.e2fsck.clone().unwrap_or_else(default_e2fsck),
             };
             let backend = LibkrunBackend::new(config).with_box_runtime(runtime);
             if workspace.is_some() {
@@ -792,7 +725,7 @@ async fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
     if let Some(workspace) = &workspace {
         workspace.verify_source_unchanged()?;
     }
-    if args.json {
+    if global.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         let mut stdout = io::stdout().lock();
@@ -1235,16 +1168,19 @@ async fn resolve_or_pull(
         .map_err(Into::into)
 }
 
-async fn box_create(args: BoxCreateArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
-    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+async fn box_create(
+    args: BoxCreateArgs,
+    global: &GlobalOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
     let cache = ImageCache::new(&cache_dir);
     let reference = match args.image {
         Some(reference) => reference,
         None => cache.default_reference()?,
     };
     let platform = Platform::host_linux();
-    let progress = CliProgress::new(args.json);
+    let progress = CliProgress::new(global.json);
     let prepared = cache
         .resolve_or_pull_with_progress(
             &reference,
@@ -1262,7 +1198,7 @@ async fn box_create(args: BoxCreateArgs) -> Result<i32, Box<dyn std::error::Erro
     let base = BaseDiskStore::new(&cache_dir).prepare(
         &spec,
         &prepared.rootfs,
-        &args.mke2fs.unwrap_or_else(default_mke2fs),
+        &global.mke2fs.clone().unwrap_or_else(default_mke2fs),
     )?;
     let metadata = BoxStore::new(state_dir).create(
         &CreateBox::new(
@@ -1272,14 +1208,17 @@ async fn box_create(args: BoxCreateArgs) -> Result<i32, Box<dyn std::error::Erro
         ),
         base.disk_path(),
     )?;
-    print_box_result(&metadata, args.json)?;
+    print_box_result(&metadata, global.json)?;
     Ok(0)
 }
 
-fn box_list(args: &BoxListArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+fn box_list(
+    _args: &BoxListArgs,
+    global: &GlobalOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
     let boxes = BoxStore::new(state_dir).list()?;
-    if args.json {
+    if global.json {
         println!("{}", serde_json::to_string_pretty(&boxes)?);
     } else {
         println!("BOX ID\tSTATE\tIMAGE DIGEST\tPLATFORM\tSIZE\tGENERATION");
@@ -1298,18 +1237,21 @@ fn box_list(args: &BoxListArgs) -> Result<i32, Box<dyn std::error::Error>> {
     Ok(0)
 }
 
-fn box_show(args: &BoxShowArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+fn box_show(args: &BoxShowArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::error::Error>> {
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
     let metadata = BoxStore::new(state_dir).get(args.box_id)?;
-    print_box_result(&metadata, args.json)?;
+    print_box_result(&metadata, global.json)?;
     Ok(0)
 }
 
-fn box_delete(args: &BoxDeleteArgs) -> Result<i32, Box<dyn std::error::Error>> {
+fn box_delete(
+    args: &BoxDeleteArgs,
+    global: &GlobalOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
     debug_assert!(args.yes, "clap requires --yes");
-    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
     let metadata = BoxStore::new(state_dir).delete(args.box_id)?;
-    if args.json {
+    if global.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&BoxMutationReport {
@@ -1324,10 +1266,13 @@ fn box_delete(args: &BoxDeleteArgs) -> Result<i32, Box<dyn std::error::Error>> {
     Ok(0)
 }
 
-fn box_reset(args: &BoxResetArgs) -> Result<i32, Box<dyn std::error::Error>> {
+fn box_reset(
+    args: &BoxResetArgs,
+    global: &GlobalOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
     debug_assert!(args.yes, "clap requires --yes");
-    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
-    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+    let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
     let store = BoxStore::new(state_dir);
     let current = store.get(args.box_id)?;
     let spec = BaseDiskSpec::new(
@@ -1344,15 +1289,18 @@ fn box_reset(args: &BoxResetArgs) -> Result<i32, Box<dyn std::error::Error>> {
             )
         })?;
     let metadata = store.reset(args.box_id, base.disk_path())?;
-    print_box_result(&metadata, args.json)?;
+    print_box_result(&metadata, global.json)?;
     Ok(0)
 }
 
-fn box_clone(args: &BoxCloneArgs) -> Result<i32, Box<dyn std::error::Error>> {
+fn box_clone(
+    args: &BoxCloneArgs,
+    global: &GlobalOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
     debug_assert!(args.yes, "clap requires --yes");
-    let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
     let metadata = BoxStore::new(state_dir).clone_box(args.box_id)?;
-    print_box_result(&metadata, args.json)?;
+    print_box_result(&metadata, global.json)?;
     Ok(0)
 }
 
@@ -1370,8 +1318,11 @@ fn print_box_result(metadata: &BoxMetadata, json: bool) -> Result<(), Box<dyn st
     Ok(())
 }
 
-async fn image_pull(args: ImagePullArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+async fn image_pull(
+    args: ImagePullArgs,
+    global: &GlobalOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let platform = Platform {
         os: args.os,
         architecture: args
@@ -1379,7 +1330,7 @@ async fn image_pull(args: ImagePullArgs) -> Result<i32, Box<dyn std::error::Erro
             .unwrap_or_else(|| Platform::host_linux().architecture),
         variant: None,
     };
-    let progress = CliProgress::new(args.json);
+    let progress = CliProgress::new(global.json);
     let prepared = pull_and_materialize(
         &args.reference,
         &cache_dir,
@@ -1388,7 +1339,7 @@ async fn image_pull(args: ImagePullArgs) -> Result<i32, Box<dyn std::error::Erro
         progress,
     )
     .await?;
-    if args.json {
+    if global.json {
         println!("{}", serde_json::to_string_pretty(&prepared)?);
     } else {
         println!("reference: {}", prepared.reference);
@@ -1413,10 +1364,13 @@ async fn pull_and_materialize(
         .map_err(Into::into)
 }
 
-fn image_list(args: &ImageListArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+fn image_list(
+    _args: &ImageListArgs,
+    global: &GlobalOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let images = ImageCache::new(cache_dir).list()?;
-    if args.json {
+    if global.json {
         println!("{}", serde_json::to_string_pretty(&images)?);
     } else {
         print_image_list(&images);
@@ -1424,10 +1378,13 @@ fn image_list(args: &ImageListArgs) -> Result<i32, Box<dyn std::error::Error>> {
     Ok(0)
 }
 
-fn image_remove(args: &ImageRemoveArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+fn image_remove(
+    args: &ImageRemoveArgs,
+    global: &GlobalOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let report = ImageCache::new(cache_dir).remove(&args.target, !args.dry_run)?;
-    if args.json {
+    if global.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_remove_report(&report);
@@ -1435,8 +1392,11 @@ fn image_remove(args: &ImageRemoveArgs) -> Result<i32, Box<dyn std::error::Error
     Ok(0)
 }
 
-fn image_default(args: &ImageDefaultArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+fn image_default(
+    args: &ImageDefaultArgs,
+    global: &GlobalOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let cache = ImageCache::new(cache_dir);
     let reference = if args.unset {
         cache.clear_default()?;
@@ -1446,7 +1406,7 @@ fn image_default(args: &ImageDefaultArgs) -> Result<i32, Box<dyn std::error::Err
     } else {
         cache.default_reference()?
     };
-    if args.json {
+    if global.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&DefaultImageReport { reference })?
@@ -1518,10 +1478,13 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn cache_info(args: &CacheInfoArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+fn cache_info(
+    _args: &CacheInfoArgs,
+    global: &GlobalOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let usage = ImageCache::new(cache_dir).usage()?;
-    if args.json {
+    if global.json {
         println!("{}", serde_json::to_string_pretty(&usage)?);
     } else {
         print_cache_usage(&usage);
@@ -1529,11 +1492,14 @@ fn cache_info(args: &CacheInfoArgs) -> Result<i32, Box<dyn std::error::Error>> {
     Ok(0)
 }
 
-fn cache_reconcile(args: &CacheReconcileArgs) -> Result<i32, Box<dyn std::error::Error>> {
+fn cache_reconcile(
+    args: &CacheReconcileArgs,
+    global: &GlobalOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
     let apply = destructive_mode(args.dry_run, args.yes, "cache reconcile")?;
-    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+    let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let report = ImageCache::new(cache_dir).reconcile(apply)?;
-    if args.json {
+    if global.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_reconcile_report(&report);
@@ -1541,11 +1507,14 @@ fn cache_reconcile(args: &CacheReconcileArgs) -> Result<i32, Box<dyn std::error:
     Ok(0)
 }
 
-fn cache_prune(args: &CachePruneArgs) -> Result<i32, Box<dyn std::error::Error>> {
+fn cache_prune(
+    args: &CachePruneArgs,
+    global: &GlobalOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
     let apply = destructive_mode(args.dry_run, args.yes, "cache prune")?;
-    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+    let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let report = ImageCache::new(cache_dir).prune(apply)?;
-    if args.json {
+    if global.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_prune_report(&report);
@@ -1553,12 +1522,15 @@ fn cache_prune(args: &CachePruneArgs) -> Result<i32, Box<dyn std::error::Error>>
     Ok(0)
 }
 
-fn cache_clean(args: &CacheCleanArgs) -> Result<i32, Box<dyn std::error::Error>> {
+fn cache_clean(
+    args: &CacheCleanArgs,
+    global: &GlobalOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
     debug_assert!(args.all, "clap requires --all");
     let apply = destructive_mode(args.dry_run, args.yes, "cache clean --all")?;
-    let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+    let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let report = ImageCache::new(cache_dir).clean(apply)?;
-    if args.json {
+    if global.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_clean_report(&report);
@@ -1671,7 +1643,10 @@ fn credentials(username: Option<String>, password: Option<String>) -> Option<Cre
         .map(|(username, password)| Credentials { username, password })
 }
 
-async fn benchmark(args: BenchmarkArgs) -> Result<i32, Box<dyn std::error::Error>> {
+async fn benchmark(
+    args: BenchmarkArgs,
+    global: &GlobalOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
     let command = args.command;
     let report = match args.backend.as_str() {
         "process" => {
@@ -1687,8 +1662,8 @@ async fn benchmark(args: BenchmarkArgs) -> Result<i32, Box<dyn std::error::Error
             .await?
         }
         "libkrun" => {
-            let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
-            let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
+            let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
+            let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
             let platform = Platform::host_linux();
             let prepared_image = if args.box_id.is_none() && args.rootfs.is_none() {
                 let cache = ImageCache::new(&cache_dir);
@@ -1708,7 +1683,7 @@ async fn benchmark(args: BenchmarkArgs) -> Result<i32, Box<dyn std::error::Error
             } else {
                 None
             };
-            let mke2fs = args.mke2fs.unwrap_or_else(default_mke2fs);
+            let mke2fs = global.mke2fs.clone().unwrap_or_else(default_mke2fs);
             let root_source = if args.box_id.is_some() {
                 None
             } else if let Some(prepared) = prepared_image {
@@ -1731,9 +1706,9 @@ async fn benchmark(args: BenchmarkArgs) -> Result<i32, Box<dyn std::error::Error
                 return Err("libkrun benchmark requires an image, rootfs, or BoxId".into());
             };
             let mut config = native_config(
-                args.helper,
-                args.libkrun,
-                args.lib_dir,
+                global.helper.clone(),
+                global.libkrun.clone(),
+                global.lib_dir.clone(),
                 None,
                 root_source
                     .as_ref()
@@ -1751,7 +1726,7 @@ async fn benchmark(args: BenchmarkArgs) -> Result<i32, Box<dyn std::error::Error
                 base_disks: BaseDiskStore::new(&cache_dir),
                 ephemeral_disks,
                 source: root_source,
-                e2fsck_path: args.e2fsck.unwrap_or_else(default_e2fsck),
+                e2fsck_path: global.e2fsck.clone().unwrap_or_else(default_e2fsck),
             };
             run_benchmark(
                 &Supervisor::new(LibkrunBackend::new(config).with_box_runtime(runtime)),
@@ -2083,11 +2058,14 @@ mod tests {
             "/usr/bin/true",
         ])
         .unwrap();
+        assert_eq!(
+            enabled.global.gvproxy,
+            Some(PathBuf::from("/opt/tools/gvproxy"))
+        );
         let Command::Run(enabled) = enabled.command else {
             panic!("expected run command");
         };
         assert!(enabled.network);
-        assert_eq!(enabled.gvproxy, Some(PathBuf::from("/opt/tools/gvproxy")));
     }
 
     #[test]
@@ -2122,13 +2100,10 @@ mod tests {
     #[test]
     fn storage_paths_are_optional_explicit_overrides() {
         let default = Cli::try_parse_from(["morae", "run", "--", "/bin/true"]).unwrap();
-        let Command::Run(default) = default.command else {
-            panic!("expected run command");
-        };
-        assert!(default.cache_dir.is_none());
-        assert!(default.state_dir.is_none());
+        assert!(default.global.cache_dir.is_none());
+        assert!(default.global.state_dir.is_none());
 
-        let explicit = Cli::try_parse_from([
+        let after_subcommand = Cli::try_parse_from([
             "morae",
             "run",
             "--cache-dir",
@@ -2139,11 +2114,45 @@ mod tests {
             "/bin/true",
         ])
         .unwrap();
-        let Command::Run(explicit) = explicit.command else {
-            panic!("expected run command");
-        };
-        assert_eq!(explicit.cache_dir, Some("custom-cache".into()));
-        assert_eq!(explicit.state_dir, Some("custom-state".into()));
+        assert_eq!(
+            after_subcommand.global.cache_dir,
+            Some("custom-cache".into())
+        );
+        assert_eq!(
+            after_subcommand.global.state_dir,
+            Some("custom-state".into())
+        );
+
+        let before_subcommand = Cli::try_parse_from([
+            "morae",
+            "--cache-dir",
+            "custom-cache",
+            "--state-dir",
+            "custom-state",
+            "run",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        assert_eq!(
+            before_subcommand.global.cache_dir,
+            Some("custom-cache".into())
+        );
+        assert_eq!(
+            before_subcommand.global.state_dir,
+            Some("custom-state".into())
+        );
+    }
+
+    #[test]
+    fn completion_includes_commands_and_global_options() {
+        let mut command = Cli::command();
+        let mut output = Vec::new();
+        clap_complete::generate(Shell::Bash, &mut command, "morae", &mut output);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("completion"));
+        assert!(output.contains("--cache-dir"));
+        assert!(output.contains("--json"));
     }
 
     #[test]
@@ -2178,13 +2187,13 @@ mod tests {
     #[test]
     fn parses_image_management_aliases() {
         let list = Cli::try_parse_from(["morae", "image", "ls", "--json"]).unwrap();
+        assert!(list.global.json);
         let Command::Image {
-            command: ImageCommand::List(args),
+            command: ImageCommand::List(_args),
         } = list.command
         else {
             panic!("expected image list command");
         };
-        assert!(args.json);
 
         let remove =
             Cli::try_parse_from(["morae", "image", "rm", "python:3.12", "--dry-run"]).unwrap();
@@ -2311,6 +2320,7 @@ mod tests {
             "--json",
         ])
         .unwrap();
+        assert!(create.global.json);
         let Command::Box {
             command: BoxCommand::Create(create),
         } = create.command
@@ -2318,7 +2328,6 @@ mod tests {
             panic!("expected box create command");
         };
         assert_eq!(create.disk_size, 512 * 1024 * 1024);
-        assert!(create.json);
 
         let box_id = BoxId::new();
         let run = Cli::try_parse_from([

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true, features = ["env"] }
+clap_complete.workspace = true
 moraebox-box = { path = "../moraebox-box" }
 moraebox-core = { path = "../moraebox-core" }
 moraebox-image = { path = "../moraebox-image" }

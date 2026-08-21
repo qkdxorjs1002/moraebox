@@ -66,6 +66,25 @@ The built-in default image is `docker.io/library/python:3.12`. moraebox pulls an
 
 ## Using the CLI
 
+### Configure global options and shell completion
+
+Storage, structured output, and native dependency overrides are global options. They may appear before or after a subcommand, so these forms are equivalent:
+
+```sh
+morae --cache-dir /var/tmp/morae-cache image list --json
+morae image list --cache-dir /var/tmp/morae-cache --json
+```
+
+The precedence is an explicit CLI option, then its `MORAE_*` environment variable, then automatic discovery or the user-wide default. Storage uses `MORAE_CACHE_DIR` and `MORAE_STATE_DIR`. Native dependency overrides use `MORAE_HELPER_PATH`, `MORAE_LIBKRUN_PATH`, `MORAE_GVPROXY_PATH`, `MORAE_LIB_DIR`, `MORAE_MKE2FS`, and `MORAE_E2FSCK`. There is no implicit project configuration file, so changing directories does not change this resolution order. Registry credentials and `MORAE_ROOTFS` remain scoped to commands that consume them.
+
+Generate completion code for the current shell with:
+
+```sh
+source <(morae completion bash)
+source <(morae completion zsh)
+morae completion fish | source
+```
+
 ### Choose resources and a timeout
 
 ```sh
@@ -176,7 +195,7 @@ morae cache clean --all --dry-run
 morae cache clean --all --yes
 ```
 
-By default, every command uses the user-wide `~/.moraebox/cache` and `~/.moraebox/state` directories, independent of the current working directory. Use `--cache-dir` or `--state-dir` only when a command should use another location. Existing project-local data is not moved automatically; for example, continue using it with `morae box list --state-dir .moraebox/state`.
+By default, every command uses the user-wide `~/.moraebox/cache` and `~/.moraebox/state` directories, independent of the current working directory. Use `--cache-dir`, `--state-dir`, or their environment variables only when a command should use another location. Existing project-local data is not moved automatically; for example, continue using it with `morae box list --state-dir .moraebox/state`.
 
 Cache size output distinguishes logical bytes from filesystem-allocated bytes. Rootfs sizes come from publish-time indexed metadata, so `image list` and `cache info` do not rescan every tree. Use `cache reconcile --dry-run` to detect missing, invalid, stale, or orphan metadata and `cache reconcile --yes` (also available as `cache repair --yes`) to repair it.
 

@@ -192,7 +192,7 @@
 - [x] image pull, rootfs materialization, base disk, workspace snapshot, helper spawn 진행률을 stderr에 표시한다.
   - `--json` 또는 non-TTY에서는 protocol-friendly structured/quiet 동작을 사용한다.
 
-- [ ] 반복되는 storage/json/native path 옵션을 global options와 명확한 config precedence로 정리하고 shell completion을 제공한다.
+- [x] 반복되는 storage/json/native path 옵션을 global options와 명확한 config precedence로 정리하고 shell completion을 제공한다.
 
 - [ ] project-local `.moraebox`가 발견되면 자동 이동 없이 기존 데이터 사용 방법만 경고한다.
 

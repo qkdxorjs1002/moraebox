@@ -141,6 +141,19 @@ impl NativeRuntimePaths {
 
 impl DoctorReport {
     pub fn collect() -> Self {
+        let paths = NativeRuntimePaths::discover_with_gvproxy(None, None, None, None);
+        Self::collect_with_paths(
+            paths,
+            configured_path("MORAE_MKE2FS"),
+            configured_path("MORAE_E2FSCK"),
+        )
+    }
+
+    pub fn collect_with_paths(
+        paths: NativeRuntimePaths,
+        mke2fs_override: Option<PathBuf>,
+        e2fsck_override: Option<PathBuf>,
+    ) -> Self {
         let os = env::consts::OS.to_owned();
         let architecture = env::consts::ARCH.to_owned();
         let os_version = command_output("sw_vers", &["-productVersion"]);
@@ -149,25 +162,17 @@ impl DoctorReport {
         // leaving a dangling-looking compatibility symlink in the framework bundle.
         let hypervisor_framework =
             Path::new("/System/Library/Frameworks/Hypervisor.framework").is_dir();
-        let helper_path = find_helper();
+        let helper_path = paths.helper;
         let hypervisor_entitlement = helper_path
             .as_deref()
+            .filter(|path| path.is_file())
             .is_some_and(binary_has_hypervisor_entitlement);
-        let libkrun = probe_library(
-            "MORAE_LIBKRUN_PATH",
-            LIBKRUN_CANDIDATES,
-            REQUIRED_LIBKRUN_SYMBOLS,
-        );
-        let libkrunfw = probe_library("MORAE_LIBKRUNFW_PATH", LIBKRUNFW_CANDIDATES, &[]);
+        let libkrun = probe_library_path(paths.libkrun, REQUIRED_LIBKRUN_SYMBOLS);
+        let libkrunfw = probe_library_path(paths.libkrunfw, &[]);
         let krunvm = probe_tool("krunvm");
-        let gvproxy = probe_tool_path(
-            configured_path("MORAE_GVPROXY_PATH")
-                .filter(|path| path.is_file())
-                .or_else(|| find_in_path("gvproxy"))
-                .or_else(|| find_candidate(GVPROXY_CANDIDATES)),
-        );
-        let mke2fs = probe_tool_with_candidates("mke2fs", MKE2FS_CANDIDATES);
-        let e2fsck = probe_tool_with_candidates("e2fsck", E2FSCK_CANDIDATES);
+        let gvproxy = probe_tool_path(paths.gvproxy);
+        let mke2fs = probe_tool_override(mke2fs_override, "mke2fs", MKE2FS_CANDIDATES);
+        let e2fsck = probe_tool_override(e2fsck_override, "e2fsck", E2FSCK_CANDIDATES);
         let cow_clone_supported = probe_cow_clone();
         let libkrun_network_api = libkrun
             .path
@@ -245,25 +250,18 @@ impl DoctorReport {
     }
 }
 
-fn probe_library(
-    environment_key: &str,
-    candidates: &[&str],
-    required_symbols: &[&str],
-) -> LibraryProbe {
-    let configured = env::var_os(environment_key).map(PathBuf::from);
-    let path = configured.filter(|path| path.is_file()).or_else(|| {
-        candidates
-            .iter()
-            .map(PathBuf::from)
-            .find(|path| path.is_file())
-    });
-    let Some(path) = path else {
+fn probe_library_path(path: Option<PathBuf>, required_symbols: &[&str]) -> LibraryProbe {
+    let found = path.as_ref().is_some_and(|path| path.is_file());
+    if !found {
         return LibraryProbe {
             found: false,
-            path: None,
+            path,
             required_symbols_present: None,
             missing_symbols: Vec::new(),
         };
+    }
+    let Some(path) = path else {
+        unreachable!("a found library path must be present");
     };
     if required_symbols.is_empty() {
         return LibraryProbe {
@@ -308,12 +306,21 @@ fn probe_tool_with_candidates(name: &str, candidates: &[&str]) -> ToolProbe {
     }))
 }
 
+fn probe_tool_override(path: Option<PathBuf>, name: &str, candidates: &[&str]) -> ToolProbe {
+    path.map_or_else(
+        || probe_tool_with_candidates(name, candidates),
+        |path| probe_tool_path(Some(path)),
+    )
+}
+
 fn probe_tool_path(path: Option<PathBuf>) -> ToolProbe {
-    let version = path
-        .as_ref()
+    let found = path.as_ref().is_some_and(|path| path.is_file());
+    let version = found
+        .then_some(())
+        .and(path.as_ref())
         .and_then(|path| command_output(path.to_string_lossy().as_ref(), &["--version"]));
     ToolProbe {
-        found: path.is_some(),
+        found,
         path,
         version,
     }
@@ -372,12 +379,6 @@ fn probe_cow_clone() -> Option<bool> {
     return None;
 
     Some(output.status.success())
-}
-
-fn find_helper() -> Option<PathBuf> {
-    configured_path("MORAE_HELPER_PATH")
-        .filter(|path| path.is_file())
-        .or_else(find_sibling_helper)
 }
 
 fn configured_path(key: &str) -> Option<PathBuf> {
@@ -448,13 +449,38 @@ mod tests {
 
     #[test]
     fn missing_library_probe_is_explicit() {
-        let probe = probe_library(
-            "MORAE_TEST_MISSING_LIBRARY",
-            &["/definitely/not/a/library"],
-            REQUIRED_LIBKRUN_SYMBOLS,
-        );
+        let path = PathBuf::from("/definitely/not/a/library");
+        let probe = probe_library_path(Some(path.clone()), REQUIRED_LIBKRUN_SYMBOLS);
         assert!(!probe.found);
+        assert_eq!(probe.path, Some(path));
         assert_eq!(probe.required_symbols_present, None);
+    }
+
+    #[test]
+    fn doctor_uses_resolved_tool_overrides_without_fallback() {
+        let missing_helper = PathBuf::from("/configured/missing-helper");
+        let missing_library = PathBuf::from("/configured/missing-libkrun");
+        let missing_proxy = PathBuf::from("/configured/missing-gvproxy");
+        let missing_mke2fs = PathBuf::from("/configured/missing-mke2fs");
+        let missing_e2fsck = PathBuf::from("/configured/missing-e2fsck");
+        let report = DoctorReport::collect_with_paths(
+            NativeRuntimePaths {
+                helper: Some(missing_helper.clone()),
+                libkrun: Some(missing_library.clone()),
+                libkrunfw: None,
+                gvproxy: Some(missing_proxy.clone()),
+                library_search_path: None,
+            },
+            Some(missing_mke2fs.clone()),
+            Some(missing_e2fsck.clone()),
+        );
+
+        assert_eq!(report.helper_path, Some(missing_helper));
+        assert_eq!(report.libkrun.path, Some(missing_library));
+        assert_eq!(report.gvproxy.path, Some(missing_proxy));
+        assert_eq!(report.mke2fs.path, Some(missing_mke2fs));
+        assert_eq!(report.e2fsck.path, Some(missing_e2fsck));
+        assert!(!report.native_backend_ready);
     }
 
     #[test]
