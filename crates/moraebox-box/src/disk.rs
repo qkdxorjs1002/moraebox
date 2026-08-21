@@ -25,6 +25,7 @@ const EPHEMERAL_DIRECTORY: &str = "ephemeral-boxes";
 const ROOT_DISK_FILE: &str = "root.ext4";
 const METADATA_FILE: &str = "metadata.json";
 const LOCK_FILE: &str = ".lock";
+const LOCKS_DIRECTORY: &str = ".locks";
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,9 +163,12 @@ impl BaseDiskStore {
             return Ok(base);
         }
 
+        let key = spec.key()?;
         let bases = self.bases_directory();
         secure_directory(&bases)?;
-        let lock_path = bases.join(".prepare.lock");
+        let locks = bases.join(LOCKS_DIRECTORY);
+        secure_directory(&locks)?;
+        let lock_path = locks.join(format!("{key}.lock"));
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -172,7 +176,7 @@ impl BaseDiskStore {
             .truncate(false)
             .open(&lock_path)?;
         set_file_permissions(&lock_path)?;
-        FileExt::try_lock_exclusive(&lock).map_err(|source| BoxStoreError::BaseDiskBusy {
+        FileExt::lock_exclusive(&lock).map_err(|source| BoxStoreError::BaseDiskBusy {
             path: lock_path,
             source,
         })?;
@@ -180,7 +184,6 @@ impl BaseDiskStore {
             return Ok(base);
         }
 
-        let key = spec.key()?;
         let destination = self.base_directory(&key);
         let staging = bases.join(format!(
             ".creating-{key}-{}-{}",
@@ -695,6 +698,8 @@ fn to_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -716,6 +721,40 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn blocking_mke2fs(directory: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let executable = directory.join("blocking-mke2fs");
+        let calls = directory.join("blocking-calls");
+        let release = directory.join("release-mke2fs");
+        let mut file = File::create(&executable).unwrap();
+        writeln!(file, "#!/bin/sh").unwrap();
+        writeln!(file, "printf x >> '{}'", calls.display()).unwrap();
+        writeln!(
+            file,
+            "while [ ! -f '{}' ]; do sleep 0.01; done",
+            release.display()
+        )
+        .unwrap();
+        writeln!(file, "exit 0").unwrap();
+        drop(file);
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        (executable, calls, release)
+    }
+
+    fn wait_for_call_count(path: &Path, expected: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let count = fs::read(path).map_or(0, |bytes| bytes.len());
+            if count >= expected {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[cfg(unix)]
     #[test]
     fn prepares_a_base_once_and_uses_direct_lookup_afterward() {
         let temporary = tempfile::tempdir().unwrap();
@@ -733,6 +772,82 @@ mod tests {
         assert_eq!(fs::read(calls).unwrap(), b"x");
         assert_eq!(first.metadata().key, spec.key().unwrap());
         assert_eq!(fs::metadata(first.disk_path()).unwrap().len(), DISK_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_base_key_waits_and_reuses_one_preparation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let rootfs = temporary.path().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        let (mke2fs, calls, release) = blocking_mke2fs(temporary.path());
+        let store = BaseDiskStore::new(temporary.path().join("cache"));
+        let spec = BaseDiskSpec::new("sha256:same", "linux/arm64", DISK_BYTES);
+
+        let first_store = store.clone();
+        let first_spec = spec.clone();
+        let first_rootfs = rootfs.clone();
+        let first_mke2fs = mke2fs.clone();
+        let first =
+            thread::spawn(move || first_store.prepare(&first_spec, &first_rootfs, &first_mke2fs));
+        assert!(wait_for_call_count(&calls, 1));
+
+        let second_store = store.clone();
+        let second_rootfs = rootfs.clone();
+        let second_mke2fs = mke2fs.clone();
+        let second_spec = spec.clone();
+        let second = thread::spawn(move || {
+            second_store.prepare(&second_spec, &second_rootfs, &second_mke2fs)
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(fs::read(&calls).unwrap(), b"x");
+        assert!(!second.is_finished());
+
+        fs::write(release, b"release").unwrap();
+        let first = first.join().unwrap().unwrap();
+        let second = second.join().unwrap().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(fs::read(calls).unwrap(), b"x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn different_base_keys_prepare_concurrently() {
+        let temporary = tempfile::tempdir().unwrap();
+        let rootfs = temporary.path().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        let (mke2fs, calls, release) = blocking_mke2fs(temporary.path());
+        let store = BaseDiskStore::new(temporary.path().join("cache"));
+
+        let first_store = store.clone();
+        let first_rootfs = rootfs.clone();
+        let first_mke2fs = mke2fs.clone();
+        let first = thread::spawn(move || {
+            first_store.prepare(
+                &BaseDiskSpec::new("sha256:first", "linux/arm64", DISK_BYTES),
+                &first_rootfs,
+                &first_mke2fs,
+            )
+        });
+        assert!(wait_for_call_count(&calls, 1));
+
+        let second_store = store.clone();
+        let second_rootfs = rootfs.clone();
+        let second_mke2fs = mke2fs.clone();
+        let second = thread::spawn(move || {
+            second_store.prepare(
+                &BaseDiskSpec::new("sha256:second", "linux/arm64", DISK_BYTES),
+                &second_rootfs,
+                &second_mke2fs,
+            )
+        });
+        let entered_concurrently = wait_for_call_count(&calls, 2);
+        fs::write(release, b"release").unwrap();
+
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        assert!(entered_concurrently);
+        assert_eq!(fs::read(calls).unwrap(), b"xx");
     }
 
     #[test]
