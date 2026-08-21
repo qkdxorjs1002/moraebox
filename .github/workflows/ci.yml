@@ -6,11 +6,16 @@ on:
       - "**"
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   rust:
+    name: Rust stable (${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-24.04, windows-2025]
+        os: [macos-15, ubuntu-24.04, windows-2025]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -18,5 +23,41 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  msrv:
+    name: Rust 1.85 MSRV (locked)
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: cargo check --workspace --all-targets --locked
+      - run: cargo test --workspace --locked
+
+  native-signed-smoke:
+    name: Native signed smoke
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native dependencies
+        id: native-dependencies
+        continue-on-error: true
+        run: |
+          brew tap qkdxorjs1002/tap
+          brew trust --tap qkdxorjs1002/tap
+          brew install \
+            qkdxorjs1002/tap/libkrun \
+            qkdxorjs1002/tap/libkrunfw \
+            qkdxorjs1002/tap/gvproxy \
+            e2fsprogs
+      - name: Run or report native signed smoke
+        env:
+          MORAE_NATIVE_DEPENDENCY_SETUP: ${{ steps.native-dependencies.outcome }}
+          MORAE_NATIVE_E2E_CACHE_DIR: ${{ runner.temp }}/moraebox-native-cache
+        run: scripts/ci-native-smoke.sh

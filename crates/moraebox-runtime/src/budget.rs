@@ -271,9 +271,7 @@ impl RunBudget {
     }
 
     fn record_event(&self, kind: StageEventKind, stage: RunStage) {
-        if kind == StageEventKind::Started
-            && let Some(progress) = &self.progress
-        {
+        if let (StageEventKind::Started, Some(progress)) = (kind, self.progress.as_ref()) {
             (progress.0)(stage);
         }
         let elapsed_micros = duration_micros(self.started.elapsed());

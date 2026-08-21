@@ -165,11 +165,11 @@ async fn cleanup_network_proxy(
 }
 
 async fn stop_network_child(child: &mut Child) -> io::Result<()> {
-    if child.try_wait()?.is_none()
-        && let Err(error) = child.start_kill()
-        && child.try_wait()?.is_none()
-    {
-        return Err(error);
+    if child.try_wait()?.is_none() {
+        let kill_result = child.start_kill();
+        if child.try_wait()?.is_none() {
+            kill_result?;
+        }
     }
     child.wait().await.map(|_| ())
 }

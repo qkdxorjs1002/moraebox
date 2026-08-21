@@ -130,10 +130,8 @@ pub(super) async fn serve(server: McpServer) -> Result<(), McpServeError> {
 
     let mut request_error = None;
     while let Some(result) = requests.join_next().await {
-        if let Err(error) = result
-            && request_error.is_none()
-        {
-            request_error = Some(error);
+        if request_error.is_none() {
+            request_error = result.err();
         }
     }
     let cleanup_error = server.sdk.shutdown().await.err();

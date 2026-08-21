@@ -209,9 +209,8 @@ impl Cas {
         staging.close();
 
         let actual = Digest::from_sha256(hasher.finalize().into());
-        if let Some(expected) = expected_digest
-            && expected != &actual
-        {
+        let mismatch = expected_digest.filter(|expected| *expected != &actual);
+        if let Some(expected) = mismatch {
             return Err(PutStreamError::Cas(CasError::DigestMismatch {
                 expected: expected.clone(),
                 actual,
@@ -346,9 +345,7 @@ fn verify_stream_size<E>(
     if actual > maximum {
         return Err(PutStreamError::SizeExceeded { actual });
     }
-    if let Some(expected) = expected
-        && actual != expected
-    {
+    if let Some(expected) = expected.filter(|expected| actual != *expected) {
         return Err(PutStreamError::SizeMismatch { expected, actual });
     }
     Ok(())

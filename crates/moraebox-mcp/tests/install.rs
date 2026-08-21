@@ -241,7 +241,7 @@ fn failed_initialize_preflight_leaves_agent_configuration_untouched() {
 
     let fake = FakeCodex::new(0);
     let bad_server = fake.directory.join("bad-server");
-    std::fs::write(&bad_server, "#!/bin/sh\necho not-json\n").unwrap();
+    std::fs::write(&bad_server, "#!/bin/sh\nIFS= read -r _\necho not-json\n").unwrap();
     std::fs::set_permissions(&bad_server, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut command = mcp_command();
     command

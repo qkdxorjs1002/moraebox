@@ -200,9 +200,12 @@ impl SandboxSdk {
         cancellation: Option<&mut oneshot::Receiver<()>>,
     ) -> Result<ExecutionPageResult, SdkError> {
         let session_id = handle.id();
-        if let Err(error) = handle.close_stdin().await
-            && handle.status().state != SessionState::Dead
-        {
+        let close_error = handle
+            .close_stdin()
+            .await
+            .err()
+            .filter(|_| handle.status().state != SessionState::Dead);
+        if let Some(error) = close_error {
             self.remove(session_id).await?;
             return Err(error.into());
         }
@@ -255,9 +258,12 @@ impl SandboxSdk {
     }
 
     async fn finish_execution(handle: &SessionHandle) -> Result<ExecutionResult, SdkError> {
-        if let Err(error) = handle.close_stdin().await
-            && handle.status().state != moraebox_core::SessionState::Dead
-        {
+        let close_error = handle
+            .close_stdin()
+            .await
+            .err()
+            .filter(|_| handle.status().state != moraebox_core::SessionState::Dead);
+        if let Some(error) = close_error {
             return Err(error.into());
         }
         let status = handle.wait().await?;
@@ -414,9 +420,10 @@ impl SandboxSdk {
 
     async fn release_active_slot(&self, session_id: SessionId) {
         let mut sessions = self.sessions.write().await;
-        if let Some(entry) = sessions.get_mut(&session_id)
-            && entry.handle.status().state == SessionState::Dead
-        {
+        let entry = sessions
+            .get_mut(&session_id)
+            .filter(|entry| entry.handle.status().state == SessionState::Dead);
+        if let Some(entry) = entry {
             entry.active_permit.take();
         }
     }
@@ -540,10 +547,8 @@ impl SandboxSdk {
             let result = result
                 .map_err(|error| SdkError::SessionTask(error.to_string()))
                 .and_then(|result| result.map(|_| ()));
-            if let Err(error) = result
-                && first_error.is_none()
-            {
-                first_error = Some(error);
+            if first_error.is_none() {
+                first_error = result.err();
             }
         }
         first_error.map_or(Ok(()), Err)

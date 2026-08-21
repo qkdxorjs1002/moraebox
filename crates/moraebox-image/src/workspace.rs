@@ -463,9 +463,11 @@ fn hash_entry_metadata(
     #[cfg(not(unix))]
     {
         hasher.update([u8::from(metadata.permissions().readonly())]);
-        if let Ok(modified) = metadata.modified()
-            && let Ok(elapsed) = modified.duration_since(std::time::UNIX_EPOCH)
-        {
+        let elapsed = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok());
+        if let Some(elapsed) = elapsed {
             hasher.update(elapsed.as_secs().to_le_bytes());
             hasher.update(elapsed.subsec_nanos().to_le_bytes());
         }
@@ -623,12 +625,14 @@ fn workspace_image_digest(
     cancelled: Option<&AtomicBool>,
 ) -> Result<Digest, WorkspaceError> {
     let before = workspace_image_fingerprint(image_path)?;
-    if let Some(metadata) = read_workspace_image_metadata(metadata_path)?
-        && metadata.schema_version == WORKSPACE_IMAGE_METADATA_SCHEMA_VERSION
-        && metadata.source_digest == source_digest.to_string()
-        && metadata.image == before
-        && let Ok(digest) = Digest::from_str(&metadata.image_digest)
-    {
+    let cached_digest = read_workspace_image_metadata(metadata_path)?
+        .filter(|metadata| {
+            metadata.schema_version == WORKSPACE_IMAGE_METADATA_SCHEMA_VERSION
+                && metadata.source_digest == source_digest.to_string()
+                && metadata.image == before
+        })
+        .and_then(|metadata| Digest::from_str(&metadata.image_digest).ok());
+    if let Some(digest) = cached_digest {
         return Ok(digest);
     }
 

@@ -52,9 +52,10 @@ where
             }
             signal_result = signals.recv() => {
                 let signal = signal_result?;
-                if let Err(error) = session.signal(signal).await
-                    && session.status().state != SessionState::Dead
-                {
+                let error = session.signal(signal).await.err().filter(|_| {
+                    session.status().state != SessionState::Dead
+                });
+                if let Some(error) = error {
                     return Err(error.into());
                 }
             }

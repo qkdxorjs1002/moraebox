@@ -157,9 +157,7 @@ impl LibkrunConfig {
                 self.root_path.display()
             )));
         }
-        if let Some(path) = &self.workspace_disk
-            && !path.is_file()
-        {
+        if let Some(path) = self.workspace_disk.as_ref().filter(|path| !path.is_file()) {
             return Err(BackendError::Control(format!(
                 "workspace disk does not exist: {}",
                 path.display()
@@ -346,9 +344,12 @@ impl LibkrunBackend {
             Ok(spawned) => Ok(spawned),
             Err(error) => {
                 let mut error = BackendError::from(error);
-                if let Some(proxy) = network_proxy.take()
-                    && let Err(cleanup) = proxy.stop().await
-                {
+                let cleanup = if let Some(proxy) = network_proxy.take() {
+                    proxy.stop().await.err()
+                } else {
+                    None
+                };
+                if let Some(cleanup) = cleanup {
                     error = BackendError::Control(format!(
                         "{error}; failed to reap gvproxy after helper spawn failure: {cleanup}"
                     ));
@@ -594,15 +595,11 @@ fn managed_exit(
 ) -> crate::backend::ExitFuture {
     let task = tokio::spawn(async move {
         let status = child.wait().await;
-        let root_cleanup = if let Ok(status) = &status
-            && helper_exit_is_clean(*status)
-            && let Some(lease) = root_lease.as_mut()
-        {
-            lease
+        let root_cleanup = match (status.as_ref(), root_lease.as_mut()) {
+            (Ok(status), Some(lease)) if helper_exit_is_clean(*status) => lease
                 .mark_clean()
-                .map_err(|error| io::Error::other(error.to_string()))
-        } else {
-            Ok(())
+                .map_err(|error| io::Error::other(error.to_string())),
+            _ => Ok(()),
         };
         let network_cleanup = if let Some(proxy) = network_proxy {
             proxy.stop().await
@@ -1519,9 +1516,12 @@ mod tests {
     ) -> JoinHandle<std::os::unix::net::UnixDatagram> {
         tokio::task::spawn_blocking(move || {
             for _ in 0..500 {
-                if let Ok(socket_path) = fs::read_to_string(&socket_path_file)
-                    && let Ok(socket) = std::os::unix::net::UnixDatagram::bind(socket_path)
-                {
+                let socket = fs::read_to_string(&socket_path_file)
+                    .ok()
+                    .and_then(|socket_path| {
+                        std::os::unix::net::UnixDatagram::bind(socket_path).ok()
+                    });
+                if let Some(socket) = socket {
                     return socket;
                 }
                 std::thread::sleep(Duration::from_millis(10));

@@ -936,9 +936,10 @@ async fn pump_stdin_inner(
             "backend stdin is unavailable",
         ));
     }
-    if !initial.is_empty()
-        && let Some(writer) = writer.as_mut()
-    {
+    if !initial.is_empty() {
+        let writer = writer
+            .as_mut()
+            .expect("non-empty initial input requires backend stdin");
         tokio::select! {
             biased;
             () = stdin_shutdown(shutdown) => return Ok(()),

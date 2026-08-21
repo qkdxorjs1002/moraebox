@@ -12,7 +12,7 @@ use moraebox_image::ImageCache;
 use moraebox_runtime::{DiskToolPaths, NativeRuntimePaths};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::{Child, Command},
     task::JoinHandle,
     time::timeout,
@@ -579,7 +579,7 @@ async fn preflight_server(launch: &ServerLaunch) -> Result<(), String> {
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to launch {}: {error}", launch.program.display()))?;
-    let stdout = child
+    let mut stdout = child
         .stdout
         .take()
         .ok_or_else(|| "server stdout was not captured".to_owned())?;
@@ -587,44 +587,20 @@ async fn preflight_server(launch: &ServerLaunch) -> Result<(), String> {
         .stderr
         .take()
         .ok_or_else(|| "server stderr was not captured".to_owned())?;
-    let stdout_task = tokio::spawn(capture_bounded(stdout));
     let stderr_task = tokio::spawn(capture_bounded(stderr));
-    let request = format!(
-        "{}\n{}\n",
-        json!({
-            "jsonrpc": "2.0",
-            "id": "moraebox-install-preflight",
-            "method": "initialize",
-            "params": {
-                "protocolVersion": super::PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": { "name": "moraebox-installer", "version": env!("CARGO_PKG_VERSION") }
-            }
-        }),
-        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
-    );
-    let write_result = async {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "server stdin was not captured".to_owned())?;
-        stdin
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|error| format!("failed to write initialize request: {error}"))?;
-        stdin
-            .shutdown()
-            .await
-            .map_err(|error| format!("failed to close server stdin: {error}"))
-    }
-    .await;
-    if let Err(error) = write_result {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "server stdin was not captured".to_owned())?;
+    let handshake = exchange_initialize(&mut stdin, &mut stdout).await;
+    drop(stdin);
+    if let Err(error) = handshake {
         terminate_child(&mut child).await;
-        let _ = collect_capture(stdout_task, "stdout").await;
-        let _ = collect_capture(stderr_task, "stderr").await;
-        return Err(error);
+        let stderr = collect_capture(stderr_task, "stderr").await?;
+        return Err(format!("{error}; stderr: {}", render_capture(&stderr)));
     }
 
+    let stdout_task = tokio::spawn(capture_bounded(stdout));
     let status = match timeout(PREFLIGHT_TIMEOUT, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
@@ -645,7 +621,7 @@ async fn preflight_server(launch: &ServerLaunch) -> Result<(), String> {
             ));
         }
     };
-    let stdout = collect_capture(stdout_task, "stdout").await?;
+    let trailing_stdout = collect_capture(stdout_task, "stdout").await?;
     let stderr = collect_capture(stderr_task, "stderr").await?;
     if !status.success() {
         return Err(format!(
@@ -653,7 +629,93 @@ async fn preflight_server(launch: &ServerLaunch) -> Result<(), String> {
             render_capture(&stderr)
         ));
     }
-    validate_initialize_response(&stdout)
+    if trailing_stdout.truncated
+        || trailing_stdout
+            .bytes
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace())
+    {
+        return Err(format!(
+            "server wrote unexpected stdout after initialize response: {}",
+            render_capture(&trailing_stdout)
+        ));
+    }
+    Ok(())
+}
+
+async fn exchange_initialize<W, R>(stdin: &mut W, stdout: &mut R) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let initialize = format!(
+        "{}\n",
+        json!({
+            "jsonrpc": "2.0",
+            "id": "moraebox-install-preflight",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": super::PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "moraebox-installer", "version": env!("CARGO_PKG_VERSION") }
+            }
+        })
+    );
+    stdin
+        .write_all(initialize.as_bytes())
+        .await
+        .map_err(|error| format!("failed to write initialize request: {error}"))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|error| format!("failed to flush initialize request: {error}"))?;
+
+    let response = timeout(PREFLIGHT_TIMEOUT, capture_bounded_line(stdout))
+        .await
+        .map_err(|_| format!("initialize response exceeded {PREFLIGHT_TIMEOUT:?}"))?
+        .map_err(|error| format!("failed to read initialize response: {error}"))?;
+    validate_initialize_response(&response)?;
+
+    let initialized = format!(
+        "{}\n",
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+    );
+    stdin
+        .write_all(initialized.as_bytes())
+        .await
+        .map_err(|error| format!("failed to write initialized notification: {error}"))?;
+    stdin
+        .shutdown()
+        .await
+        .map_err(|error| format!("failed to close server stdin: {error}"))
+}
+
+async fn capture_bounded_line<R>(reader: &mut R) -> std::io::Result<CapturedOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let count = reader.read(&mut byte).await?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len() == PREFLIGHT_CAPTURE_BYTES {
+            return Ok(CapturedOutput {
+                bytes,
+                truncated: true,
+            });
+        }
+        bytes.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    Ok(CapturedOutput {
+        bytes,
+        truncated: false,
+    })
 }
 
 async fn capture_bounded<R>(mut reader: R) -> std::io::Result<CapturedOutput>

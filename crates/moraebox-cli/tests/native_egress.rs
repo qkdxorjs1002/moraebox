@@ -125,10 +125,10 @@ impl NativeHarness {
             "signed helper is missing at {}; run cargo build --workspace and codesign it",
             helper.display()
         );
-        verify_doctor(&morae);
 
         let configured_cache = env::var_os(E2E_CACHE_ENV).map(PathBuf::from);
         let configured_image = env::var(E2E_IMAGE_ENV).ok();
+        verify_doctor(&morae, configured_cache.as_deref());
         let cached = ready_image(
             &morae,
             configured_cache.as_deref(),
@@ -223,8 +223,12 @@ struct NativeChildren {
     gvproxy: Option<i32>,
 }
 
-fn verify_doctor(morae: &Path) {
-    let output = Command::new(morae)
+fn verify_doctor(morae: &Path, cache_dir: Option<&Path>) {
+    let mut command = Command::new(morae);
+    if let Some(cache_dir) = cache_dir {
+        command.arg("--cache-dir").arg(cache_dir);
+    }
+    let output = command
         .args(["doctor", "--json", "--strict"])
         .output()
         .expect("run morae doctor");
@@ -321,9 +325,8 @@ fn wait_for_native_children(child: &mut Child, expect_gvproxy: bool) -> NativeCh
             .iter()
             .find(|(_, command)| command.contains("gvproxy") && command.contains("--listen-vfkit"))
             .map(|(pid, _)| *pid);
-        if let Some(helper) = helper
-            && (!expect_gvproxy || gvproxy.is_some())
-        {
+        let helper = helper.filter(|_| !expect_gvproxy || gvproxy.is_some());
+        if let Some(helper) = helper {
             return NativeChildren { helper, gvproxy };
         }
         assert!(

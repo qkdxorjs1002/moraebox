@@ -238,7 +238,7 @@
   - mock registry digest/auth/timeout/retry/concurrent pull
   - Box/cache 중단 쓰기, stale staging, power-loss recovery
 
-- [ ] CI에 Rust 1.85 MSRV와 `--locked` job을 추가하고 native signed smoke의 실행/skip 이유를 명시한다.
+- [x] CI에 Rust 1.85 MSRV와 `--locked` job을 추가하고 native signed smoke의 실행/skip 이유를 명시한다.
 
 - [ ] dependency/license/advisory 검사와 GitHub Actions commit SHA pinning을 추가한다.
 

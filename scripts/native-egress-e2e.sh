@@ -9,18 +9,27 @@ if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
     exit 2
 fi
 
-cargo test -p moraebox-vmm-helper
-cargo build --workspace
+cargo test -p moraebox-vmm-helper --locked
+cargo build --workspace --locked
 
 codesign --force --sign - \
     --entitlements assets/moraebox-vmm.entitlements \
     target/debug/morae-vmm-helper
 codesign --verify --strict target/debug/morae-vmm-helper
 
-target/debug/morae doctor --json --strict
+if [ -n "${MORAE_NATIVE_E2E_CACHE_DIR:-}" ]; then
+    target/debug/morae \
+        --cache-dir "$MORAE_NATIVE_E2E_CACHE_DIR" \
+        doctor \
+        --json \
+        --strict
+else
+    target/debug/morae doctor --json --strict
+fi
 MORAE_NATIVE_E2E=1 cargo test \
     -p moraebox-cli \
     --test native_egress \
+    --locked \
     -- \
     --ignored \
     --nocapture \

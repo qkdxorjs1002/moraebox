@@ -495,9 +495,7 @@ impl CliProgress {
     }
 
     fn runtime(self, stage: RunStage) {
-        if self.enabled
-            && let Some(message) = run_stage_progress_message(stage)
-        {
+        if let (true, Some(message)) = (self.enabled, run_stage_progress_message(stage)) {
             eprintln!("morae: runtime: {message}");
         }
     }

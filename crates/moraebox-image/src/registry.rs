@@ -414,9 +414,7 @@ impl RegistryClient {
                 .await?;
             if let Some(declared) = response.content_length() {
                 verify_download_limit("manifest", declared, self.limits.max_manifest_bytes)?;
-                if let Some(expected) = expected_size
-                    && declared != expected
-                {
+                if let Some(expected) = expected_size.filter(|expected| declared != *expected) {
                     return Err(RegistryError::DescriptorSizeMismatch {
                         digest: selector.into(),
                         expected,
@@ -430,9 +428,11 @@ impl RegistryClient {
                 .and_then(|value| value.to_str().ok())
                 .map(Digest::from_str)
                 .transpose()?;
-            if let (Some(expected), Some(reported)) = (&selector_digest, &header_digest)
-                && expected != reported
-            {
+            let digest_mismatch = selector_digest
+                .as_ref()
+                .zip(header_digest.as_ref())
+                .filter(|(expected, reported)| expected != reported);
+            if let Some((expected, reported)) = digest_mismatch {
                 return Err(RegistryError::ManifestDigestMismatch {
                     expected: expected.clone(),
                     actual: reported.clone(),
@@ -489,9 +489,10 @@ impl RegistryClient {
             let response = self
                 .get_authenticated(&url, reference, authorization, None)
                 .await?;
-            if let Some(declared) = response.content_length()
-                && declared != descriptor.size
-            {
+            let declared = response
+                .content_length()
+                .filter(|declared| *declared != descriptor.size);
+            if let Some(declared) = declared {
                 return Err(RegistryError::DescriptorSizeMismatch {
                     digest: descriptor.digest.clone(),
                     expected: descriptor.size,

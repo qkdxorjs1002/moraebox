@@ -731,9 +731,10 @@ fn pid_command(pid_path: &std::path::Path) -> Vec<String> {
 fn wait_for_pid(pid_path: &std::path::Path) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Ok(contents) = std::fs::read_to_string(pid_path)
-            && let Ok(pid) = contents.parse()
-        {
+        let pid = std::fs::read_to_string(pid_path)
+            .ok()
+            .and_then(|contents| contents.parse().ok());
+        if let Some(pid) = pid {
             return pid;
         }
         assert!(Instant::now() < deadline, "process PID was not published");
