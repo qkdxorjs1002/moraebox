@@ -736,7 +736,7 @@ mod tests {
     async fn repeated_stop_returns_the_same_final_status() {
         let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
         let mut spec = RunSpec::command(long_running_command());
-        spec.kill_grace = Duration::from_millis(20);
+        spec.kill_grace = Duration::from_millis(200);
         let started = sdk.start(spec).await.unwrap();
 
         let first = sdk.stop(started.session_id).await.unwrap();
@@ -904,7 +904,7 @@ mod tests {
     async fn cancellable_exec_waits_for_session_cleanup() {
         let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
         let mut spec = RunSpec::command(long_running_command());
-        spec.kill_grace = Duration::from_millis(20);
+        spec.kill_grace = Duration::from_millis(200);
         let (cancel, cancellation) = oneshot::channel();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -939,7 +939,7 @@ mod tests {
     async fn shutdown_stops_and_forgets_connection_owned_sessions() {
         let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
         let mut spec = RunSpec::command(long_running_command());
-        spec.kill_grace = Duration::from_millis(20);
+        spec.kill_grace = Duration::from_millis(200);
         let first = sdk.start(spec.clone()).await.unwrap();
         let second = sdk.start(spec).await.unwrap();
 
@@ -964,7 +964,7 @@ mod tests {
             SessionRegistryConfig::new(NonZeroUsize::new(1).unwrap(), Duration::from_secs(1)),
         );
         let mut spec = RunSpec::command(long_running_command());
-        spec.kill_grace = Duration::from_millis(20);
+        spec.kill_grace = Duration::from_millis(200);
         let first = sdk.start(spec.clone()).await.unwrap();
 
         assert!(matches!(
@@ -1010,7 +1010,7 @@ mod tests {
             SessionRegistryConfig::new(NonZeroUsize::new(1).unwrap(), Duration::from_secs(1)),
         );
         let mut spec = RunSpec::command(long_running_command());
-        spec.kill_grace = Duration::from_millis(20);
+        spec.kill_grace = Duration::from_millis(200);
         let started = sdk.start(spec.clone()).await.unwrap();
 
         let removed = sdk.remove(started.session_id).await.unwrap().unwrap();

@@ -52,6 +52,48 @@ fn stdio_has_one_json_response_per_request() {
     assert!(trailing.is_empty(), "unexpected stdout: {trailing}");
 }
 
+#[test]
+fn stdio_rejects_schema_bypass_arguments() {
+    let (mut child, mut stdin, responses, reader) = spawn_server();
+    initialize(&mut stdin, &responses);
+    let requests = [
+        json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"sandbox_exec","arguments":{
+                "argv":["/usr/bin/printf","not-run"],"unexpected":true
+            }}
+        }),
+        json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"sandbox_exec","arguments":{
+                "argv":["/usr/bin/printf","not-run"],"unlimited":true,"timeout_ms":1
+            }}
+        }),
+        json!({
+            "jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"sandbox_io","arguments":{
+                "session_id":"00000000-0000-0000-0000-000000000000","max_bytes":0
+            }}
+        }),
+        json!({
+            "jsonrpc":"2.0","id":5,"method":"tools/call",
+            "params":{"name":"sandbox_io","arguments":{
+                "session_id":"00000000-0000-0000-0000-000000000000","rows":24
+            }}
+        }),
+    ];
+    for request in requests {
+        write_request(&mut stdin, &request);
+        let response = read_response(&responses);
+        assert_eq!(response.get("id"), request.get("id"));
+        assert_eq!(response.pointer("/result/isError"), Some(&json!(true)));
+    }
+    drop(stdin);
+    assert!(wait_for_child(&mut child).success());
+    reader.join().unwrap();
+    assert!(responses.try_iter().next().is_none());
+}
+
 #[cfg(unix)]
 #[test]
 fn large_waiting_exec_is_bounded_and_continues_with_sandbox_io() {

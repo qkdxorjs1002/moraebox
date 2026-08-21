@@ -39,6 +39,8 @@ const PROTOCOL_VERSION: &str = "2026-07-28";
 const MAX_CONCURRENT_REQUESTS: usize = 32;
 const RESPONSE_QUEUE_CAPACITY: usize = 128;
 const SANDBOX_EXEC_INLINE_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_MCP_STDIN_BYTES: usize = 1024 * 1024;
+const MAX_MCP_STDIN_BASE64_CHARS: usize = MAX_MCP_STDIN_BYTES.div_ceil(3) * 4;
 type InflightRequests = Arc<StdMutex<HashMap<String, Option<oneshot::Sender<()>>>>>;
 const SERVER_INSTRUCTIONS: &str = concat!(
     "Use sandbox_exec when a command benefits from a disposable execution environment, ",
@@ -659,7 +661,12 @@ async fn sandbox_exec_with_inline_limit(
     spec.tty = args.tty;
     spec.network = args.network;
     spec.timeout = match (args.unlimited, args.timeout_ms) {
-        (true, _) => TimeoutPolicy::Unlimited,
+        (true, Some(_)) => {
+            return Err(ExecError::Failed(
+                "unlimited=true cannot be combined with timeout_ms".into(),
+            ));
+        }
+        (true, None) => TimeoutPolicy::Unlimited,
         (false, Some(milliseconds)) if milliseconds > 0 => TimeoutPolicy::Limited(milliseconds),
         (false, Some(_)) => {
             return Err(ExecError::Failed(
@@ -668,11 +675,9 @@ async fn sandbox_exec_with_inline_limit(
         }
         (false, None) => TimeoutPolicy::default(),
     };
-    if let Some(input) = args.stdin_base64 {
-        spec.stdin = STANDARD
-            .decode(input)
-            .map_err(|error| ExecError::Failed(error.to_string()))?;
-    }
+    spec.stdin = decode_bounded_stdin(args.stdin_base64)
+        .map_err(ExecError::Failed)?
+        .unwrap_or_default();
     if args.wait {
         let result = match cancellation {
             Some(cancellation) => {
@@ -701,11 +706,9 @@ async fn sandbox_exec_with_inline_limit(
 
 async fn sandbox_io(sdk: &SandboxSdk, arguments: Value) -> Result<Value, String> {
     let args: IoArgs = serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+    validate_io_args(&args)?;
     let session_id = SessionId::from_str(&args.session_id).map_err(|error| error.to_string())?;
-    let stdin = args
-        .stdin_base64
-        .map(|input| STANDARD.decode(input).map_err(|error| error.to_string()))
-        .transpose()?;
+    let stdin = decode_bounded_stdin(args.stdin_base64)?;
     let resize = args.rows.zip(args.columns);
     let signal = args.signal.as_deref().map(parse_signal).transpose()?;
     let result = sdk
@@ -723,6 +726,39 @@ async fn sandbox_io(sdk: &SandboxSdk, arguments: Value) -> Result<Value, String>
         .await
         .map_err(|error| error.to_string())?;
     Ok(io_json(&result))
+}
+
+fn validate_io_args(args: &IoArgs) -> Result<(), String> {
+    if !(1..=MAX_IO_OUTPUT_READ_BYTES).contains(&args.max_bytes) {
+        return Err(format!(
+            "max_bytes must be between 1 and {MAX_IO_OUTPUT_READ_BYTES}"
+        ));
+    }
+    match (args.rows, args.columns) {
+        (None, None) => Ok(()),
+        (Some(rows), Some(columns)) if rows > 0 && columns > 0 => Ok(()),
+        (Some(_), Some(_)) => Err("rows and columns must be greater than zero".into()),
+        _ => Err("rows and columns must be provided together".into()),
+    }
+}
+
+fn decode_bounded_stdin(input: Option<String>) -> Result<Option<Vec<u8>>, String> {
+    let Some(input) = input else {
+        return Ok(None);
+    };
+    if input.len() > MAX_MCP_STDIN_BASE64_CHARS {
+        return Err(format!(
+            "stdin_base64 exceeds the {MAX_MCP_STDIN_BYTES}-byte decoded input limit"
+        ));
+    }
+    let decoded = STANDARD.decode(input).map_err(|error| error.to_string())?;
+    if decoded.len() > MAX_MCP_STDIN_BYTES {
+        return Err(format!(
+            "stdin_base64 decodes to {} bytes, exceeding the {MAX_MCP_STDIN_BYTES}-byte limit",
+            decoded.len()
+        ));
+    }
+    Ok(Some(decoded))
 }
 
 async fn sandbox_stop(sdk: &SandboxSdk, arguments: Value) -> Result<Value, String> {
@@ -986,7 +1022,7 @@ fn tools_list() -> Value {
                     "type": "object",
                     "properties": {
                         "argv": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-                        "stdin_base64": { "type": "string" },
+                        "stdin_base64": { "type": "string", "maxLength": MAX_MCP_STDIN_BASE64_CHARS },
                         "box_id": { "type": "string", "format": "uuid", "description": "Persistent Box root filesystem to reuse; the microVM and SessionId remain new." },
                         "timeout_ms": { "type": "integer", "minimum": 1 },
                         "unlimited": { "type": "boolean", "default": false },
@@ -994,7 +1030,8 @@ fn tools_list() -> Value {
                         "tty": { "type": "boolean", "default": false },
                         "wait": { "type": "boolean", "default": true }
                     },
-                    "required": ["argv"]
+                    "required": ["argv"],
+                    "additionalProperties": false
                 },
                 "annotations": { "destructiveHint": false, "openWorldHint": true }
             },
@@ -1008,13 +1045,14 @@ fn tools_list() -> Value {
                         "session_id": { "type": "string" },
                         "cursor": { "type": "integer", "minimum": 0, "default": 0 },
                         "max_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_IO_OUTPUT_READ_BYTES, "default": 1_048_576 },
-                        "stdin_base64": { "type": "string" },
+                        "stdin_base64": { "type": "string", "maxLength": MAX_MCP_STDIN_BASE64_CHARS },
                         "close_stdin": { "type": "boolean", "default": false },
-                        "rows": { "type": "integer", "minimum": 1 },
-                        "columns": { "type": "integer", "minimum": 1 },
+                        "rows": { "type": "integer", "minimum": 1, "maximum": 65_535 },
+                        "columns": { "type": "integer", "minimum": 1, "maximum": 65_535 },
                         "signal": { "type": "string", "enum": ["INT", "TERM", "KILL", "HUP"] }
                     },
-                    "required": ["session_id"]
+                    "required": ["session_id"],
+                    "additionalProperties": false
                 },
                 "annotations": { "destructiveHint": false, "openWorldHint": false }
             },
@@ -1025,7 +1063,8 @@ fn tools_list() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": { "session_id": { "type": "string" } },
-                    "required": ["session_id"]
+                    "required": ["session_id"],
+                    "additionalProperties": false
                 },
                 "annotations": { "destructiveHint": true, "idempotentHint": true, "openWorldHint": false }
             },
@@ -1124,7 +1163,7 @@ fn tools_list() -> Value {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 struct ExecArgs {
     argv: Vec<String>,
@@ -1153,7 +1192,7 @@ impl Default for ExecArgs {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct IoArgs {
     session_id: String,
     cursor: u64,
@@ -1181,6 +1220,7 @@ impl Default for IoArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StopArgs {
     session_id: String,
 }
@@ -1335,6 +1375,14 @@ mod tests {
             Some(&json!("uuid"))
         );
         assert_eq!(
+            list.pointer("/result/tools/0/inputSchema/additionalProperties"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            list.pointer("/result/tools/1/inputSchema/properties/rows/maximum"),
+            Some(&json!(u16::MAX))
+        );
+        assert_eq!(
             list.pointer("/result/tools/0/annotations/openWorldHint"),
             Some(&json!(true))
         );
@@ -1444,6 +1492,82 @@ mod tests {
             sdk.wait(session_id).await,
             Err(SdkError::UnknownSession(id)) if id == session_id
         ));
+    }
+
+    #[tokio::test]
+    async fn tool_handlers_reject_schema_bypasses_before_execution() {
+        let server = test_server(SandboxSdk::new(Arc::new(ProcessBackend)));
+        let cases = [
+            (
+                "sandbox_exec",
+                json!({ "argv": successful_command(), "unknown": true }),
+                "unknown field",
+            ),
+            (
+                "sandbox_exec",
+                json!({
+                    "argv": successful_command(),
+                    "unlimited": true,
+                    "timeout_ms": 10
+                }),
+                "cannot be combined",
+            ),
+            (
+                "sandbox_io",
+                json!({ "session_id": SessionId::new(), "max_bytes": 0 }),
+                "max_bytes must be between",
+            ),
+            (
+                "sandbox_io",
+                json!({ "session_id": SessionId::new(), "rows": 24 }),
+                "provided together",
+            ),
+            (
+                "sandbox_io",
+                json!({ "session_id": SessionId::new(), "rows": 0, "columns": 80 }),
+                "greater than zero",
+            ),
+            (
+                "sandbox_io",
+                json!({ "session_id": SessionId::new(), "rows": 65_536, "columns": 80 }),
+                "invalid value",
+            ),
+        ];
+        for (index, (name, arguments, expected)) in cases.into_iter().enumerate() {
+            let response = handle_request(
+                &server,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": "tools/call",
+                    "params": { "name": name, "arguments": arguments }
+                }),
+            )
+            .await;
+            assert_eq!(response.pointer("/result/isError"), Some(&json!(true)));
+            let message = response
+                .pointer("/result/structuredContent/error")
+                .and_then(Value::as_str)
+                .unwrap();
+            assert!(
+                message.contains(expected),
+                "expected {expected:?} in {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stdin_decoder_rejects_encoded_and_decoded_oversize_inputs() {
+        let oversized = STANDARD.encode(vec![0_u8; MAX_MCP_STDIN_BYTES + 1]);
+        let error = decode_bounded_stdin(Some(oversized)).unwrap_err();
+        assert!(error.contains("decoded input limit") || error.contains("decodes to"));
+
+        let encoded_oversize = "A".repeat(MAX_MCP_STDIN_BASE64_CHARS + 1);
+        assert!(
+            decode_bounded_stdin(Some(encoded_oversize))
+                .unwrap_err()
+                .contains("decoded input limit")
+        );
     }
 
     #[test]

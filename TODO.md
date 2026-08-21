@@ -137,7 +137,7 @@
   - 큰 result를 `content.text`와 `structuredContent`에 두 번 복사하지 않는다.
   - 기본 output 형식은 현재의 lossy UTF-8 `text`를 유지한다.
 
-- [ ] MCP 입력을 server-side에서도 엄격히 검증한다.
+- [x] MCP 입력을 server-side에서도 엄격히 검증한다.
   - unknown field, `max_bytes`, stdin decoded size, rows/columns pair, TTY dimensions를 검증한다.
   - `unlimited=true`와 `timeout_ms` 동시 지정은 ambiguity 오류로 처리한다.
 
