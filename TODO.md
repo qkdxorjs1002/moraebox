@@ -250,9 +250,10 @@
   - exec, streaming I/O, signal, resize, copy-in/out frame과 size/path validation을 포함한다.
   - MCP stdout과 guest protocol diagnostics가 섞이지 않게 한다.
 
-- [ ] single-use prepared pool을 실제 startup 경로에 통합하고 warm lease p50/p95/p99를 측정한다.
+- [x] single-use prepared pool을 실제 startup 경로에 통합하고 warm lease p50/p95/p99를 측정한다.
+  - 장기 실행되는 MCP와 native benchmark는 아직 실행되지 않은 CoW root artifact만 준비하며, 매 실행은 새 microVM을 시작한다.
   - 아직 untrusted command를 실행하지 않은 prepared unit만 lease한다.
-  - lease 반환 후 VM을 재사용하지 않고 파기·보충한다.
+  - lease 소비 후 실행된 VM과 root disk를 재사용하지 않고 파기·보충한다.
   - image pull, template build, workspace import 시간을 warm lease SLO와 분리한다.
 
 - [ ] live PTY resize를 SIGWINCH부터 native controller까지 연결한다.

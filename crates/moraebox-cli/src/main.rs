@@ -27,8 +27,8 @@ use moraebox_image::{
 };
 use moraebox_runtime::{
     Backend, BackendCapabilities, DiskToolPaths, DoctorReport, IsolationLevel, LibkrunBackend,
-    NativeRuntimePaths, ProcessBackend, RunBudget, RunStage, SessionError, SessionHandle,
-    SessionManager, SessionStatus, Supervisor,
+    NativeRuntimePaths, PoolConfig, PreparedRootPool, ProcessBackend, RunBudget, RunStage,
+    SessionError, SessionHandle, SessionManager, SessionStatus, Supervisor,
 };
 use moraebox_sdk::{ManagedStorage, NativeRuntimeOverrides, NativeSandboxConfig};
 use serde::Serialize;

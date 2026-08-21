@@ -37,6 +37,15 @@ pub struct PreparedPool<K, V> {
     state: Mutex<PoolState<K, V>>,
 }
 
+impl<K, V> std::fmt::Debug for PreparedPool<K, V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedPool")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<K, V> PreparedPool<K, V>
 where
     K: Eq + Hash + Clone,
@@ -226,6 +235,19 @@ mod tests {
         let lease = pool.lease(&"key").await.unwrap();
         assert_eq!(lease.into_inner(), 7);
         assert!(pool.lease(&"key").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn lease_never_crosses_prepared_keys() {
+        let pool = PreparedPool::new(PoolConfig {
+            max_size: 2,
+            idle_ttl: Duration::from_secs(1),
+        })
+        .unwrap();
+        pool.put("image-a", 7).await.unwrap();
+
+        assert!(pool.lease(&"image-b").await.is_none());
+        assert_eq!(pool.lease(&"image-a").await.unwrap().into_inner(), 7);
     }
 
     #[tokio::test]

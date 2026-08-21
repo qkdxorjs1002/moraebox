@@ -23,7 +23,9 @@ pub use doctor::{
     CacheVolumeProbe, DiskToolPaths, DoctorCheck, DoctorCheckStatus, DoctorReport, LibraryProbe,
     NativeBinaryProbe, NativeRuntimePaths, NetworkProbe, ToolProbe,
 };
-pub use libkrun::{BoxRootSource, BoxRuntimeConfig, LibkrunBackend, LibkrunConfig};
+pub use libkrun::{
+    BoxRootSource, BoxRuntimeConfig, LibkrunBackend, LibkrunConfig, PreparedRootPool,
+};
 pub use pool::{PoolConfig, PoolError, PoolStats, PreparedKey, PreparedLease, PreparedPool};
 pub use process::ProcessBackend;
 pub use session::{

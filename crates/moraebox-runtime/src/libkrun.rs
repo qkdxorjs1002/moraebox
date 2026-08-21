@@ -7,8 +7,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use moraebox_box::{BaseDiskSpec, BaseDiskStore, BoxState, BoxStore, EphemeralDiskStore};
-use moraebox_core::{OutputChannel, RunSpec, Signal};
+use moraebox_box::{
+    BaseDisk, BaseDiskSpec, BaseDiskStore, BoxState, BoxStore, EphemeralDisk, EphemeralDiskStore,
+};
+use moraebox_core::{OutputChannel, RunSpec, SessionId, Signal};
 use tokio::{
     process::{Child, Command},
     time::Instant,
@@ -18,8 +20,8 @@ use tokio::{task::JoinHandle, time::sleep};
 
 use crate::{
     Backend, BackendCapabilities, BackendController, BackendError, CapabilitySupport,
-    IsolationLevel, RootMode, RunBudget, RunStage, SpawnedSandbox, StartupMetrics,
-    doctor::validate_native_runtime_for_spawn, environment::resolve_environment,
+    IsolationLevel, PreparedKey, PreparedPool, RootMode, RunBudget, RunStage, SpawnedSandbox,
+    StartupMetrics, doctor::validate_native_runtime_for_spawn, environment::resolve_environment,
 };
 
 mod network;
@@ -30,6 +32,8 @@ use network::NetworkProxy;
 use network::vfkit_socket_uri;
 pub(crate) use network::{append_bounded_tail, probe_vfkit_endpoint, stderr_diagnostics};
 use root::{ManagedRootLease, PreparedRoot, box_backend_error, repair_dirty_box};
+
+pub type PreparedRootPool = PreparedPool<PreparedKey, EphemeralDisk>;
 
 const NETWORK_PROXY_START_TIMEOUT: Duration = Duration::from_secs(5);
 const NETWORK_PROXY_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -186,6 +190,8 @@ impl LibkrunConfig {
 pub struct LibkrunBackend {
     config: LibkrunConfig,
     box_runtime: Option<BoxRuntimeConfig>,
+    prepared_roots: Option<Arc<PreparedRootPool>>,
+    workspace_digest: Option<String>,
 }
 
 impl LibkrunBackend {
@@ -203,12 +209,31 @@ impl LibkrunBackend {
         Self {
             config,
             box_runtime: None,
+            prepared_roots: None,
+            workspace_digest: None,
         }
     }
 
     #[must_use]
     pub fn with_box_runtime(mut self, config: BoxRuntimeConfig) -> Self {
         self.box_runtime = Some(config);
+        self
+    }
+
+    /// Enables single-use prepared ephemeral root artifacts for long-lived backends.
+    ///
+    /// A leased artifact is consumed by exactly one helper invocation and is never returned to
+    /// the pool. Persistent Boxes and unmanaged directory/static-disk roots bypass this pool.
+    #[must_use]
+    pub fn with_prepared_pool(mut self, pool: Arc<PreparedRootPool>) -> Self {
+        self.prepared_roots = Some(pool);
+        self
+    }
+
+    /// Adds the immutable workspace image identity to prepared artifact pool keys.
+    #[must_use]
+    pub fn with_workspace_digest(mut self, digest: impl Into<String>) -> Self {
+        self.workspace_digest = Some(digest.into());
         self
     }
 }
@@ -255,6 +280,8 @@ impl Backend for LibkrunBackend {
         };
         startup.root_prepare_micros = Some(elapsed_micros(root_started));
         startup.root_mode = root_startup.root_mode;
+        startup.prepared_pool_hit = root_startup.prepared_pool_hit;
+        startup.prepared_lease_micros = root_startup.prepared_lease_micros;
         startup.cache_lookup_micros = root_startup.cache_lookup_micros;
         startup.box_lock_micros = root_startup.box_lock_micros;
         startup.base_prepare_micros = root_startup.base_prepare_micros;
@@ -390,7 +417,7 @@ impl LibkrunBackend {
         if let Some(box_id) = spec.box_id {
             return Self::prepare_persistent_root(runtime, box_id, budget).await;
         }
-        Self::prepare_ephemeral_root(runtime, spec, budget).await
+        self.prepare_ephemeral_root(runtime, spec, budget).await
     }
 
     async fn prepare_persistent_root(
@@ -432,6 +459,7 @@ impl LibkrunBackend {
     }
 
     async fn prepare_ephemeral_root(
+        &self,
         runtime: &BoxRuntimeConfig,
         spec: &RunSpec,
         budget: &RunBudget,
@@ -447,6 +475,11 @@ impl LibkrunBackend {
             source.platform,
             source.virtual_size_bytes,
         );
+        let prepared_key = PreparedKey {
+            image_digest: base_spec.manifest_digest.clone(),
+            workspace_digest: self.workspace_digest.clone(),
+            policy_digest: base_spec.key().map_err(box_backend_error)?,
+        };
         let lookup_store = base_store.clone();
         let lookup_spec = base_spec.clone();
         let lookup_started = Instant::now();
@@ -489,25 +522,69 @@ impl LibkrunBackend {
             base
         };
         let ephemeral_store = runtime.ephemeral_disks.clone();
-        let session_id = spec.session_id;
-        let clone_started = Instant::now();
-        let disk = budget
-            .run(RunStage::EphemeralDiskClone, async move {
-                tokio::task::spawn_blocking(move || {
-                    ephemeral_store.clone_for_session(&base, session_id)
+        let lease_started = Instant::now();
+        let prepared = if let Some(pool) = &self.prepared_roots {
+            let lease = pool.lease(&prepared_key).await;
+            startup.prepared_pool_hit = Some(lease.is_some());
+            startup.prepared_lease_micros = Some(elapsed_micros(lease_started));
+            lease.map(crate::PreparedLease::into_inner)
+        } else {
+            None
+        };
+        let disk = if let Some(disk) = prepared {
+            disk
+        } else {
+            let clone_store = ephemeral_store.clone();
+            let clone_base = base.clone();
+            let session_id = spec.session_id;
+            let clone_started = Instant::now();
+            let disk = budget
+                .run(RunStage::EphemeralDiskClone, async move {
+                    clone_ephemeral_disk(clone_store, clone_base, session_id).await
                 })
                 .await
-                .map_err(|error| BackendError::Control(format!("CoW clone task failed: {error}")))?
-                .map_err(box_backend_error)
-            })
-            .await
-            .map_err(BackendError::from)?;
-        startup.disk_clone_micros = Some(elapsed_micros(clone_started));
+                .map_err(BackendError::from)?;
+            startup.disk_clone_micros = Some(elapsed_micros(clone_started));
+            disk
+        };
+        if let Some(pool) = &self.prepared_roots {
+            replenish_prepared_root(pool, prepared_key, ephemeral_store, base);
+        }
         Ok((
             PreparedRoot::Managed(ManagedRootLease::Ephemeral(disk)),
             startup,
         ))
     }
+}
+
+async fn clone_ephemeral_disk(
+    store: EphemeralDiskStore,
+    base: BaseDisk,
+    session_id: SessionId,
+) -> Result<EphemeralDisk, BackendError> {
+    tokio::task::spawn_blocking(move || store.clone_for_session(&base, session_id))
+        .await
+        .map_err(|error| BackendError::Control(format!("CoW clone task failed: {error}")))?
+        .map_err(box_backend_error)
+}
+
+fn replenish_prepared_root(
+    pool: &Arc<PreparedRootPool>,
+    key: PreparedKey,
+    store: EphemeralDiskStore,
+    base: BaseDisk,
+) {
+    let pool = Arc::downgrade(pool);
+    tokio::spawn(async move {
+        let Some(pool) = pool.upgrade() else {
+            return;
+        };
+        let _ = pool
+            .replenish(key, 1, || {
+                clone_ephemeral_disk(store.clone(), base.clone(), SessionId::new())
+            })
+            .await;
+    });
 }
 
 fn spawn_piped(
@@ -1133,6 +1210,76 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn prepared_roots_are_leased_once_replenished_and_destroyed() {
+        let fixture =
+            ManagedFixture::new("#!/bin/sh\nprintf '%s\\n' \"$@\"\n", "#!/bin/sh\nexit 0\n");
+        let rootfs = fixture.state.path().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        fs::write(rootfs.join("payload"), b"rootfs").unwrap();
+        let mke2fs = fixture.state.path().join("mke2fs");
+        write_executable(&mke2fs, "#!/bin/sh\nexit 0\n");
+        let source = BoxRootSource {
+            rootfs_path: rootfs,
+            manifest_digest: "sha256:prepared-root".into(),
+            platform: "linux/arm64".into(),
+            virtual_size_bytes: MANAGED_TEST_DISK_BYTES,
+            mke2fs_path: mke2fs,
+        };
+        let runtime_root = fixture.state.path().join("runtime");
+        let pool = Arc::new(
+            PreparedRootPool::new(crate::PoolConfig {
+                max_size: 2,
+                idle_ttl: Duration::from_secs(60),
+            })
+            .unwrap(),
+        );
+        let backend = fixture
+            .backend(Some((source, runtime_root.clone())))
+            .with_prepared_pool(Arc::clone(&pool));
+        let supervisor = crate::Supervisor::new(backend);
+
+        let cold = supervisor
+            .run(RunSpec::command(["/usr/bin/true"]))
+            .await
+            .unwrap();
+        assert_eq!(cold.startup.prepared_pool_hit, Some(false));
+        assert!(cold.startup.prepared_lease_micros.is_some());
+        assert!(cold.startup.disk_clone_micros.is_some());
+        wait_for_pool_ready(&pool).await;
+
+        let first_warm = supervisor
+            .run(RunSpec::command(["/usr/bin/true"]))
+            .await
+            .unwrap();
+        assert_eq!(first_warm.startup.prepared_pool_hit, Some(true));
+        assert!(first_warm.startup.prepared_lease_micros.is_some());
+        assert_eq!(first_warm.startup.disk_clone_micros, None);
+        let first_path = root_disk_argument(&first_warm);
+        wait_for_pool_ready(&pool).await;
+
+        let second_warm = supervisor
+            .run(RunSpec::command(["/usr/bin/true"]))
+            .await
+            .unwrap();
+        assert_eq!(second_warm.startup.prepared_pool_hit, Some(true));
+        assert_eq!(second_warm.startup.disk_clone_micros, None);
+        assert_ne!(first_path, root_disk_argument(&second_warm));
+        wait_for_pool_ready(&pool).await;
+
+        drop(supervisor);
+        drop(pool);
+        let ephemeral = runtime_root.join("ephemeral-boxes");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fs::read_dir(&ephemeral).is_ok_and(|entries| entries.count() != 0) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dropping the pool must destroy every unleased prepared root");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn native_preflight_failure_precedes_root_and_network_side_effects() {
         let fixture = ManagedFixture::new("#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
         let rootfs = fixture.state.path().join("rootfs");
@@ -1539,6 +1686,34 @@ mod tests {
         })
         .await
         .expect("child process did not publish its pid");
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pool_ready(pool: &PreparedRootPool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while pool.stats().await.ready == 0 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("prepared root replenishment did not finish");
+    }
+
+    #[cfg(unix)]
+    fn root_disk_argument(report: &crate::RunReport) -> PathBuf {
+        let output = report
+            .output
+            .iter()
+            .flat_map(|chunk| chunk.data.iter().copied())
+            .collect::<Vec<_>>();
+        let output = String::from_utf8(output).unwrap();
+        let mut arguments = output.lines();
+        while let Some(argument) = arguments.next() {
+            if argument == "--root-disk" {
+                return PathBuf::from(arguments.next().expect("root disk path follows flag"));
+            }
+        }
+        panic!("helper arguments did not contain --root-disk");
     }
 
     #[cfg(unix)]

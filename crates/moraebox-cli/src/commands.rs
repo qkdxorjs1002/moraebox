@@ -1,5 +1,5 @@
 use super::{
-    Backend, BackendCapabilities, BaseDiskSpec, BaseDiskStore, BenchmarkArgs, BoxCloneArgs,
+    Arc, Backend, BackendCapabilities, BaseDiskSpec, BaseDiskStore, BenchmarkArgs, BoxCloneArgs,
     BoxCommand, BoxCreateArgs, BoxDeleteArgs, BoxId, BoxListArgs, BoxMetadata, BoxRepairArgs,
     BoxRepairReport, BoxResetArgs, BoxShowArgs, BoxStore, CacheCleanArgs, CacheCommand,
     CacheInfoArgs, CachePruneArgs, CacheReconcileArgs, CacheReconcileReport, CacheUsage,
@@ -9,10 +9,10 @@ use super::{
     ImageProgressStage, ImagePullArgs, ImagePullPolicy, ImageRemoveArgs, IsTerminal,
     IsolationLevel, LibkrunBackend, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, ManagedStorage,
     NativeRuntimeOverrides, NativeRuntimePaths, NativeSandboxConfig, OutputChannel, Path, Platform,
-    PreparedImage, ProcessBackend, PruneReport, Read, RemoveReport, RootfsMetadataIssueKind,
-    RunArgs, RunBudget, RunSpec, RunStage, Serialize, StoragePaths, Supervisor, TimeoutPolicy,
-    WorkspaceSnapshot, WorkspaceStage, Write, command_stage, fs, io, resolve_cache_dir,
-    resolve_state_dir, run_interactive,
+    PoolConfig, PreparedImage, PreparedRootPool, ProcessBackend, PruneReport, Read, RemoveReport,
+    RootfsMetadataIssueKind, RunArgs, RunBudget, RunSpec, RunStage, Serialize, StoragePaths,
+    Supervisor, TimeoutPolicy, WorkspaceSnapshot, WorkspaceStage, Write, command_stage, fs, io,
+    resolve_cache_dir, resolve_state_dir, run_interactive,
 };
 use std::collections::BTreeMap;
 
@@ -418,7 +418,10 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, CliErrorSourc
                     .map(|snapshot| snapshot.image_path.clone()),
             )?;
             let runtime = native.box_runtime(&storage, root_source);
-            let backend = LibkrunBackend::new(config).with_box_runtime(runtime);
+            let mut backend = LibkrunBackend::new(config).with_box_runtime(runtime);
+            if let Some(workspace) = &workspace {
+                backend = backend.with_workspace_digest(workspace.image_digest.to_string());
+            }
             if workspace.is_some() {
                 progress.workspace_message("attaching read-only image");
             }
@@ -1109,8 +1112,16 @@ async fn benchmark(args: BenchmarkArgs, global: &GlobalOptions) -> Result<i32, C
                 None,
             )?;
             let runtime = native.box_runtime(&storage, root_source);
+            let prepared_roots = Arc::new(
+                PreparedRootPool::new(PoolConfig::default())
+                    .expect("default prepared pool config is valid"),
+            );
             let mut report = run_benchmark(
-                &Supervisor::new(LibkrunBackend::new(config).with_box_runtime(runtime)),
+                &Supervisor::new(
+                    LibkrunBackend::new(config)
+                        .with_box_runtime(runtime)
+                        .with_prepared_pool(prepared_roots),
+                ),
                 command,
                 args.iterations,
                 args.box_id,
@@ -1171,6 +1182,10 @@ async fn run_benchmark<B: Backend>(
     let mut box_lock_samples = Vec::new();
     let mut disk_clone_samples = Vec::new();
     let mut helper_spawn_samples = Vec::new();
+    let mut prepared_ready_samples = Vec::new();
+    let mut prepared_lease_samples = Vec::new();
+    let mut prepared_pool_hits = 0_u32;
+    let mut prepared_pool_misses = 0_u32;
     let mut failures = 0_u32;
     for _ in 0..iterations {
         let mut spec = RunSpec::command(command.clone());
@@ -1182,12 +1197,27 @@ async fn run_benchmark<B: Backend>(
             failures += 1;
         }
         samples.push(report.elapsed_micros);
-        if let Some(command_started) = report
+        let command_started = report
             .trace
             .iter()
             .find(|event| event.kind == moraebox_runtime::TraceKind::CommandStarted)
-        {
-            backend_ready_samples.push(command_started.elapsed_micros);
+            .map(|event| event.elapsed_micros);
+        if let Some(command_started) = command_started {
+            backend_ready_samples.push(command_started);
+        }
+        match report.startup.prepared_pool_hit {
+            Some(true) => {
+                prepared_pool_hits += 1;
+                if let Some(command_started) = command_started {
+                    prepared_ready_samples.push(command_started);
+                }
+                extend_if_some(
+                    &mut prepared_lease_samples,
+                    report.startup.prepared_lease_micros,
+                );
+            }
+            Some(false) => prepared_pool_misses += 1,
+            None => {}
         }
         if let Some(first_output) = report
             .trace
@@ -1231,6 +1261,14 @@ async fn run_benchmark<B: Backend>(
         box_lock_p95_micros: optional_percentile(&mut box_lock_samples, 95),
         disk_clone_p95_micros: optional_percentile(&mut disk_clone_samples, 95),
         helper_spawn_p95_micros: optional_percentile(&mut helper_spawn_samples, 95),
+        prepared_pool_hits,
+        prepared_pool_misses,
+        prepared_ready_p50_micros: optional_percentile(&mut prepared_ready_samples, 50),
+        prepared_ready_p95_micros: optional_percentile(&mut prepared_ready_samples, 95),
+        prepared_ready_p99_micros: optional_percentile(&mut prepared_ready_samples, 99),
+        prepared_lease_p50_micros: optional_percentile(&mut prepared_lease_samples, 50),
+        prepared_lease_p95_micros: optional_percentile(&mut prepared_lease_samples, 95),
+        prepared_lease_p99_micros: optional_percentile(&mut prepared_lease_samples, 99),
     })
 }
 
@@ -1292,6 +1330,14 @@ struct BenchmarkReport {
     box_lock_p95_micros: Option<u64>,
     disk_clone_p95_micros: Option<u64>,
     helper_spawn_p95_micros: Option<u64>,
+    prepared_pool_hits: u32,
+    prepared_pool_misses: u32,
+    prepared_ready_p50_micros: Option<u64>,
+    prepared_ready_p95_micros: Option<u64>,
+    prepared_ready_p99_micros: Option<u64>,
+    prepared_lease_p50_micros: Option<u64>,
+    prepared_lease_p95_micros: Option<u64>,
+    prepared_lease_p99_micros: Option<u64>,
 }
 
 fn platform_name(platform: &Platform) -> String {
@@ -1961,5 +2007,14 @@ mod tests {
             "cached-one-shot"
         );
         assert_eq!(benchmark_mode(ProcessBackend::CAPABILITIES), "host-process");
+    }
+
+    #[test]
+    fn prepared_benchmark_percentiles_use_only_available_warm_samples() {
+        let mut samples = [50, 10, 40, 20, 30];
+        assert_eq!(optional_percentile(&mut samples, 50), Some(30));
+        assert_eq!(optional_percentile(&mut samples, 95), Some(50));
+        assert_eq!(optional_percentile(&mut samples, 99), Some(50));
+        assert_eq!(optional_percentile(&mut [], 50), None);
     }
 }

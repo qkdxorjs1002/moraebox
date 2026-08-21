@@ -80,6 +80,10 @@ pub struct StartupMetrics {
     #[serde(default)]
     pub resolved_image_digest: Option<String>,
     pub root_mode: Option<RootMode>,
+    #[serde(default)]
+    pub prepared_pool_hit: Option<bool>,
+    #[serde(default)]
+    pub prepared_lease_micros: Option<u64>,
     pub network_setup_micros: Option<u64>,
     pub root_prepare_micros: Option<u64>,
     pub cache_lookup_micros: Option<u64>,

@@ -32,8 +32,8 @@ use moraebox_core::{
 use moraebox_image::{Credentials, ImageCache, Platform};
 use moraebox_runtime::{
     Backend, BackendCapabilities, BackendError, BoxRootSource, BoxRuntimeConfig, DiskToolPaths,
-    LibkrunBackend, LibkrunConfig, ProcessBackend, RunBudget, RunStage, SessionError,
-    SpawnedSandbox, StageError,
+    LibkrunBackend, LibkrunConfig, PoolConfig, PreparedRootPool, ProcessBackend, RunBudget,
+    RunStage, SessionError, SpawnedSandbox, StageError,
 };
 use moraebox_sdk::{
     ExecutionPageResult, IoRequest, IoResult, MAX_IO_OUTPUT_READ_BYTES, ManagedStorage,
@@ -168,13 +168,16 @@ struct LazyImageBackend {
     reference: Option<String>,
     platform: Platform,
     credentials: Option<Credentials>,
+    prepared_roots: Arc<PreparedRootPool>,
 }
 
 impl LazyImageBackend {
     fn backend(&self, source: Option<BoxRootSource>) -> LibkrunBackend {
         let mut runtime = self.runtime.clone();
         runtime.source = source;
-        LibkrunBackend::new(self.config.clone()).with_box_runtime(runtime)
+        LibkrunBackend::new(self.config.clone())
+            .with_box_runtime(runtime)
+            .with_prepared_pool(Arc::clone(&self.prepared_roots))
     }
 
     async fn prepare(
@@ -367,11 +370,19 @@ fn create_server(args: ServerArgs) -> Result<McpServer, McpServerError> {
                 .unwrap_or_else(|| cache_dir.join("rootfs"));
             let config = native.libkrun_config(Some(root_path), storage, None)?;
             let runtime = native.box_runtime(storage, None);
+            let prepared_roots = Arc::new(
+                PreparedRootPool::new(PoolConfig::default())
+                    .expect("default prepared pool config is valid"),
+            );
             if let Some(rootfs) = args.rootfs {
                 let source = native.rootfs_source(rootfs, &platform)?;
                 let mut runtime = runtime;
                 runtime.source = Some(source);
-                Arc::new(LibkrunBackend::new(config).with_box_runtime(runtime))
+                Arc::new(
+                    LibkrunBackend::new(config)
+                        .with_box_runtime(runtime)
+                        .with_prepared_pool(prepared_roots),
+                )
             } else {
                 Arc::new(LazyImageBackend {
                     config,
@@ -381,6 +392,7 @@ fn create_server(args: ServerArgs) -> Result<McpServer, McpServerError> {
                     reference: args.image,
                     platform: platform.clone(),
                     credentials: credentials.clone(),
+                    prepared_roots,
                 })
             }
         }
