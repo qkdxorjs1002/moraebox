@@ -16,22 +16,21 @@ use std::{
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand};
-use moraebox_box::{
-    BaseDiskSpec, BaseDiskStore, BoxStore, BoxStoreError, CreateBox, EphemeralDiskStore,
-};
+use moraebox_box::{BaseDiskSpec, BaseDiskStore, BoxStore, BoxStoreError, CreateBox};
 use moraebox_core::{
     BoxId, DEFAULT_KILL_GRACE, DEFAULT_OUTPUT_LIMIT, ImagePullPolicy, MAX_KILL_GRACE,
     MAX_OUTPUT_LIMIT, OutputChunk, OutputReadError, RunSpec, SessionId, Signal, TimeoutPolicy,
     resolve_cache_dir, resolve_state_dir,
 };
-use moraebox_image::{Credentials, ImageCache, Platform, digest_tree};
+use moraebox_image::{Credentials, ImageCache, Platform};
 use moraebox_runtime::{
-    Backend, BackendCapabilities, BackendError, BoxRootSource, BoxRuntimeConfig, LibkrunBackend,
-    LibkrunConfig, NativeRuntimePaths, ProcessBackend, RunBudget, RunStage, SessionError,
+    Backend, BackendCapabilities, BackendError, BoxRootSource, BoxRuntimeConfig, DiskToolPaths,
+    LibkrunBackend, LibkrunConfig, ProcessBackend, RunBudget, RunStage, SessionError,
     SpawnedSandbox, StageError,
 };
 use moraebox_sdk::{
-    ExecutionPageResult, IoRequest, IoResult, MAX_IO_OUTPUT_READ_BYTES, SandboxSdk, SdkError,
+    ExecutionPageResult, IoRequest, IoResult, MAX_IO_OUTPUT_READ_BYTES, ManagedStorage,
+    NativeRuntimeOverrides, NativeSandboxConfig, SandboxSdk, SdkError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -157,12 +156,11 @@ struct BoxServices {
 struct LazyImageBackend {
     config: LibkrunConfig,
     runtime: BoxRuntimeConfig,
+    native: NativeSandboxConfig,
     images: ImageCache,
     reference: Option<String>,
     platform: Platform,
     credentials: Option<Credentials>,
-    virtual_size_bytes: u64,
-    mke2fs_path: PathBuf,
 }
 
 impl LazyImageBackend {
@@ -188,13 +186,9 @@ impl LazyImageBackend {
             .map_err(image_prepare_error)?;
         let digest = prepared.manifest_digest.clone();
         Ok((
-            self.backend(Some(BoxRootSource {
-                rootfs_path: prepared.rootfs,
-                manifest_digest: prepared.manifest_digest,
-                platform: platform_name(&self.platform),
-                virtual_size_bytes: self.virtual_size_bytes,
-                mke2fs_path: self.mke2fs_path.clone(),
-            })),
+            self.backend(Some(
+                self.native.prepared_image_source(prepared, &self.platform),
+            )),
             digest,
         ))
     }
@@ -365,14 +359,27 @@ fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error::Erro
     let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
     let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     let platform = Platform::host_linux();
-    let images = ImageCache::new(&cache_dir);
+    let managed_storage = (args.backend == "libkrun")
+        .then(|| ManagedStorage::open(&cache_dir, &state_dir))
+        .transpose()?;
+    let images = managed_storage.as_ref().map_or_else(
+        || ImageCache::new(&cache_dir),
+        |storage| storage.images().clone(),
+    );
     let credentials = args
         .registry_username
         .zip(args.registry_password)
         .map(|(username, password)| Credentials { username, password });
-    let box_store = BoxStore::new(&state_dir);
-    let base_disks = BaseDiskStore::new(&cache_dir);
-    let mke2fs_path = args.mke2fs.unwrap_or_else(default_mke2fs);
+    let box_store = managed_storage.as_ref().map_or_else(
+        || BoxStore::new(&state_dir),
+        |storage| storage.boxes().clone(),
+    );
+    let base_disks = managed_storage.as_ref().map_or_else(
+        || BaseDiskStore::new(&cache_dir),
+        |storage| storage.base_disks().clone(),
+    );
+    let disk_tools = DiskToolPaths::discover(args.mke2fs.clone(), args.e2fsck.clone());
+    let mke2fs_path = disk_tools.mke2fs_command();
     let backend: Arc<dyn Backend> = match args.backend.as_str() {
         "process" => {
             if args.rootfs.is_some() || args.image.is_some() {
@@ -381,48 +388,29 @@ fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error::Erro
             Arc::new(ProcessBackend)
         }
         "libkrun" => {
-            let paths = NativeRuntimePaths::discover_with_gvproxy(
-                args.helper,
-                args.libkrun,
-                args.lib_dir,
-                args.gvproxy,
+            let storage = managed_storage
+                .as_ref()
+                .expect("libkrun storage is initialized above");
+            let native = NativeSandboxConfig::discover(
+                NativeRuntimeOverrides {
+                    helper: args.helper,
+                    libkrun: args.libkrun,
+                    library_search_path: args.lib_dir,
+                    gvproxy: args.gvproxy,
+                },
+                disk_tools,
+                args.disk_size,
+                args.cpus,
+                args.memory_mib,
             );
-            let helper = paths.helper.ok_or(
-                "libkrun backend requires --helper, MORAE_HELPER_PATH, or a sibling morae-vmm-helper",
-            )?;
-            let library = paths.libkrun.ok_or(
-                "libkrun backend requires --libkrun, MORAE_LIBKRUN_PATH, or a supported Homebrew libkrun",
-            )?;
             let root_path = args
                 .rootfs
                 .clone()
                 .unwrap_or_else(|| cache_dir.join("rootfs"));
-            let mut config = LibkrunConfig::new(helper, library, root_path);
-            config.libkrunfw_path = paths.libkrunfw;
-            config.library_search_path = paths.library_search_path;
-            config.gvproxy_path = paths.gvproxy;
-            config.network_runtime_dir = cache_dir.join("network");
-            config.vcpus = args.cpus;
-            config.memory_mib = args.memory_mib;
-            let ephemeral_disks = EphemeralDiskStore::new(cache_dir.join("runtime"));
-            let _ = box_store.garbage_collect()?;
-            let _ = base_disks.garbage_collect()?;
-            let _ = ephemeral_disks.garbage_collect()?;
-            let runtime = BoxRuntimeConfig {
-                boxes: box_store.clone(),
-                base_disks: base_disks.clone(),
-                ephemeral_disks,
-                source: None,
-                e2fsck_path: args.e2fsck.unwrap_or_else(default_e2fsck),
-            };
+            let config = native.libkrun_config(Some(root_path), storage, None)?;
+            let runtime = native.box_runtime(storage, None);
             if let Some(rootfs) = args.rootfs {
-                let source = BoxRootSource {
-                    manifest_digest: digest_tree(&rootfs)?.to_string(),
-                    rootfs_path: rootfs,
-                    platform: platform_name(&platform),
-                    virtual_size_bytes: args.disk_size,
-                    mke2fs_path: mke2fs_path.clone(),
-                };
+                let source = native.rootfs_source(rootfs, &platform)?;
                 let mut runtime = runtime;
                 runtime.source = Some(source);
                 Arc::new(LibkrunBackend::new(config).with_box_runtime(runtime))
@@ -430,12 +418,11 @@ fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error::Erro
                 Arc::new(LazyImageBackend {
                     config,
                     runtime,
+                    native,
                     images: images.clone(),
                     reference: args.image,
                     platform: platform.clone(),
                     credentials: credentials.clone(),
-                    virtual_size_bytes: args.disk_size,
-                    mke2fs_path: mke2fs_path.clone(),
                 })
             }
         }
@@ -2054,36 +2041,6 @@ struct ConfirmedBoxArgs {
     confirm: bool,
 }
 
-fn default_mke2fs() -> PathBuf {
-    for path in [
-        "/opt/homebrew/opt/e2fsprogs/sbin/mke2fs",
-        "/usr/local/opt/e2fsprogs/sbin/mke2fs",
-        "/usr/sbin/mke2fs",
-        "/sbin/mke2fs",
-    ] {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return path;
-        }
-    }
-    PathBuf::from("mke2fs")
-}
-
-fn default_e2fsck() -> PathBuf {
-    for path in [
-        "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck",
-        "/usr/local/opt/e2fsprogs/sbin/e2fsck",
-        "/usr/sbin/e2fsck",
-        "/sbin/e2fsck",
-    ] {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return path;
-        }
-    }
-    PathBuf::from("e2fsck")
-}
-
 fn platform_name(platform: &Platform) -> String {
     match &platform.variant {
         Some(variant) => format!("{}/{}/{}", platform.os, platform.architecture, variant),
@@ -2924,7 +2881,7 @@ mod tests {
                 base_disks: BaseDiskStore::new(&root),
                 platform: Platform::host_linux(),
                 credentials: None,
-                mke2fs_path: default_mke2fs(),
+                mke2fs_path: DiskToolPaths::discover(None, None).mke2fs_command(),
                 default_disk_size: 8 * 1024 * 1024 * 1024,
             },
         }

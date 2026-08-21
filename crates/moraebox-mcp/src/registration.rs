@@ -9,7 +9,7 @@ use std::{
 use clap::{Args, ValueEnum};
 use moraebox_core::{resolve_cache_dir, resolve_state_dir};
 use moraebox_image::ImageCache;
-use moraebox_runtime::NativeRuntimePaths;
+use moraebox_runtime::{DiskToolPaths, NativeRuntimePaths};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -332,6 +332,8 @@ fn resolve_native_registration_paths(
             install.gvproxy.clone(),
         )
     });
+    let discovered_disk_tools =
+        discover.then(|| DiskToolPaths::discover(install.mke2fs.clone(), install.e2fsck.clone()));
     let helper = discovered
         .as_ref()
         .and_then(|paths| paths.helper.clone())
@@ -352,12 +354,24 @@ fn resolve_native_registration_paths(
         .and_then(|paths| paths.library_search_path.clone())
         .or_else(|| install.lib_dir.clone());
     let mke2fs = if discover {
-        resolve_tool_path(install.mke2fs.as_deref(), &super::default_mke2fs())?
+        resolve_tool_path(
+            install.mke2fs.as_deref(),
+            &discovered_disk_tools
+                .as_ref()
+                .expect("disk tools are discovered with native paths")
+                .mke2fs_command(),
+        )?
     } else {
         install.mke2fs.as_deref().map(absolute_path).transpose()?
     };
     let e2fsck = if discover {
-        resolve_tool_path(install.e2fsck.as_deref(), &super::default_e2fsck())?
+        resolve_tool_path(
+            install.e2fsck.as_deref(),
+            &discovered_disk_tools
+                .as_ref()
+                .expect("disk tools are discovered with native paths")
+                .e2fsck_command(),
+        )?
     } else {
         install.e2fsck.as_deref().map(absolute_path).transpose()?
     };

@@ -344,6 +344,8 @@ codesign --force --sign - \
 
 모든 네이티브 실행은 root disk 준비나 gvproxy 시작 전에 `morae doctor --json`과 같은 선행 조건을 다시 검사합니다. helper는 실행 가능하고 host architecture용으로 서명되어 Hypervisor entitlement를 가져야 합니다. libkrun 1.19.4와 libkrunfw 5.5.0은 서명된 host architecture 파일이어야 하며 canonical Homebrew 경로로 고정된 정식 버전을 증명해야 합니다. libkrun은 필수 ABI와, 네트워크 실행에서는 `krun_add_net_unixgram`도 제공해야 합니다. 검증할 수 없는 복사본이나 custom library는 helper spawn까지 진행하지 않고 doctor 기반 remediation과 함께 거부합니다.
 
+CLI와 MCP의 네이티브 실행은 `moraebox-sdk` 구성 계층을 공유합니다. disk tool과 native helper를 같은 override 우선순위로 해석하고, 동일한 image/Box/base/ephemeral store를 startup GC와 함께 열며, image 또는 rootfs source에 하나의 platform·disk-size·filesystem-tool 정책을 적용합니다. frontend에는 command와 transport에만 해당하는 선택만 남깁니다.
+
 ## 개발
 
 ```sh

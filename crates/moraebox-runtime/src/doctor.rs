@@ -187,6 +187,34 @@ pub struct NativeRuntimePaths {
     pub library_search_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskToolPaths {
+    pub mke2fs: Option<PathBuf>,
+    pub e2fsck: Option<PathBuf>,
+}
+
+impl DiskToolPaths {
+    /// Resolve disk tools without replacing an explicit caller path.
+    pub fn discover(mke2fs: Option<PathBuf>, e2fsck: Option<PathBuf>) -> Self {
+        Self {
+            mke2fs: resolve_tool_path(mke2fs, "MORAE_MKE2FS", "mke2fs", MKE2FS_CANDIDATES),
+            e2fsck: resolve_tool_path(e2fsck, "MORAE_E2FSCK", "e2fsck", E2FSCK_CANDIDATES),
+        }
+    }
+
+    pub fn mke2fs_command(&self) -> PathBuf {
+        self.mke2fs
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("mke2fs"))
+    }
+
+    pub fn e2fsck_command(&self) -> PathBuf {
+        self.e2fsck
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("e2fsck"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("native runtime preflight failed: {details}")]
 pub(crate) struct NativeRuntimePreflightError {
@@ -280,8 +308,9 @@ impl DoctorReport {
         let libkrunfw = probe_libkrunfw(paths.libkrunfw, &architecture);
         let krunvm = probe_tool("krunvm");
         let gvproxy = probe_tool_path(paths.gvproxy);
-        let mke2fs = probe_tool_override(mke2fs_override, "mke2fs", MKE2FS_CANDIDATES);
-        let e2fsck = probe_tool_override(e2fsck_override, "e2fsck", E2FSCK_CANDIDATES);
+        let disk_tools = DiskToolPaths::discover(mke2fs_override, e2fsck_override);
+        let mke2fs = probe_tool_path(disk_tools.mke2fs);
+        let e2fsck = probe_tool_path(disk_tools.e2fsck);
         let cache_volume = probe_cache_volume(cache_dir);
         let cow_clone_supported = cache_volume.reflink_supported;
         let network_root = nearest_existing_directory(&env::temp_dir());
@@ -566,22 +595,6 @@ fn probe_symbols(path: &Path, required_symbols: &[&str]) -> (Option<bool>, Vec<S
 
 fn probe_tool(name: &str) -> ToolProbe {
     probe_tool_path(find_in_path(name))
-}
-
-fn probe_tool_with_candidates(name: &str, candidates: &[&str]) -> ToolProbe {
-    probe_tool_path(find_in_path(name).or_else(|| {
-        candidates
-            .iter()
-            .map(PathBuf::from)
-            .find(|path| path.is_file())
-    }))
-}
-
-fn probe_tool_override(path: Option<PathBuf>, name: &str, candidates: &[&str]) -> ToolProbe {
-    path.map_or_else(
-        || probe_tool_with_candidates(name, candidates),
-        |path| probe_tool_path(Some(path)),
-    )
 }
 
 fn probe_tool_path(path: Option<PathBuf>) -> ToolProbe {
@@ -1180,6 +1193,18 @@ fn configured_path(key: &str) -> Option<PathBuf> {
     env::var_os(key).map(PathBuf::from)
 }
 
+fn resolve_tool_path(
+    explicit: Option<PathBuf>,
+    environment: &str,
+    name: &str,
+    candidates: &[&str],
+) -> Option<PathBuf> {
+    explicit
+        .or_else(|| configured_path(environment))
+        .or_else(|| find_in_path(name))
+        .or_else(|| find_candidate(candidates))
+}
+
 fn find_sibling_helper() -> Option<PathBuf> {
     let sibling = env::current_exe().ok()?.with_file_name(if cfg!(windows) {
         "morae-vmm-helper.exe"
@@ -1412,6 +1437,23 @@ mod tests {
             Some(PathBuf::from("/configured/search"))
         );
         assert_eq!(paths.gvproxy, Some(PathBuf::from("/configured/gvproxy")));
+    }
+
+    #[test]
+    fn explicit_disk_tool_paths_take_precedence_and_commands_have_fallbacks() {
+        let paths = DiskToolPaths::discover(
+            Some(PathBuf::from("/configured/mke2fs")),
+            Some(PathBuf::from("/configured/e2fsck")),
+        );
+        assert_eq!(paths.mke2fs_command(), PathBuf::from("/configured/mke2fs"));
+        assert_eq!(paths.e2fsck_command(), PathBuf::from("/configured/e2fsck"));
+
+        let unavailable = DiskToolPaths {
+            mke2fs: None,
+            e2fsck: None,
+        };
+        assert_eq!(unavailable.mke2fs_command(), PathBuf::from("mke2fs"));
+        assert_eq!(unavailable.e2fsck_command(), PathBuf::from("e2fsck"));
     }
 
     #[test]

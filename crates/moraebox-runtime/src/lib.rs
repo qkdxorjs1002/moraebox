@@ -20,7 +20,7 @@ pub use backend::{
 };
 pub use budget::{RunBudget, RunBudgetTimeout, RunStage, StageError, StageTiming};
 pub use doctor::{
-    CacheVolumeProbe, DoctorCheck, DoctorCheckStatus, DoctorReport, LibraryProbe,
+    CacheVolumeProbe, DiskToolPaths, DoctorCheck, DoctorCheckStatus, DoctorReport, LibraryProbe,
     NativeBinaryProbe, NativeRuntimePaths, NetworkProbe, ToolProbe,
 };
 pub use libkrun::{BoxRootSource, BoxRuntimeConfig, LibkrunBackend, LibkrunConfig};

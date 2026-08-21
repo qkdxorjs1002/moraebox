@@ -226,7 +226,7 @@
 
 ### 구조와 검증
 
-- [ ] CLI/MCP/native에서 중복된 storage, image, disk-size, helper/tool discovery를 공통 builder/config 계층으로 옮긴다.
+- [x] CLI/MCP/native에서 중복된 storage, image, disk-size, helper/tool discovery를 공통 builder/config 계층으로 옮긴다.
 
 - [ ] 큰 CLI, MCP server, image cache, libkrun adapter를 command/transport/storage/backend 책임별 모듈로 분리한다.
 

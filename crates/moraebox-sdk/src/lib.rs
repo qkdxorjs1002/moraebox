@@ -2,6 +2,12 @@
 
 #![forbid(unsafe_code)]
 
+mod configuration;
+
+pub use configuration::{
+    ManagedStorage, NativeConfigurationError, NativeRuntimeOverrides, NativeSandboxConfig,
+};
+
 use std::{
     collections::HashMap,
     future::Future,

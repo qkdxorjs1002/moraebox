@@ -14,8 +14,7 @@ use std::{
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use moraebox_box::{
-    BaseDiskSpec, BaseDiskStore, BoxMetadata, BoxRepairReport, BoxStore, BoxStoreError, CreateBox,
-    EphemeralDiskStore,
+    BaseDiskSpec, BaseDiskStore, BoxMetadata, BoxRepairReport, BoxStore, CreateBox,
 };
 use moraebox_core::{
     BoxId, ImagePullPolicy, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, OutputChannel, OutputReadError,
@@ -25,13 +24,14 @@ use moraebox_core::{
 use moraebox_image::{
     CacheReconcileReport, CacheUsage, CachedImage, CleanReport, Credentials, ImageCache,
     ImageProgressStage, Platform, PreparedImage, PruneReport, RemoveReport,
-    RootfsMetadataIssueKind, WorkspaceSnapshot, WorkspaceStage, digest_tree,
+    RootfsMetadataIssueKind, WorkspaceSnapshot, WorkspaceStage,
 };
 use moraebox_runtime::{
-    Backend, BackendCapabilities, BoxRootSource, BoxRuntimeConfig, DoctorReport, IsolationLevel,
-    LibkrunBackend, LibkrunConfig, NativeRuntimePaths, ProcessBackend, RunBudget, RunStage,
-    SessionError, SessionHandle, SessionManager, SessionStatus, Supervisor,
+    Backend, BackendCapabilities, DiskToolPaths, DoctorReport, IsolationLevel, LibkrunBackend,
+    NativeRuntimePaths, ProcessBackend, RunBudget, RunStage, SessionError, SessionHandle,
+    SessionManager, SessionStatus, Supervisor,
 };
+use moraebox_sdk::{ManagedStorage, NativeRuntimeOverrides, NativeSandboxConfig};
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
@@ -882,7 +882,8 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::
     } else {
         None
     };
-    let mke2fs = global.mke2fs.clone().unwrap_or_else(default_mke2fs);
+    let disk_tools = DiskToolPaths::discover(global.mke2fs.clone(), global.e2fsck.clone());
+    let mke2fs = disk_tools.mke2fs_command();
 
     let workspace = if let Some(source) = args.workspace.as_deref() {
         let cache_dir = cache_dir
@@ -930,52 +931,38 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::
             let state_dir = state_dir
                 .as_deref()
                 .ok_or("libkrun backend requires a state directory")?;
+            let storage = ManagedStorage::open(cache_dir, state_dir)?;
+            let native = NativeSandboxConfig::discover(
+                NativeRuntimeOverrides {
+                    helper: global.helper.clone(),
+                    libkrun: global.libkrun.clone(),
+                    library_search_path: global.lib_dir.clone(),
+                    gvproxy: global.gvproxy.clone(),
+                },
+                disk_tools,
+                args.disk_size,
+                args.cpus,
+                args.memory_mib,
+            );
             let root_source = if spec.box_id.is_some() {
                 None
             } else if let Some(prepared) = prepared_image.as_ref() {
-                Some(BoxRootSource {
-                    rootfs_path: prepared.rootfs.clone(),
-                    manifest_digest: prepared.manifest_digest.clone(),
-                    platform: platform_name(&platform),
-                    virtual_size_bytes: args.disk_size,
-                    mke2fs_path: mke2fs,
-                })
+                Some(native.prepared_image_source((*prepared).clone(), &platform))
             } else if let Some(rootfs) = args.rootfs.as_ref() {
-                Some(BoxRootSource {
-                    rootfs_path: rootfs.clone(),
-                    manifest_digest: digest_tree(rootfs)?.to_string(),
-                    platform: platform_name(&platform),
-                    virtual_size_bytes: args.disk_size,
-                    mke2fs_path: mke2fs,
-                })
+                Some(native.rootfs_source(rootfs, &platform)?)
             } else {
                 return Err("libkrun run requires an image, rootfs, or BoxId".into());
             };
-            let mut config = native_config(
-                global.helper.clone(),
-                global.libkrun.clone(),
-                global.lib_dir.clone(),
-                global.gvproxy.clone(),
+            let config = native.libkrun_config(
                 root_source
                     .as_ref()
                     .map(|source| source.rootfs_path.clone()),
-                "--rootfs, --image, or MORAE_ROOTFS",
-                true,
+                &storage,
+                workspace
+                    .as_ref()
+                    .map(|snapshot| snapshot.image_path.clone()),
             )?;
-            config.vcpus = args.cpus;
-            config.memory_mib = args.memory_mib;
-            config.workspace_disk = workspace
-                .as_ref()
-                .map(|snapshot| snapshot.image_path.clone());
-            config.network_runtime_dir = cache_dir.join("network");
-            let (boxes, base_disks, ephemeral_disks) = box_runtime_stores(state_dir, cache_dir)?;
-            let runtime = BoxRuntimeConfig {
-                boxes,
-                base_disks,
-                ephemeral_disks,
-                source: root_source,
-                e2fsck_path: global.e2fsck.clone().unwrap_or_else(default_e2fsck),
-            };
+            let runtime = native.box_runtime(&storage, root_source);
             let backend = LibkrunBackend::new(config).with_box_runtime(runtime);
             if workspace.is_some() {
                 progress.workspace_message("attaching read-only image");
@@ -1468,7 +1455,7 @@ async fn box_create(
     let base = BaseDiskStore::new(&cache_dir).prepare(
         &spec,
         &prepared.rootfs,
-        &global.mke2fs.clone().unwrap_or_else(default_mke2fs),
+        &DiskToolPaths::discover(global.mke2fs.clone(), global.e2fsck.clone()).mke2fs_command(),
     )?;
     let metadata = BoxStore::new(state_dir).create(
         &CreateBox::new(
@@ -2003,51 +1990,38 @@ async fn benchmark(
             } else {
                 None
             };
-            let mke2fs = global.mke2fs.clone().unwrap_or_else(default_mke2fs);
+            let disk_tools = DiskToolPaths::discover(global.mke2fs.clone(), global.e2fsck.clone());
+            let storage = ManagedStorage::open(&cache_dir, &state_dir)?;
+            let native = NativeSandboxConfig::discover(
+                NativeRuntimeOverrides {
+                    helper: global.helper.clone(),
+                    libkrun: global.libkrun.clone(),
+                    library_search_path: global.lib_dir.clone(),
+                    gvproxy: None,
+                },
+                disk_tools,
+                args.disk_size,
+                args.cpus,
+                args.memory_mib,
+            );
             let digest = prepared_digest(prepared_image.as_ref());
             let root_source = if args.box_id.is_some() {
                 None
             } else if let Some(prepared) = prepared_image {
-                Some(BoxRootSource {
-                    rootfs_path: prepared.rootfs,
-                    manifest_digest: prepared.manifest_digest,
-                    platform: platform_name(&platform),
-                    virtual_size_bytes: args.disk_size,
-                    mke2fs_path: mke2fs,
-                })
+                Some(native.prepared_image_source(prepared, &platform))
             } else if let Some(rootfs) = args.rootfs {
-                Some(BoxRootSource {
-                    manifest_digest: digest_tree(&rootfs)?.to_string(),
-                    rootfs_path: rootfs,
-                    platform: platform_name(&platform),
-                    virtual_size_bytes: args.disk_size,
-                    mke2fs_path: mke2fs,
-                })
+                Some(native.rootfs_source(rootfs, &platform)?)
             } else {
                 return Err("libkrun benchmark requires an image, rootfs, or BoxId".into());
             };
-            let mut config = native_config(
-                global.helper.clone(),
-                global.libkrun.clone(),
-                global.lib_dir.clone(),
-                None,
+            let config = native.libkrun_config(
                 root_source
                     .as_ref()
                     .map(|source| source.rootfs_path.clone()),
-                "--rootfs, --image, or --box",
-                true,
+                &storage,
+                None,
             )?;
-            config.vcpus = args.cpus;
-            config.memory_mib = args.memory_mib;
-            config.network_runtime_dir = cache_dir.join("network");
-            let (boxes, base_disks, ephemeral_disks) = box_runtime_stores(state_dir, &cache_dir)?;
-            let runtime = BoxRuntimeConfig {
-                boxes,
-                base_disks,
-                ephemeral_disks,
-                source: root_source,
-                e2fsck_path: global.e2fsck.clone().unwrap_or_else(default_e2fsck),
-            };
+            let runtime = native.box_runtime(&storage, root_source);
             let mut report = run_benchmark(
                 &Supervisor::new(LibkrunBackend::new(config).with_box_runtime(runtime)),
                 command,
@@ -2231,86 +2205,6 @@ struct BenchmarkReport {
     box_lock_p95_micros: Option<u64>,
     disk_clone_p95_micros: Option<u64>,
     helper_spawn_p95_micros: Option<u64>,
-}
-
-fn native_config(
-    helper: Option<PathBuf>,
-    libkrun: Option<PathBuf>,
-    lib_dir: Option<PathBuf>,
-    gvproxy: Option<PathBuf>,
-    root: Option<PathBuf>,
-    root_description: &'static str,
-    managed_root: bool,
-) -> Result<LibkrunConfig, Box<dyn std::error::Error>> {
-    let paths = NativeRuntimePaths::discover_with_gvproxy(helper, libkrun, lib_dir, gvproxy);
-    let helper = required_path(
-        paths.helper,
-        "--helper, MORAE_HELPER_PATH, or a sibling morae-vmm-helper",
-    )?;
-    let library = required_path(
-        paths.libkrun,
-        "--libkrun, MORAE_LIBKRUN_PATH, or a supported Homebrew libkrun",
-    )?;
-    let root = if managed_root {
-        root.unwrap_or_default()
-    } else {
-        required_path(root, root_description)?
-    };
-    let mut config = LibkrunConfig::new(helper, library, root);
-    config.libkrunfw_path = paths.libkrunfw;
-    config.library_search_path = paths.library_search_path;
-    config.gvproxy_path = paths.gvproxy;
-    Ok(config)
-}
-
-fn box_runtime_stores(
-    state_dir: impl Into<PathBuf>,
-    cache_dir: &Path,
-) -> Result<(BoxStore, BaseDiskStore, EphemeralDiskStore), BoxStoreError> {
-    let boxes = BoxStore::new(state_dir);
-    let base_disks = BaseDiskStore::new(cache_dir);
-    let ephemeral_disks = EphemeralDiskStore::new(cache_dir.join("runtime"));
-    let _ = boxes.garbage_collect()?;
-    let _ = base_disks.garbage_collect()?;
-    let _ = ephemeral_disks.garbage_collect()?;
-    Ok((boxes, base_disks, ephemeral_disks))
-}
-
-fn required_path(
-    path: Option<PathBuf>,
-    description: &'static str,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    path.ok_or_else(|| format!("libkrun backend requires {description}").into())
-}
-
-fn default_mke2fs() -> PathBuf {
-    for path in [
-        "/opt/homebrew/opt/e2fsprogs/sbin/mke2fs",
-        "/usr/local/opt/e2fsprogs/sbin/mke2fs",
-        "/usr/sbin/mke2fs",
-        "/sbin/mke2fs",
-    ] {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return path;
-        }
-    }
-    PathBuf::from("mke2fs")
-}
-
-fn default_e2fsck() -> PathBuf {
-    for path in [
-        "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck",
-        "/usr/local/opt/e2fsprogs/sbin/e2fsck",
-        "/usr/sbin/e2fsck",
-        "/sbin/e2fsck",
-    ] {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return path;
-        }
-    }
-    PathBuf::from("e2fsck")
 }
 
 fn platform_name(platform: &Platform) -> String {
