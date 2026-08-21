@@ -224,6 +224,72 @@ fn async_session_survives_request_completion_and_is_cleaned_on_eof() {
     assert!(responses.try_iter().next().is_none());
 }
 
+#[test]
+fn explicit_remove_stops_and_forgets_a_session_idempotently() {
+    let (mut child, mut stdin, responses, reader) = spawn_server();
+    initialize(&mut stdin, &responses);
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"sandbox_exec","arguments":{
+                "argv":long_running_command(),"wait":false
+            }}
+        }),
+    );
+    let started = read_response(&responses);
+    let session_id = started
+        .pointer("/result/structuredContent/status/session_id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
+
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"sandbox_remove","arguments":{"session_id":session_id}}
+        }),
+    );
+    let removed = read_response(&responses);
+    assert_eq!(
+        removed.pointer("/result/structuredContent/removed"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        removed.pointer("/result/structuredContent/status/state"),
+        Some(&json!("dead"))
+    );
+
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"sandbox_remove","arguments":{"session_id":session_id}}
+        }),
+    );
+    assert_eq!(
+        read_response(&responses).pointer("/result/structuredContent/removed"),
+        Some(&json!(false))
+    );
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":5,"method":"tools/call",
+            "params":{"name":"sandbox_io","arguments":{"session_id":session_id}}
+        }),
+    );
+    assert_eq!(
+        read_response(&responses).pointer("/result/isError"),
+        Some(&json!(true))
+    );
+
+    drop(stdin);
+    assert!(wait_for_child(&mut child).success());
+    reader.join().unwrap();
+    assert!(responses.try_iter().next().is_none());
+}
+
 fn write_request(stdin: &mut impl Write, request: &Value) {
     writeln!(stdin, "{request}").unwrap();
     stdin.flush().unwrap();

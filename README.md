@@ -221,13 +221,14 @@ The server exposes execution tools plus persistent Box management:
 | --- | --- |
 | `sandbox_exec` | Run one command or start an asynchronous session; optional `box_id` reuses persistent files |
 | `sandbox_io` | Read bounded output, write or close stdin, resize, or send a signal |
-| `sandbox_stop` | Stop a session and wait for cleanup |
+| `sandbox_stop` | Stop a session and wait for cleanup while retaining its record |
+| `sandbox_remove` | Stop if needed and immediately remove retained session status and output |
 | `sandbox_box_create` | Create a persistent Box from an OCI image |
 | `sandbox_box_list` / `sandbox_box_get` | Inspect persistent Box metadata |
 | `sandbox_box_delete` / `sandbox_box_reset` | Permanently mutate an idle Box with explicit confirmation |
 | `sandbox_box_clone` | Create a new independent durable Box with explicit confirmation |
 
-Commands remain argv arrays in the MCP schema. Output chunks are exposed as UTF-8 text so agents can read them directly; invalid UTF-8 bytes are replaced with `U+FFFD`. Stdin bytes remain base64-encoded.
+Commands remain argv arrays in the MCP schema. Output chunks are exposed as UTF-8 text so agents can read them directly; invalid UTF-8 bytes are replaced with `U+FFFD`. Stdin bytes remain base64-encoded. The server permits up to 32 active runs. Completed asynchronous sessions remain readable for five minutes, or until `sandbox_remove` releases them explicitly; disconnecting the stdio client removes all connection-owned sessions.
 
 ## How it works
 

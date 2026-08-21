@@ -44,8 +44,10 @@ const SERVER_INSTRUCTIONS: &str = concat!(
     "wait=false to start sessions; use sandbox_io for cursor-based I/O and sandbox_stop to ",
     "terminate and clean up sessions. wait=true sessions belong to their request and are ",
     "cleaned when that request is cancelled. wait=false sessions belong to this stdio ",
-    "connection and remain available until sandbox_stop or client disconnect. Pass box_id ",
-    "to continue from a persistent Box while ",
+    "connection and remain available until sandbox_remove or client disconnect. Up to 32 ",
+    "sessions may run at once; completed async sessions retain status and output for five ",
+    "minutes unless sandbox_remove releases them sooner. sandbox_stop preserves the completed ",
+    "record for output reads. Pass box_id to continue from a persistent Box while ",
     "still receiving a new microVM and SessionId for every run. Use the sandbox_box_* tools ",
     "to create and manage persistent root filesystems. Only the libkrun backend provides VM isolation; the ",
     "process backend is for deterministic development and is not isolated. Host workspace ",
@@ -549,6 +551,7 @@ async fn call_tool(
         },
         "sandbox_io" => sandbox_io(&server.sdk, arguments).await,
         "sandbox_stop" => sandbox_stop(&server.sdk, arguments).await,
+        "sandbox_remove" => sandbox_remove(&server.sdk, arguments).await,
         "sandbox_box_create" => sandbox_box_create(server, arguments).await,
         "sandbox_box_list" => sandbox_box_list(server, arguments).await,
         "sandbox_box_get" => sandbox_box_get(server, arguments).await,
@@ -655,6 +658,19 @@ async fn sandbox_stop(sdk: &SandboxSdk, arguments: Value) -> Result<Value, Strin
         .await
         .map_err(|error| error.to_string())?;
     Ok(json!({ "status": status }))
+}
+
+async fn sandbox_remove(sdk: &SandboxSdk, arguments: Value) -> Result<Value, String> {
+    let args: StopArgs = serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+    let session_id = SessionId::from_str(&args.session_id).map_err(|error| error.to_string())?;
+    let status = sdk
+        .remove(session_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    match status {
+        Some(status) => Ok(json!({ "removed": true, "status": status })),
+        None => Ok(json!({ "removed": false })),
+    }
 }
 
 async fn sandbox_box_create(server: &McpServer, arguments: Value) -> Result<Value, String> {
@@ -864,7 +880,7 @@ fn tools_list() -> Value {
             {
                 "name": "sandbox_exec",
                 "title": "Execute in configured runtime",
-                "description": "Start a command in the configured runtime. Every call receives a new SessionId and, with libkrun, a new microVM. Pass box_id only when the command should reuse that Box's persistent root filesystem. Prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. wait=true runs are cleaned when their request is cancelled. wait=false starts a session owned by this stdio connection until sandbox_stop or disconnect. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
+                "description": "Start a command in the configured runtime. Every call receives a new SessionId and, with libkrun, a new microVM. Pass box_id only when the command should reuse that Box's persistent root filesystem. Prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. At most 32 sessions run concurrently. wait=true runs are cleaned when their request is cancelled. wait=false starts a session owned by this stdio connection until sandbox_remove or disconnect; completed status and output expire after five minutes. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -909,6 +925,18 @@ fn tools_list() -> Value {
                     "type": "object",
                     "properties": { "session_id": { "type": "string" } },
                     "required": ["session_id"]
+                },
+                "annotations": { "destructiveHint": true, "idempotentHint": true, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_remove",
+                "title": "Remove sandbox session",
+                "description": "Stop a running session if needed, wait for cleanup, and immediately remove its retained status and output. Repeating the call returns removed=false.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "session_id": { "type": "string" } },
+                    "required": ["session_id"],
+                    "additionalProperties": false
                 },
                 "annotations": { "destructiveHint": true, "idempotentHint": true, "openWorldHint": false }
             },
@@ -1207,6 +1235,13 @@ mod tests {
         assert_eq!(
             list.pointer("/result/tools/0/annotations/openWorldHint"),
             Some(&json!(true))
+        );
+        assert!(
+            list.pointer("/result/tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| tools
+                    .iter()
+                    .any(|tool| tool.get("name") == Some(&json!("sandbox_remove"))))
         );
         let call = handle_request(
             &server,

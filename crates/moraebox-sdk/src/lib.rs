@@ -2,30 +2,79 @@
 
 #![forbid(unsafe_code)]
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::Future,
+    num::NonZeroUsize,
+    path::PathBuf,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use moraebox_box::{BoxMetadata, BoxStore, BoxStoreError, CreateBox};
-use moraebox_core::{BoxId, OutputChunk, OutputReadError, RunSpec, SessionId, Signal};
+use moraebox_core::{
+    BoxId, OutputChunk, OutputReadError, RunSpec, SessionId, SessionState, Signal,
+};
 use moraebox_runtime::{Backend, SessionError, SessionHandle, SessionManager, SessionStatus};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
-    sync::{RwLock, oneshot},
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore, oneshot},
     task::JoinSet,
 };
+
+pub const DEFAULT_MAX_ACTIVE_SESSIONS: usize = 32;
+pub const DEFAULT_COMPLETED_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionRegistryConfig {
+    pub max_active_sessions: NonZeroUsize,
+    pub completed_session_ttl: Duration,
+}
+
+impl SessionRegistryConfig {
+    #[must_use]
+    pub const fn new(max_active_sessions: NonZeroUsize, completed_session_ttl: Duration) -> Self {
+        Self {
+            max_active_sessions,
+            completed_session_ttl,
+        }
+    }
+}
+
+impl Default for SessionRegistryConfig {
+    fn default() -> Self {
+        Self::new(
+            NonZeroUsize::new(DEFAULT_MAX_ACTIVE_SESSIONS)
+                .expect("default active session limit is non-zero"),
+            DEFAULT_COMPLETED_SESSION_TTL,
+        )
+    }
+}
+
+struct SessionEntry {
+    handle: SessionHandle,
+    active_permit: Option<OwnedSemaphorePermit>,
+    generation: Arc<()>,
+}
 
 #[derive(Clone)]
 pub struct SandboxSdk {
     manager: SessionManager,
-    sessions: Arc<RwLock<HashMap<SessionId, SessionHandle>>>,
+    sessions: Arc<RwLock<HashMap<SessionId, SessionEntry>>>,
+    active_sessions: Arc<Semaphore>,
+    registry_config: SessionRegistryConfig,
     box_store: Option<BoxStore>,
 }
 
 impl SandboxSdk {
     pub fn new(backend: Arc<dyn Backend>) -> Self {
+        let registry_config = SessionRegistryConfig::default();
         Self {
             manager: SessionManager::new(backend),
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            active_sessions: Arc::new(Semaphore::new(registry_config.max_active_sessions.get())),
+            registry_config,
             box_store: None,
         }
     }
@@ -36,11 +85,18 @@ impl SandboxSdk {
         self
     }
 
+    /// Configures the bounded session registry before this SDK is cloned or used.
+    #[must_use]
+    pub fn with_session_registry(mut self, config: SessionRegistryConfig) -> Self {
+        self.active_sessions = Arc::new(Semaphore::new(config.max_active_sessions.get()));
+        self.registry_config = config;
+        self
+    }
+
     pub async fn start(&self, spec: RunSpec) -> Result<SessionStatus, SdkError> {
+        let permit = self.acquire_active_slot()?;
         let handle = self.manager.start(spec).await?;
-        let status = handle.status();
-        self.sessions.write().await.insert(handle.id(), handle);
-        Ok(status)
+        Ok(self.register_session(handle, permit).await)
     }
 
     /// Starts a connection-owned session unless its creating request is cancelled first.
@@ -50,15 +106,18 @@ impl SandboxSdk {
     pub async fn start_cancellable(
         &self,
         spec: RunSpec,
-        cancellation: oneshot::Receiver<()>,
+        mut cancellation: oneshot::Receiver<()>,
     ) -> Result<SessionStatus, SdkError> {
+        if cancellation.try_recv().is_ok() {
+            return Err(SdkError::RequestCancelled);
+        }
+        let permit = self.acquire_active_slot()?;
         let handle = self.start_handle_cancellable(spec, cancellation).await?;
-        let status = handle.status();
-        self.sessions.write().await.insert(handle.id(), handle);
-        Ok(status)
+        Ok(self.register_session(handle, permit).await)
     }
 
     pub async fn exec(&self, spec: RunSpec) -> Result<ExecutionResult, SdkError> {
+        let _permit = self.acquire_active_slot()?;
         let handle = self.manager.start(spec).await?;
         Self::finish_execution(&handle).await
     }
@@ -72,6 +131,7 @@ impl SandboxSdk {
         if cancellation.try_recv().is_ok() {
             return Err(SdkError::RequestCancelled);
         }
+        let _permit = self.acquire_active_slot()?;
         let mut start = Box::pin(self.manager.start(spec));
         let handle = tokio::select! {
             result = &mut start => result?,
@@ -150,6 +210,91 @@ impl SandboxSdk {
         }
     }
 
+    fn acquire_active_slot(&self) -> Result<OwnedSemaphorePermit, SdkError> {
+        Arc::clone(&self.active_sessions)
+            .try_acquire_owned()
+            .map_err(|_| SdkError::SessionLimitExceeded {
+                maximum: self.registry_config.max_active_sessions.get(),
+            })
+    }
+
+    async fn register_session(
+        &self,
+        handle: SessionHandle,
+        permit: OwnedSemaphorePermit,
+    ) -> SessionStatus {
+        let session_id = handle.id();
+        let status = handle.status();
+        let completion = handle.completion();
+        let generation = Arc::new(());
+        self.sessions.write().await.insert(
+            session_id,
+            SessionEntry {
+                handle,
+                active_permit: Some(permit),
+                generation: Arc::clone(&generation),
+            },
+        );
+        Self::spawn_session_reaper(
+            Arc::downgrade(&self.sessions),
+            session_id,
+            generation,
+            completion,
+            self.registry_config.completed_session_ttl,
+        );
+        status
+    }
+
+    fn spawn_session_reaper(
+        sessions: Weak<RwLock<HashMap<SessionId, SessionEntry>>>,
+        session_id: SessionId,
+        generation: Arc<()>,
+        completion: impl Future<Output = Result<SessionStatus, SessionError>> + Send + 'static,
+        completed_session_ttl: Duration,
+    ) {
+        tokio::spawn(async move {
+            if completion.await.is_err() {
+                return;
+            }
+            let Some(registry) = sessions.upgrade() else {
+                return;
+            };
+            {
+                let mut entries = registry.write().await;
+                let Some(entry) = entries.get_mut(&session_id) else {
+                    return;
+                };
+                if !Arc::ptr_eq(&entry.generation, &generation) {
+                    return;
+                }
+                entry.active_permit.take();
+            }
+            drop(registry);
+
+            tokio::time::sleep(completed_session_ttl).await;
+            let Some(registry) = sessions.upgrade() else {
+                return;
+            };
+            let mut entries = registry.write().await;
+            let should_remove = entries.get(&session_id).is_some_and(|entry| {
+                Arc::ptr_eq(&entry.generation, &generation)
+                    && entry.handle.status().state == SessionState::Dead
+            });
+            if should_remove {
+                entries.remove(&session_id);
+            }
+        });
+    }
+
+    async fn release_active_slot(&self, session_id: SessionId) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(entry) = sessions.get_mut(&session_id)
+            && entry.handle.status().state == SessionState::Dead
+        {
+            entry.active_permit.take();
+        }
+    }
+
     pub async fn io(
         &self,
         session_id: SessionId,
@@ -171,8 +316,12 @@ impl SandboxSdk {
         let output = handle
             .read_output(request.cursor, request.max_bytes)
             .await?;
+        let status = handle.status();
+        if status.state == SessionState::Dead {
+            self.release_active_slot(session_id).await;
+        }
         Ok(IoResult {
-            status: handle.status(),
+            status,
             output: output.chunks,
             next_cursor: output.next_cursor,
             truncated: output.truncated,
@@ -180,29 +329,36 @@ impl SandboxSdk {
     }
 
     pub async fn wait(&self, session_id: SessionId) -> Result<SessionStatus, SdkError> {
-        self.session(session_id)
-            .await?
-            .wait()
-            .await
-            .map_err(Into::into)
+        let status = self.session(session_id).await?.wait().await?;
+        self.release_active_slot(session_id).await;
+        Ok(status)
     }
 
     pub async fn stop(&self, session_id: SessionId) -> Result<SessionStatus, SdkError> {
         let handle = self.session(session_id).await?;
-        handle.stop().await?;
-        Ok(handle.wait().await?)
+        let status = Self::stop_handle(&handle).await?;
+        self.release_active_slot(session_id).await;
+        Ok(status)
     }
 
-    pub async fn remove(&self, session_id: SessionId) -> bool {
-        self.sessions.write().await.remove(&session_id).is_some()
+    /// Stops a running session and removes its retained status and output immediately.
+    pub async fn remove(&self, session_id: SessionId) -> Result<Option<SessionStatus>, SdkError> {
+        let Some(entry) = self.sessions.write().await.remove(&session_id) else {
+            return Ok(None);
+        };
+        if entry.handle.status().state == SessionState::Dead {
+            Ok(Some(entry.handle.status()))
+        } else {
+            Self::stop_handle(&entry.handle).await.map(Some)
+        }
     }
 
     /// Stops and forgets every connection-owned session, continuing after individual failures.
     pub async fn shutdown(&self) -> Result<(), SdkError> {
         let sessions = std::mem::take(&mut *self.sessions.write().await);
         let mut cleanup = JoinSet::new();
-        for handle in sessions.into_values() {
-            cleanup.spawn(async move { Self::stop_handle(&handle).await });
+        for entry in sessions.into_values() {
+            cleanup.spawn(async move { Self::stop_handle(&entry.handle).await });
         }
 
         let mut first_error = None;
@@ -280,7 +436,7 @@ impl SandboxSdk {
             .read()
             .await
             .get(&session_id)
-            .cloned()
+            .map(|entry| entry.handle.clone())
             .ok_or(SdkError::UnknownSession(session_id))
     }
 
@@ -336,6 +492,8 @@ pub enum SdkError {
     Session(#[from] SessionError),
     #[error("unknown sandbox session {0}")]
     UnknownSession(SessionId),
+    #[error("active sandbox session limit reached (maximum {maximum})")]
+    SessionLimitExceeded { maximum: usize },
     #[error("sandbox request was cancelled")]
     RequestCancelled,
     #[error("session cleanup task failed: {0}")]
@@ -524,6 +682,73 @@ mod tests {
             sdk.wait(second.session_id).await,
             Err(SdkError::UnknownSession(id)) if id == second.session_id
         ));
+    }
+
+    #[tokio::test]
+    async fn active_session_limit_is_stable_and_released_on_stop() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend)).with_session_registry(
+            SessionRegistryConfig::new(NonZeroUsize::new(1).unwrap(), Duration::from_secs(1)),
+        );
+        let mut spec = RunSpec::command(long_running_command());
+        spec.kill_grace = Duration::from_millis(20);
+        let first = sdk.start(spec.clone()).await.unwrap();
+
+        assert!(matches!(
+            sdk.start(spec.clone()).await,
+            Err(SdkError::SessionLimitExceeded { maximum: 1 })
+        ));
+        assert!(matches!(
+            sdk.exec(spec.clone()).await,
+            Err(SdkError::SessionLimitExceeded { maximum: 1 })
+        ));
+
+        sdk.stop(first.session_id).await.unwrap();
+        let second = sdk.start(spec).await.unwrap();
+        sdk.remove(second.session_id).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_session_output_expires_after_registry_ttl() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend)).with_session_registry(
+            SessionRegistryConfig::new(NonZeroUsize::new(1).unwrap(), Duration::from_millis(100)),
+        );
+        let started = sdk
+            .start(RunSpec::command(mixed_output_command()))
+            .await
+            .unwrap();
+        sdk.wait(started.session_id).await.unwrap();
+        let retained = sdk
+            .io(started.session_id, IoRequest::default())
+            .await
+            .unwrap();
+        assert!(!retained.output.is_empty());
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(matches!(
+            sdk.wait(started.session_id).await,
+            Err(SdkError::UnknownSession(id)) if id == started.session_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_stops_and_forgets_a_session_idempotently() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend)).with_session_registry(
+            SessionRegistryConfig::new(NonZeroUsize::new(1).unwrap(), Duration::from_secs(1)),
+        );
+        let mut spec = RunSpec::command(long_running_command());
+        spec.kill_grace = Duration::from_millis(20);
+        let started = sdk.start(spec.clone()).await.unwrap();
+
+        let removed = sdk.remove(started.session_id).await.unwrap().unwrap();
+        assert_eq!(removed.state, SessionState::Dead);
+        assert!(sdk.remove(started.session_id).await.unwrap().is_none());
+        assert!(matches!(
+            sdk.wait(started.session_id).await,
+            Err(SdkError::UnknownSession(id)) if id == started.session_id
+        ));
+
+        let replacement = sdk.start(spec).await.unwrap();
+        sdk.remove(replacement.session_id).await.unwrap().unwrap();
     }
 
     #[cfg(unix)]

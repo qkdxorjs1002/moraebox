@@ -122,6 +122,25 @@ impl SessionHandle {
         self.status.borrow().clone()
     }
 
+    /// Returns a completion future that does not retain command or I/O ownership.
+    pub fn completion(
+        &self,
+    ) -> impl Future<Output = Result<SessionStatus, SessionError>> + Send + 'static {
+        let mut receiver = self.status.clone();
+        async move {
+            loop {
+                let current = receiver.borrow().clone();
+                if current.state == SessionState::Dead {
+                    return Ok(current);
+                }
+                receiver
+                    .changed()
+                    .await
+                    .map_err(|_| SessionError::SessionClosed)?;
+            }
+        }
+    }
+
     pub async fn read_output(
         &self,
         cursor: u64,
@@ -205,17 +224,7 @@ impl SessionHandle {
     }
 
     pub async fn wait(&self) -> Result<SessionStatus, SessionError> {
-        let mut receiver = self.status.clone();
-        loop {
-            let current = receiver.borrow().clone();
-            if current.state == SessionState::Dead {
-                return Ok(current);
-            }
-            receiver
-                .changed()
-                .await
-                .map_err(|_| SessionError::SessionClosed)?;
-        }
+        self.completion().await
     }
 
     async fn request(

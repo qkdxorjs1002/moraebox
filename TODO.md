@@ -84,7 +84,7 @@
   - cancelled request와 연결 종료가 소유한 session을 정리한다.
   - 비동기 session을 의도적으로 유지할 수 있는 ownership 규칙을 명시한다.
 
-- [ ] SDK/MCP session registry에 active-session 상한, 완료 session TTL/reaper, 명시적 remove를 추가한다.
+- [x] SDK/MCP session registry에 active-session 상한, 완료 session TTL/reaper, 명시적 remove를 추가한다.
   - 완료된 session이 64 MiB output buffer와 함께 무기한 남지 않도록 한다.
   - 한도를 넘으면 안정적인 resource-limit 오류를 반환한다.
 
