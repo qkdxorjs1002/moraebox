@@ -20,9 +20,9 @@ use moraebox_box::{
     BaseDiskSpec, BaseDiskStore, BoxStore, BoxStoreError, CreateBox, EphemeralDiskStore,
 };
 use moraebox_core::{
-    BoxId, DEFAULT_KILL_GRACE, DEFAULT_OUTPUT_LIMIT, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, OutputChunk,
-    OutputReadError, RunSpec, SessionId, Signal, TimeoutPolicy, resolve_cache_dir,
-    resolve_state_dir,
+    BoxId, DEFAULT_KILL_GRACE, DEFAULT_OUTPUT_LIMIT, ImagePullPolicy, MAX_KILL_GRACE,
+    MAX_OUTPUT_LIMIT, OutputChunk, OutputReadError, RunSpec, SessionId, Signal, TimeoutPolicy,
+    resolve_cache_dir, resolve_state_dir,
 };
 use moraebox_image::{Credentials, ImageCache, Platform, digest_tree};
 use moraebox_runtime::{
@@ -163,7 +163,6 @@ struct LazyImageBackend {
     credentials: Option<Credentials>,
     virtual_size_bytes: u64,
     mke2fs_path: PathBuf,
-    prepared: tokio::sync::OnceCell<LibkrunBackend>,
 }
 
 impl LazyImageBackend {
@@ -173,7 +172,10 @@ impl LazyImageBackend {
         LibkrunBackend::new(self.config.clone()).with_box_runtime(runtime)
     }
 
-    async fn prepare(&self) -> Result<LibkrunBackend, BackendError> {
+    async fn prepare(
+        &self,
+        policy: ImagePullPolicy,
+    ) -> Result<(LibkrunBackend, String), BackendError> {
         let reference = self
             .reference
             .clone()
@@ -181,27 +183,29 @@ impl LazyImageBackend {
             .map_err(image_prepare_error)?;
         let prepared = self
             .images
-            .resolve_or_pull(&reference, &self.platform, self.credentials.clone())
+            .prepare(&reference, &self.platform, self.credentials.clone(), policy)
             .await
             .map_err(image_prepare_error)?;
-        Ok(self.backend(Some(BoxRootSource {
-            rootfs_path: prepared.rootfs,
-            manifest_digest: prepared.manifest_digest,
-            platform: platform_name(&self.platform),
-            virtual_size_bytes: self.virtual_size_bytes,
-            mke2fs_path: self.mke2fs_path.clone(),
-        })))
+        let digest = prepared.manifest_digest.clone();
+        Ok((
+            self.backend(Some(BoxRootSource {
+                rootfs_path: prepared.rootfs,
+                manifest_digest: prepared.manifest_digest,
+                platform: platform_name(&self.platform),
+                virtual_size_bytes: self.virtual_size_bytes,
+                mke2fs_path: self.mke2fs_path.clone(),
+            })),
+            digest,
+        ))
     }
 
-    async fn prepared_backend(&self, budget: &RunBudget) -> Result<&LibkrunBackend, BackendError> {
-        match budget
-            .run(
-                RunStage::ImagePull,
-                self.prepared.get_or_try_init(|| self.prepare()),
-            )
-            .await
-        {
-            Ok(backend) => Ok(backend),
+    async fn prepared_backend(
+        &self,
+        policy: ImagePullPolicy,
+        budget: &RunBudget,
+    ) -> Result<(LibkrunBackend, String), BackendError> {
+        match budget.run(RunStage::ImagePull, self.prepare(policy)).await {
+            Ok(prepared) => Ok(prepared),
             Err(StageError::Timeout(error)) => Err(BackendError::Timeout {
                 stage: error.stage,
                 limit: error.limit,
@@ -233,10 +237,12 @@ impl Backend for LazyImageBackend {
         if spec.box_id.is_some() {
             self.backend(None).spawn(spec, budget).await
         } else {
-            self.prepared_backend(budget)
-                .await?
-                .spawn(spec, budget)
-                .await
+            let (backend, digest) = self
+                .prepared_backend(spec.image_pull_policy, budget)
+                .await?;
+            let mut spawned = backend.spawn(spec, budget).await?;
+            spawned.startup.resolved_image_digest = Some(digest);
+            Ok(spawned)
         }
     }
 }
@@ -427,7 +433,6 @@ fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error::Erro
                     credentials: credentials.clone(),
                     virtual_size_bytes: args.disk_size,
                     mke2fs_path: mke2fs_path.clone(),
-                    prepared: tokio::sync::OnceCell::new(),
                 })
             }
         }
@@ -1122,6 +1127,7 @@ async fn sandbox_exec_with_inline_limit(
     }
     let mut spec = RunSpec::command(args.argv);
     spec.box_id = args.box_id;
+    spec.image_pull_policy = args.pull_policy;
     spec.tty = args.tty;
     spec.network = args.network;
     if let Some(output_limit) = args.output_limit_bytes {
@@ -1300,10 +1306,11 @@ async fn sandbox_box_create(server: &McpServer, arguments: Value) -> Result<Valu
     let prepared = server
         .boxes
         .images
-        .resolve_or_pull(
+        .prepare(
             &reference,
             &server.boxes.platform,
             server.boxes.credentials.clone(),
+            args.pull_policy,
         )
         .await
         .map_err(|error| {
@@ -1533,6 +1540,10 @@ fn session_status_schema() -> Value {
         "properties": {
             "session_id": { "type": "string", "format": "uuid" },
             "backend": { "type": "string" },
+            "resolved_image_digest": {
+                "anyOf": [{ "type": "string" }, { "type": "null" }],
+                "description": "Actual materialized OCI manifest digest for image-backed sessions."
+            },
             "state": {
                 "type": "string",
                 "enum": ["new", "preparing", "starting", "ready", "running", "stopping", "failed", "timed_out", "dead"]
@@ -1549,8 +1560,8 @@ fn session_status_schema() -> Value {
             "elapsed_micros": { "type": "integer", "minimum": 0 }
         },
         "required": [
-            "session_id", "backend", "state", "termination_reason", "exit_code", "signal",
-            "timed_out", "elapsed_micros"
+            "session_id", "backend", "resolved_image_digest", "state", "termination_reason",
+            "exit_code", "signal", "timed_out", "elapsed_micros"
         ],
         "additionalProperties": false
     })
@@ -1763,13 +1774,14 @@ fn tools_list() -> Value {
             {
                 "name": "sandbox_exec",
                 "title": "Execute in configured runtime",
-                "description": "Start a command in the configured runtime. Every call receives a new SessionId and, with libkrun, a new microVM. The first image-backed run prepares its image lazily within timeout_ms; failures use code image_prepare_failed and stage image_pull. Pass box_id only when the command should reuse that Box's persistent root filesystem. Prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. output_limit_bytes bounds retained output and kill_grace_ms bounds TERM-to-force cleanup; defaults remain 64 MiB and 5000 ms. At most 32 sessions run concurrently. wait=true returns at most 1 MiB inline; when has_more is true, call sandbox_io with the returned SessionId and continuation_cursor within five minutes. Cancelled wait=true runs are cleaned. wait=false starts a session owned by this stdio connection until sandbox_remove or disconnect; completed status and output expire after five minutes. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
+                "description": "Start a command in the configured runtime. Every call receives a new SessionId and, with libkrun, a new microVM. Image-backed runs prepare their image lazily within timeout_ms; pull_policy=missing uses the cache first, always refreshes from the registry, and never permits only an existing cache entry. Failures use code image_prepare_failed and stage image_pull, and status.resolved_image_digest reports the actual materialized manifest. Pass box_id only when the command should reuse that Box's persistent root filesystem. Prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. output_limit_bytes bounds retained output and kill_grace_ms bounds TERM-to-force cleanup; defaults remain 64 MiB and 5000 ms. At most 32 sessions run concurrently. wait=true returns at most 1 MiB inline; when has_more is true, call sandbox_io with the returned SessionId and continuation_cursor within five minutes. Cancelled wait=true runs are cleaned. wait=false starts a session owned by this stdio connection until sandbox_remove or disconnect; completed status and output expire after five minutes. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "argv": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
                         "stdin_base64": { "type": "string", "maxLength": MAX_MCP_STDIN_BASE64_CHARS },
                         "box_id": { "type": "string", "format": "uuid", "description": "Persistent Box root filesystem to reuse; the microVM and SessionId remain new." },
+                        "pull_policy": { "type": "string", "enum": ["missing", "always", "never"], "default": "missing", "description": "Image acquisition policy for image-backed sessions." },
                         "timeout_ms": { "type": "integer", "minimum": 1 },
                         "unlimited": { "type": "boolean", "default": false },
                         "output_limit_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_OUTPUT_LIMIT, "default": DEFAULT_OUTPUT_LIMIT },
@@ -1857,11 +1869,12 @@ fn tools_list() -> Value {
             {
                 "name": "sandbox_box_create",
                 "title": "Create persistent Box",
-                "description": "Create an independent persistent root filesystem from an OCI image. Image resolution may access the registry when the immutable base is not cached.",
+                "description": "Create an independent persistent root filesystem from an OCI image. pull_policy=missing uses the cache first, always refreshes from the registry, and never permits only an existing cache entry. The returned manifest_digest is the actual materialized manifest.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "image": { "type": "string", "description": "OCI image reference; uses the configured default when omitted." },
+                        "pull_policy": { "type": "string", "enum": ["missing", "always", "never"], "default": "missing", "description": "Image acquisition policy." },
                         "disk_size_bytes": { "type": "integer", "minimum": 1, "description": "Virtual root disk size; uses the server default when omitted." }
                     },
                     "additionalProperties": false
@@ -1949,6 +1962,7 @@ struct ExecArgs {
     argv: Vec<String>,
     stdin_base64: Option<String>,
     box_id: Option<BoxId>,
+    pull_policy: ImagePullPolicy,
     timeout_ms: Option<u64>,
     unlimited: bool,
     output_limit_bytes: Option<usize>,
@@ -1964,6 +1978,7 @@ impl Default for ExecArgs {
             argv: Vec::new(),
             stdin_base64: None,
             box_id: None,
+            pull_policy: ImagePullPolicy::Missing,
             timeout_ms: None,
             unlimited: false,
             output_limit_bytes: None,
@@ -2019,6 +2034,7 @@ struct EmptyArgs {}
 #[serde(default, deny_unknown_fields)]
 struct BoxCreateArgs {
     image: Option<String>,
+    pull_policy: ImagePullPolicy,
     disk_size_bytes: Option<u64>,
 }
 
@@ -2300,11 +2316,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(call.pointer("/result/isError"), Some(&json!(false)));
         assert_eq!(
             call.pointer("/result/structuredContent/status/exit_code"),
             Some(&json!(0))
         );
+        assert_exec_pull_contract(&list, &call);
         assert_eq!(
             call.pointer("/result/structuredContent/output/0/text"),
             Some(&json!("mcp"))
@@ -2337,6 +2353,28 @@ mod tests {
         assert_eq!(
             list.pointer("/result/tools/0/inputSchema/properties/kill_grace_ms/maximum"),
             Some(&json!(60_000))
+        );
+        assert_eq!(
+            list.pointer("/result/tools/0/inputSchema/properties/pull_policy/enum"),
+            Some(&json!(["missing", "always", "never"]))
+        );
+    }
+
+    fn assert_exec_pull_contract(list: &Value, call: &Value) {
+        assert_eq!(call.pointer("/result/isError"), Some(&json!(false)));
+        assert_eq!(
+            list.pointer("/result/tools/0/inputSchema/properties/pull_policy/default"),
+            Some(&json!("missing"))
+        );
+        assert_eq!(
+            list.pointer(
+                "/result/tools/0/outputSchema/oneOf/0/oneOf/0/properties/status/properties/resolved_image_digest/anyOf/1/type"
+            ),
+            Some(&json!("null"))
+        );
+        assert_eq!(
+            call.pointer("/result/structuredContent/status/resolved_image_digest"),
+            Some(&Value::Null)
         );
     }
 

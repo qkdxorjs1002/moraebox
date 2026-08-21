@@ -77,6 +77,8 @@ pub enum RootMode {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupMetrics {
+    #[serde(default)]
+    pub resolved_image_digest: Option<String>,
     pub root_mode: Option<RootMode>,
     pub network_setup_micros: Option<u64>,
     pub root_prepare_micros: Option<u64>,

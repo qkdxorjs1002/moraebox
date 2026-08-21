@@ -87,6 +87,22 @@ fn json_execution_errors_use_the_stable_envelope_on_stdout() {
 }
 
 #[test]
+fn json_execution_result_exposes_resolved_image_digest_slot() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_morae"));
+    command.args(["run", "--backend", "process", "--json", "--"]);
+    command.args(output_and_exit_command());
+    let output = command.output().unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    assert!(output.stderr.is_empty());
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        document.pointer("/startup/resolved_image_digest"),
+        Some(&serde_json::Value::Null)
+    );
+}
+
+#[test]
 fn process_backend_rejects_tty_from_typed_capabilities() {
     let output = Command::new(env!("CARGO_BIN_EXE_morae"))
         .args(["run", "--backend", "process", "--tty", "--", "not-executed"])

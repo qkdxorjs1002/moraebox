@@ -82,6 +82,38 @@ pub enum TimeoutPolicy {
     Unlimited,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImagePullPolicy {
+    #[default]
+    Missing,
+    Always,
+    Never,
+}
+
+impl std::fmt::Display for ImagePullPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Missing => "missing",
+            Self::Always => "always",
+            Self::Never => "never",
+        })
+    }
+}
+
+impl std::str::FromStr for ImagePullPolicy {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "missing" => Ok(Self::Missing),
+            "always" => Ok(Self::Always),
+            "never" => Ok(Self::Never),
+            _ => Err("pull policy must be one of: missing, always, never"),
+        }
+    }
+}
+
 impl TimeoutPolicy {
     pub fn duration(self) -> Option<Duration> {
         match self {
@@ -117,6 +149,8 @@ pub struct RunSpec {
     pub inherit_env: bool,
     #[serde(default)]
     pub network: bool,
+    #[serde(default)]
+    pub image_pull_policy: ImagePullPolicy,
     pub stdin: Vec<u8>,
     pub timeout: TimeoutPolicy,
     #[serde(with = "duration_millis")]
@@ -137,6 +171,7 @@ impl RunSpec {
             env: BTreeMap::new(),
             inherit_env: false,
             network: false,
+            image_pull_policy: ImagePullPolicy::default(),
             stdin: Vec::new(),
             timeout: TimeoutPolicy::default(),
             kill_grace: DEFAULT_KILL_GRACE,
@@ -210,6 +245,15 @@ mod tests {
     #[test]
     fn network_access_is_opt_in() {
         assert!(!RunSpec::command(["true"]).network);
+    }
+
+    #[test]
+    fn image_pull_policy_defaults_to_missing_and_round_trips() {
+        let spec = RunSpec::command(["true"]);
+        assert_eq!(spec.image_pull_policy, ImagePullPolicy::Missing);
+        assert_eq!("always".parse(), Ok(ImagePullPolicy::Always));
+        assert_eq!(ImagePullPolicy::Never.to_string(), "never");
+        assert!("sometimes".parse::<ImagePullPolicy>().is_err());
     }
 
     #[test]

@@ -202,7 +202,7 @@
 
 - [x] `--json` 실행 오류에도 stable JSON error envelope와 stage를 제공한다.
 
-- [ ] image pull policy `missing|always|never`를 추가하고 실제 resolved digest를 결과에 표시한다.
+- [x] image pull policy `missing|always|never`를 추가하고 실제 resolved digest를 결과에 표시한다.
 
 - [ ] `doctor`가 실제 cache volume의 reflink 지원, free space, network helper/socket, signing, ABI 상태를 각각 진단하고 remediation을 제공한다.
 

@@ -7,7 +7,7 @@ use std::{
 };
 
 use fs2::FileExt;
-use moraebox_core::{StorageRootError, ensure_private_storage_root};
+use moraebox_core::{ImagePullPolicy, StorageRootError, ensure_private_storage_root};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -376,7 +376,18 @@ impl ImageCache {
         platform: &Platform,
         credentials: Option<Credentials>,
     ) -> Result<PreparedImage, ImageCacheError> {
-        self.resolve_or_pull_with_progress(reference, platform, credentials, |_| {})
+        self.prepare(reference, platform, credentials, ImagePullPolicy::Missing)
+            .await
+    }
+
+    pub async fn prepare(
+        &self,
+        reference: &str,
+        platform: &Platform,
+        credentials: Option<Credentials>,
+        policy: ImagePullPolicy,
+    ) -> Result<PreparedImage, ImageCacheError> {
+        self.prepare_with_progress(reference, platform, credentials, policy, |_| {})
             .await
     }
 
@@ -385,15 +396,44 @@ impl ImageCache {
         reference: &str,
         platform: &Platform,
         credentials: Option<Credentials>,
+        progress: F,
+    ) -> Result<PreparedImage, ImageCacheError>
+    where
+        F: FnMut(ImageProgressStage),
+    {
+        self.prepare_with_progress(
+            reference,
+            platform,
+            credentials,
+            ImagePullPolicy::Missing,
+            progress,
+        )
+        .await
+    }
+
+    pub async fn prepare_with_progress<F>(
+        &self,
+        reference: &str,
+        platform: &Platform,
+        credentials: Option<Credentials>,
+        policy: ImagePullPolicy,
         mut progress: F,
     ) -> Result<PreparedImage, ImageCacheError>
     where
         F: FnMut(ImageProgressStage),
     {
         let canonical = canonical_reference(reference)?;
+        if policy == ImagePullPolicy::Always {
+            return self
+                .pull_with_progress(&canonical, platform, credentials, progress)
+                .await;
+        }
         progress(ImageProgressStage::CheckCache);
         if let Some(image) = self.resolve_reference(&canonical, platform)? {
             return Ok(prepared_image(image));
+        }
+        if policy == ImagePullPolicy::Never {
+            return Err(ImageCacheError::CacheOnlyMiss(canonical));
         }
         let _activity = self.lock_activity(false)?;
         let _reference =
@@ -1603,6 +1643,8 @@ pub enum ImageCacheError {
     },
     #[error("image target was not found in the cache: {0}")]
     TargetNotFound(String),
+    #[error("image is not cached and pull policy is never: {0}")]
+    CacheOnlyMiss(String),
     #[error("invalid image target: {0}")]
     InvalidTarget(String),
     #[error("invalid sha256 digest: {0}")]
@@ -1811,6 +1853,51 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(stages, vec![ImageProgressStage::CheckCache]);
+    }
+
+    #[tokio::test]
+    async fn never_policy_uses_only_a_cached_image() {
+        let fixture = Fixture::new();
+        let digest = fixture.add_image(Some("python:3.12"));
+        let mut stages = Vec::new();
+
+        let prepared = fixture
+            .cache
+            .prepare_with_progress(
+                "python:3.12",
+                &Fixture::platform(),
+                None,
+                ImagePullPolicy::Never,
+                |stage| stages.push(stage),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.manifest_digest, digest.to_string());
+        assert_eq!(stages, vec![ImageProgressStage::CheckCache]);
+    }
+
+    #[tokio::test]
+    async fn never_policy_fails_a_cache_miss_without_pulling() {
+        let fixture = Fixture::new();
+        let mut stages = Vec::new();
+
+        let error = fixture
+            .cache
+            .prepare_with_progress(
+                "example.com/missing/image:latest",
+                &Fixture::platform(),
+                None,
+                ImagePullPolicy::Never,
+                |stage| stages.push(stage),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ImageCacheError::CacheOnlyMiss(reference) if reference == "example.com/missing/image:latest")
+        );
         assert_eq!(stages, vec![ImageProgressStage::CheckCache]);
     }
 

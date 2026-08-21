@@ -80,6 +80,7 @@ pub(crate) async fn start_session<B: Backend + ?Sized>(
     let initial = SessionStatus {
         session_id: spec.session_id,
         backend: backend.name().into(),
+        resolved_image_digest: startup.resolved_image_digest.clone(),
         state: lifecycle.state(),
         termination_reason: lifecycle.termination_reason(),
         exit_code: None,
@@ -884,10 +885,14 @@ fn publish_status(
     exit_code: Option<i32>,
     signal: Option<i32>,
 ) {
-    let backend = sender.borrow().backend.clone();
+    let current = sender.borrow();
+    let backend = current.backend.clone();
+    let resolved_image_digest = current.resolved_image_digest.clone();
+    drop(current);
     let _ = sender.send(SessionStatus {
         session_id: spec.session_id,
         backend,
+        resolved_image_digest,
         state: lifecycle.state(),
         termination_reason: lifecycle.termination_reason(),
         exit_code,
@@ -1090,6 +1095,8 @@ fn record_trace_at(trace: &Arc<StdMutex<TraceRecorder>>, kind: TraceKind, elapse
 pub struct SessionStatus {
     pub session_id: SessionId,
     pub backend: String,
+    #[serde(default)]
+    pub resolved_image_digest: Option<String>,
     pub state: SessionState,
     pub termination_reason: Option<TerminationReason>,
     pub exit_code: Option<i32>,
@@ -1245,6 +1252,50 @@ mod tests {
         assert!(trace.contains(&TraceKind::FirstOutput));
         assert_eq!(trace[trace.len() - 2], TraceKind::ProcessExited);
         assert_eq!(trace.last(), Some(&TraceKind::CleanupComplete));
+    }
+
+    #[tokio::test]
+    async fn resolved_image_digest_survives_status_updates() {
+        let manager = SessionManager::new(Arc::new(ResolvedImageProcessBackend));
+        let session = manager
+            .start(RunSpec::command(stdin_echo_command()))
+            .await
+            .unwrap();
+        session.close_stdin().await.unwrap();
+
+        let status = session.wait().await.unwrap();
+
+        assert_eq!(
+            status.resolved_image_digest.as_deref(),
+            Some("sha256:resolved")
+        );
+        assert_eq!(
+            session.startup().resolved_image_digest.as_deref(),
+            Some("sha256:resolved")
+        );
+    }
+
+    struct ResolvedImageProcessBackend;
+
+    #[async_trait]
+    impl Backend for ResolvedImageProcessBackend {
+        fn name(&self) -> &'static str {
+            "resolved-image-process"
+        }
+
+        fn capabilities(&self) -> crate::BackendCapabilities {
+            ProcessBackend::CAPABILITIES
+        }
+
+        async fn spawn(
+            &self,
+            spec: &RunSpec,
+            budget: &RunBudget,
+        ) -> Result<crate::SpawnedSandbox, BackendError> {
+            let mut spawned = ProcessBackend.spawn(spec, budget).await?;
+            spawned.startup.resolved_image_digest = Some("sha256:resolved".into());
+            Ok(spawned)
+        }
     }
 
     #[tokio::test]

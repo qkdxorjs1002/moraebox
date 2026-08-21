@@ -18,8 +18,9 @@ use moraebox_box::{
     EphemeralDiskStore,
 };
 use moraebox_core::{
-    BoxId, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, OutputChannel, OutputReadError, RunSpec, SessionState,
-    Signal, StoragePaths, TimeoutPolicy, resolve_cache_dir, resolve_state_dir,
+    BoxId, ImagePullPolicy, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, OutputChannel, OutputReadError,
+    RunSpec, SessionState, Signal, StoragePaths, TimeoutPolicy, resolve_cache_dir,
+    resolve_state_dir,
 };
 use moraebox_image::{
     CacheReconcileReport, CacheUsage, CachedImage, CleanReport, Credentials, ImageCache,
@@ -172,6 +173,9 @@ struct RunArgs {
     /// OCI registry reference; uses the configured python:3.12 default when omitted.
     #[arg(long)]
     image: Option<String>,
+    /// Image acquisition policy: cache-first, forced refresh, or cache-only.
+    #[arg(long = "pull", default_value_t = ImagePullPolicy::Missing)]
+    pull_policy: ImagePullPolicy,
     /// Reuse the persistent root filesystem identified by this `BoxId`.
     #[arg(long = "box", conflicts_with_all = ["rootfs", "image", "workspace"])]
     box_id: Option<BoxId>,
@@ -229,6 +233,9 @@ struct BoxCreateArgs {
     /// OCI registry reference; uses the configured default when omitted.
     #[arg(long)]
     image: Option<String>,
+    /// Image acquisition policy: cache-first, forced refresh, or cache-only.
+    #[arg(long = "pull", default_value_t = ImagePullPolicy::Missing)]
+    pull_policy: ImagePullPolicy,
     #[arg(long, default_value = "8GiB", value_parser = parse_disk_size)]
     disk_size: u64,
     #[arg(long, env = "MORAE_REGISTRY_USERNAME", requires = "registry_password")]
@@ -372,6 +379,9 @@ struct BenchmarkArgs {
     rootfs: Option<PathBuf>,
     #[arg(long, conflicts_with = "rootfs")]
     image: Option<String>,
+    /// Image acquisition policy: cache-first, forced refresh, or cache-only.
+    #[arg(long = "pull", default_value_t = ImagePullPolicy::Missing)]
+    pull_policy: ImagePullPolicy,
     #[arg(long = "box", conflicts_with_all = ["rootfs", "image"])]
     box_id: Option<BoxId>,
     #[arg(long, default_value = "8GiB", value_parser = parse_disk_size)]
@@ -769,6 +779,7 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::
     }
     let mut spec = RunSpec::command(args.command);
     spec.box_id = args.box_id;
+    spec.image_pull_policy = args.pull_policy;
     spec.timeout = parse_timeout(&args.timeout)?;
     spec.output_limit = args.output_limit;
     spec.kill_grace = args.kill_grace;
@@ -792,6 +803,11 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::
         && (args.rootfs.is_some() || args.image.is_some() || args.workspace.is_some())
     {
         return Err("--box cannot be combined with --rootfs, --image, or --workspace".into());
+    }
+    if args.pull_policy != ImagePullPolicy::Missing
+        && (args.backend != "libkrun" || args.rootfs.is_some() || spec.box_id.is_some())
+    {
+        return Err("--pull always|never requires an image-backed libkrun run".into());
     }
     validate_network_option(capabilities, spec.network)?;
     validate_tty_option(capabilities, spec.tty)?;
@@ -848,6 +864,7 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::
                         cache_dir,
                         &platform,
                         credentials(args.registry_username, args.registry_password),
+                        args.pull_policy,
                         progress,
                     ),
                 )
@@ -886,7 +903,10 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::
         None
     };
 
-    let report = match args.backend.as_str() {
+    let resolved_image_digest = prepared_image
+        .as_ref()
+        .map(|prepared| prepared.manifest_digest.clone());
+    let mut report = match args.backend.as_str() {
         "process" => {
             if args.interactive {
                 return run_interactive(ProcessBackend, spec, budget).await;
@@ -962,6 +982,7 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::
         }
         _ => unreachable!("clap validates backend values"),
     };
+    report.startup.resolved_image_digest = resolved_image_digest;
     if let Some(workspace) = &workspace {
         workspace.verify_source_unchanged()?;
     }
@@ -1398,10 +1419,11 @@ async fn resolve_or_pull(
     cache_dir: &std::path::Path,
     platform: &Platform,
     credentials: Option<Credentials>,
+    policy: ImagePullPolicy,
     progress: CliProgress,
 ) -> Result<PreparedImage, Box<dyn std::error::Error>> {
     ImageCache::new(cache_dir)
-        .resolve_or_pull_with_progress(reference, platform, credentials, move |stage| {
+        .prepare_with_progress(reference, platform, credentials, policy, move |stage| {
             progress.image(stage);
         })
         .await
@@ -1422,10 +1444,11 @@ async fn box_create(
     let platform = Platform::host_linux();
     let progress = CliProgress::new(global.json);
     let prepared = cache
-        .resolve_or_pull_with_progress(
+        .prepare_with_progress(
             &reference,
             &platform,
             credentials(args.registry_username, args.registry_password),
+            args.pull_policy,
             move |stage| progress.image(stage),
         )
         .await?;
@@ -1938,6 +1961,7 @@ async fn benchmark(
     args: BenchmarkArgs,
     global: &GlobalOptions,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    validate_benchmark_pull_policy(&args)?;
     let command = args.command;
     let report = match args.backend.as_str() {
         "process" => {
@@ -1959,24 +1983,21 @@ async fn benchmark(
             let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
             let platform = Platform::host_linux();
             let prepared_image = if args.box_id.is_none() && args.rootfs.is_none() {
-                let cache = ImageCache::new(&cache_dir);
-                let reference = match args.image {
-                    Some(reference) => reference,
-                    None => cache.default_reference()?,
-                };
                 Some(
-                    cache
-                        .resolve_or_pull(
-                            &reference,
-                            &platform,
-                            credentials(args.registry_username, args.registry_password),
-                        )
-                        .await?,
+                    prepare_benchmark_image(
+                        &cache_dir,
+                        &platform,
+                        args.image,
+                        credentials(args.registry_username, args.registry_password),
+                        args.pull_policy,
+                    )
+                    .await?,
                 )
             } else {
                 None
             };
             let mke2fs = global.mke2fs.clone().unwrap_or_else(default_mke2fs);
+            let digest = prepared_digest(prepared_image.as_ref());
             let root_source = if args.box_id.is_some() {
                 None
             } else if let Some(prepared) = prepared_image {
@@ -2021,7 +2042,7 @@ async fn benchmark(
                 source: root_source,
                 e2fsck_path: global.e2fsck.clone().unwrap_or_else(default_e2fsck),
             };
-            run_benchmark(
+            let mut report = run_benchmark(
                 &Supervisor::new(LibkrunBackend::new(config).with_box_runtime(runtime)),
                 command,
                 args.iterations,
@@ -2029,12 +2050,42 @@ async fn benchmark(
                 args.output_limit,
                 args.kill_grace,
             )
-            .await?
+            .await?;
+            report.resolved_image_digest = digest;
+            report
         }
         _ => unreachable!("clap validates backend values"),
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(i32::from(report.failures > 0))
+}
+
+fn validate_benchmark_pull_policy(args: &BenchmarkArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.pull_policy != ImagePullPolicy::Missing
+        && (args.backend != "libkrun" || args.box_id.is_some() || args.rootfs.is_some())
+    {
+        return Err("--pull always|never requires an image-backed libkrun benchmark".into());
+    }
+    Ok(())
+}
+
+async fn prepare_benchmark_image(
+    cache_dir: &Path,
+    platform: &Platform,
+    image: Option<String>,
+    credentials: Option<Credentials>,
+    policy: ImagePullPolicy,
+) -> Result<PreparedImage, Box<dyn std::error::Error>> {
+    let cache = ImageCache::new(cache_dir);
+    let reference = image.map_or_else(|| cache.default_reference(), Ok)?;
+    cache
+        .prepare(&reference, platform, credentials, policy)
+        .await
+        .map_err(Into::into)
+}
+
+fn prepared_digest(image: Option<&PreparedImage>) -> Option<String> {
+    image.map(|image| image.manifest_digest.clone())
 }
 
 async fn run_benchmark<B: Backend>(
@@ -2098,6 +2149,7 @@ async fn run_benchmark<B: Backend>(
     Ok(BenchmarkReport {
         backend: backend.into(),
         mode: benchmark_mode(supervisor.backend_capabilities()).into(),
+        resolved_image_digest: None,
         iterations,
         failures,
         min_micros: samples[0],
@@ -2158,6 +2210,7 @@ struct BoxMutationReport {
 struct BenchmarkReport {
     backend: String,
     mode: String,
+    resolved_image_digest: Option<String>,
     iterations: u32,
     failures: u32,
     min_micros: u64,
@@ -2402,6 +2455,43 @@ mod tests {
         };
         assert_eq!(explicit.output_limit, 4096);
         assert_eq!(explicit.kill_grace, Duration::from_millis(750));
+    }
+
+    #[test]
+    fn parses_image_pull_policy_for_image_backed_commands() {
+        let default = Cli::try_parse_from(["morae", "run", "--", "/bin/true"]).unwrap();
+        let Command::Run(default) = default.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(default.pull_policy, ImagePullPolicy::Missing);
+
+        let run =
+            Cli::try_parse_from(["morae", "run", "--pull", "never", "--", "/bin/true"]).unwrap();
+        let Command::Run(run) = run.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(run.pull_policy, ImagePullPolicy::Never);
+
+        let create = Cli::try_parse_from(["morae", "box", "create", "--pull", "always"]).unwrap();
+        let Command::Box {
+            command: BoxCommand::Create(create),
+        } = create.command
+        else {
+            panic!("expected box create command");
+        };
+        assert_eq!(create.pull_policy, ImagePullPolicy::Always);
+
+        assert!(
+            Cli::try_parse_from([
+                "morae",
+                "benchmark",
+                "--pull",
+                "sometimes",
+                "--",
+                "/bin/true",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
