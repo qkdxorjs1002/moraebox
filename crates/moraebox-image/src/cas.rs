@@ -7,6 +7,8 @@ use std::{
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::lock::AdvisoryLock;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Digest([u8; 32]);
 
@@ -73,6 +75,7 @@ impl Cas {
                 actual,
             });
         }
+        let _lock = AdvisoryLock::acquire(&self.lock_path(expected)).await?;
         let destination = self.blob_path(expected);
         if tokio::fs::try_exists(&destination).await? {
             self.read(expected).await?;
@@ -108,6 +111,12 @@ impl Cas {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn lock_path(&self, digest: &Digest) -> PathBuf {
+        self.root
+            .join("locks/sha256")
+            .join(format!("{}.lock", digest.hex()))
     }
 }
 
@@ -166,5 +175,24 @@ mod tests {
                 if expected == digest && actual == Digest::from_bytes(b"corrupt")
         ));
         assert_eq!(tokio::fs::read(path).await.unwrap(), b"corrupt");
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_digest_publish_is_double_checked() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = Cas::new(directory.path());
+        let digest = Digest::from_bytes(b"shared");
+
+        let (first, second) = tokio::join!(
+            cas.put_verified(&digest, b"shared"),
+            cas.put_verified(&digest, b"shared")
+        );
+
+        assert_eq!(first.unwrap(), cas.blob_path(&digest));
+        assert_eq!(second.unwrap(), cas.blob_path(&digest));
+        assert_eq!(
+            tokio::fs::read(cas.blob_path(&digest)).await.unwrap(),
+            b"shared"
+        );
     }
 }

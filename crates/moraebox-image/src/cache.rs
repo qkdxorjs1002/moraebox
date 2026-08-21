@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::{
     Cas, Credentials, Digest, ImageManifest, ImageReference, Platform, RegistryClient,
-    RegistryError, reference::Selector,
+    RegistryError, lock::AdvisoryLock, reference::Selector,
 };
 
 const SCHEMA_VERSION: u32 = 1;
@@ -119,6 +119,37 @@ struct RootfsEntry {
 }
 
 #[derive(Debug)]
+struct StagedRootfs {
+    directory: PathBuf,
+    rootfs: PathBuf,
+}
+
+impl StagedRootfs {
+    fn new(cache_root: &Path, digest: &Digest) -> Self {
+        let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = cache_root.join("tmp/rootfs").join(format!(
+            "{}.{}.{}",
+            digest.hex(),
+            std::process::id(),
+            sequence
+        ));
+        let rootfs = directory.join("rootfs");
+        Self { directory, rootfs }
+    }
+
+    fn publish(&self, destination: &Path) -> Result<(), ImageCacheError> {
+        fs::rename(&self.rootfs, destination)?;
+        Ok(())
+    }
+}
+
+impl Drop for StagedRootfs {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+#[derive(Debug)]
 enum ImageTarget {
     Digest(Digest),
     Reference(String),
@@ -153,7 +184,6 @@ impl ImageCache {
 
     fn record_pulled_image(
         &self,
-        _lock: &CacheLock,
         reference: &str,
         source_manifest_digest: &Digest,
         manifest_digest: &Digest,
@@ -217,16 +247,17 @@ impl ImageCache {
         platform: &Platform,
         credentials: Option<Credentials>,
     ) -> Result<PreparedImage, ImageCacheError> {
-        if let Some(image) = self.resolve_reference(reference, platform)? {
-            return Ok(prepared_image(image));
-        }
-        let lock = self.lock_exclusive()?;
         let canonical = canonical_reference(reference)?;
-        if let Some(image) = self.resolve_reference_unlocked(&canonical, platform)? {
+        if let Some(image) = self.resolve_reference(&canonical, platform)? {
             return Ok(prepared_image(image));
         }
-        self.pull_locked(&lock, &canonical, platform, credentials)
-            .await
+        let _activity = self.lock_activity(false)?;
+        let _reference =
+            AdvisoryLock::acquire(&self.reference_lock_path(&canonical, platform)).await?;
+        if let Some(image) = self.resolve_reference(&canonical, platform)? {
+            return Ok(prepared_image(image));
+        }
+        self.pull_unlocked(&canonical, platform, credentials).await
     }
 
     pub async fn pull(
@@ -235,10 +266,11 @@ impl ImageCache {
         platform: &Platform,
         credentials: Option<Credentials>,
     ) -> Result<PreparedImage, ImageCacheError> {
-        let lock = self.lock_exclusive()?;
         let canonical = canonical_reference(reference)?;
-        self.pull_locked(&lock, &canonical, platform, credentials)
-            .await
+        let _activity = self.lock_activity(false)?;
+        let _reference =
+            AdvisoryLock::acquire(&self.reference_lock_path(&canonical, platform)).await?;
+        self.pull_unlocked(&canonical, platform, credentials).await
     }
 
     fn resolve_reference_unlocked(
@@ -289,9 +321,8 @@ impl ImageCache {
         }))
     }
 
-    async fn pull_locked(
+    async fn pull_unlocked(
         &self,
-        lock: &CacheLock,
         reference: &str,
         platform: &Platform,
         credentials: Option<Credentials>,
@@ -305,25 +336,48 @@ impl ImageCache {
         let image = RegistryClient::new(credentials)?
             .pull(reference, platform, &cas)
             .await?;
-        let rootfs = self.rootfs_path(&image.manifest_digest);
+        let staging = StagedRootfs::new(&self.root, &image.manifest_digest);
         let materialize_image = image.clone();
         let materialize_cas = cas.clone();
-        let materialize_rootfs = rootfs.clone();
-        tokio::task::spawn_blocking(move || {
-            materialize_image.materialize_rootfs(&materialize_cas, &materialize_rootfs)
+        let materialize_rootfs = staging.rootfs.clone();
+        let staging = tokio::task::spawn_blocking(move || {
+            materialize_image.materialize_rootfs(&materialize_cas, &materialize_rootfs)?;
+            Ok::<_, RegistryError>(staging)
         })
         .await
         .map_err(|error| ImageCacheError::Task(error.to_string()))??;
-        self.record_pulled_image(
-            lock,
+        self.publish_staged_rootfs(
+            staging,
             &image.reference.to_string(),
             &image.source_manifest_digest,
             &image.manifest_digest,
             platform,
-        )?;
+        )
+        .await
+    }
+
+    async fn publish_staged_rootfs(
+        &self,
+        staging: StagedRootfs,
+        reference: &str,
+        source_manifest_digest: &Digest,
+        manifest_digest: &Digest,
+        platform: &Platform,
+    ) -> Result<PreparedImage, ImageCacheError> {
+        let rootfs = self.rootfs_path(manifest_digest);
+        let _digest = AdvisoryLock::acquire(&self.rootfs_lock_path(manifest_digest)).await?;
+        let _metadata = AdvisoryLock::acquire(&self.metadata_lock_path()).await?;
+        if !is_complete_rootfs(&rootfs) {
+            if rootfs.exists() {
+                return Err(RegistryError::RootfsExists(rootfs.clone()).into());
+            }
+            fs::create_dir_all(self.rootfs_directory())?;
+            staging.publish(&rootfs)?;
+        }
+        self.record_pulled_image(reference, source_manifest_digest, manifest_digest, platform)?;
         Ok(PreparedImage {
-            reference: image.reference.to_string(),
-            manifest_digest: image.manifest_digest.to_string(),
+            reference: reference.into(),
+            manifest_digest: manifest_digest.to_string(),
             rootfs,
         })
     }
@@ -347,6 +401,7 @@ impl ImageCache {
     }
 
     pub fn remove(&self, target: &str, apply: bool) -> Result<RemoveReport, ImageCacheError> {
+        let _activity = apply.then(|| self.lock_activity(true)).transpose()?;
         let _lock = self.lock_exclusive()?;
         let target_kind = parse_target(target)?;
         let records = self.read_records()?;
@@ -439,6 +494,7 @@ impl ImageCache {
     }
 
     pub fn prune(&self, apply: bool) -> Result<PruneReport, ImageCacheError> {
+        let _activity = apply.then(|| self.lock_activity(true)).transpose()?;
         let _lock = self.lock_exclusive()?;
         let roots = self.read_rootfs_entries()?;
         let complete = roots
@@ -508,6 +564,7 @@ impl ImageCache {
     }
 
     pub fn clean(&self, apply: bool) -> Result<CleanReport, ImageCacheError> {
+        let _activity = apply.then(|| self.lock_activity(true)).transpose()?;
         let _lock = self.lock_exclusive()?;
         let paths = [
             self.root.join("images"),
@@ -538,21 +595,28 @@ impl ImageCache {
     }
 
     fn lock(&self, exclusive: bool) -> Result<CacheLock, ImageCacheError> {
+        self.lock_path(&self.metadata_lock_path(), exclusive)
+    }
+
+    fn lock_activity(&self, exclusive: bool) -> Result<CacheLock, ImageCacheError> {
+        self.lock_path(&self.activity_lock_path(), exclusive)
+    }
+
+    fn lock_path(&self, path: &Path, exclusive: bool) -> Result<CacheLock, ImageCacheError> {
         fs::create_dir_all(&self.root)?;
-        let path = self.root.join(".moraebox-cache.lock");
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&path)?;
+            .open(path)?;
         let result = if exclusive {
             FileExt::try_lock_exclusive(&file)
         } else {
             FileExt::try_lock_shared(&file)
         };
         result.map_err(|error| ImageCacheError::Busy {
-            path,
+            path: path.into(),
             source: error,
         })?;
         Ok(CacheLock { file })
@@ -758,6 +822,32 @@ impl ImageCache {
 
     fn default_path(&self) -> PathBuf {
         self.root.join("default-image.json")
+    }
+
+    fn metadata_lock_path(&self) -> PathBuf {
+        self.root.join(".moraebox-cache.lock")
+    }
+
+    fn activity_lock_path(&self) -> PathBuf {
+        self.root.join(".moraebox-cache.activity.lock")
+    }
+
+    fn reference_lock_path(&self, reference: &str, platform: &Platform) -> PathBuf {
+        let key = format!(
+            "{reference}\0{}\0{}\0{}",
+            platform.os,
+            platform.architecture,
+            platform.variant.as_deref().unwrap_or_default()
+        );
+        self.root
+            .join("locks/references")
+            .join(format!("{}.lock", Digest::from_bytes(key.as_bytes()).hex()))
+    }
+
+    fn rootfs_lock_path(&self, digest: &Digest) -> PathBuf {
+        self.root
+            .join("locks/rootfs")
+            .join(format!("{}.lock", digest.hex()))
     }
 
     fn record_directory(&self) -> PathBuf {
@@ -1176,7 +1266,6 @@ mod tests {
         fixture
             .cache
             .record_pulled_image(
-                &lock,
                 &reference,
                 &source_digest,
                 &selected_digest,
@@ -1195,7 +1284,6 @@ mod tests {
         fixture
             .cache
             .record_pulled_image(
-                &lock,
                 &reference,
                 &Digest::from_bytes(b"wrong-source"),
                 &selected_digest,
@@ -1339,5 +1427,105 @@ mod tests {
             fixture.cache.lock_exclusive(),
             Err(ImageCacheError::Busy { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn reference_locks_do_not_depend_on_the_global_metadata_lock() {
+        let fixture = Fixture::new();
+        let _metadata = fixture.cache.lock_exclusive().unwrap();
+        let path = fixture
+            .cache
+            .reference_lock_path(BUILTIN_DEFAULT_IMAGE, &Fixture::platform());
+
+        let lock = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            AdvisoryLock::acquire(&path),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        drop(lock);
+    }
+
+    #[test]
+    fn destructive_management_rejects_an_active_pull_lease() {
+        let fixture = Fixture::new();
+        let activity = fixture.cache.lock_activity(false).unwrap();
+
+        assert!(matches!(
+            fixture.cache.clean(true),
+            Err(ImageCacheError::Busy { .. })
+        ));
+
+        drop(activity);
+        assert!(fixture.cache.clean(true).unwrap().applied);
+    }
+
+    #[tokio::test]
+    async fn same_digest_rootfs_publish_is_double_checked() {
+        let fixture = Fixture::new();
+        let digest = Digest::from_bytes(b"shared-rootfs");
+        let source = Digest::from_bytes(b"source-index");
+        let first = staged_rootfs(&fixture.cache, &digest, b"first");
+        let second = staged_rootfs(&fixture.cache, &digest, b"second");
+        let first_directory = first.directory.clone();
+        let second_directory = second.directory.clone();
+        let platform = Fixture::platform();
+
+        let (first_result, second_result) = tokio::join!(
+            fixture.cache.publish_staged_rootfs(
+                first,
+                "example.com/a:first",
+                &source,
+                &digest,
+                &platform,
+            ),
+            fixture.cache.publish_staged_rootfs(
+                second,
+                "example.com/a:second",
+                &source,
+                &digest,
+                &platform,
+            )
+        );
+
+        assert_eq!(
+            first_result.unwrap().rootfs,
+            fixture.cache.rootfs_path(&digest)
+        );
+        assert_eq!(
+            second_result.unwrap().rootfs,
+            fixture.cache.rootfs_path(&digest)
+        );
+        assert!(is_complete_rootfs(&fixture.cache.rootfs_path(&digest)));
+        assert!(!first_directory.exists());
+        assert!(!second_directory.exists());
+        assert!(
+            fixture
+                .cache
+                .resolve_reference("example.com/a:first", &Fixture::platform())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            fixture
+                .cache
+                .resolve_reference("example.com/a:second", &Fixture::platform())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    fn staged_rootfs(cache: &ImageCache, digest: &Digest, payload: &[u8]) -> StagedRootfs {
+        let staging = StagedRootfs::new(cache.root(), digest);
+        fs::create_dir_all(&staging.rootfs).unwrap();
+        fs::write(
+            staging.rootfs.join(CURRENT_COMPLETE_MARKER),
+            digest.to_string(),
+        )
+        .unwrap();
+        fs::write(staging.rootfs.join("payload"), payload).unwrap();
+        staging
     }
 }

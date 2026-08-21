@@ -5,6 +5,7 @@
 mod cache;
 mod cas;
 mod layer;
+mod lock;
 mod reference;
 mod registry;
 mod workspace;

@@ -163,7 +163,7 @@
 
 ### OCI/cache/workspace performance
 
-- [ ] cache 전체 배타 lock을 reference/digest/key 단위 lock으로 분리한다.
+- [x] cache 전체 배타 lock을 reference/digest/key 단위 lock으로 분리한다.
   - network download와 layer materialization은 global metadata lock 밖에서 수행한다.
   - 동일 digest publish는 짧은 atomic critical section에서 double-check한다.
 
