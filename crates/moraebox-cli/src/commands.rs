@@ -3,22 +3,24 @@ use super::{
     BoxCommand, BoxCreateArgs, BoxDeleteArgs, BoxId, BoxListArgs, BoxMetadata, BoxRepairArgs,
     BoxRepairReport, BoxResetArgs, BoxShowArgs, BoxStore, CacheCleanArgs, CacheCommand,
     CacheInfoArgs, CachePruneArgs, CacheReconcileArgs, CacheReconcileReport, CacheUsage,
-    CachedImage, CleanReport, Cli, Command, CommandFactory, CompletionArgs, CreateBox, Credentials,
-    DiskToolPaths, DoctorArgs, DoctorReport, Duration, ExitCode, GlobalOptions, ImageCache,
-    ImageCommand, ImageDefaultArgs, ImageListArgs, ImageProgressStage, ImagePullArgs,
-    ImagePullPolicy, ImageRemoveArgs, IsTerminal, IsolationLevel, LibkrunBackend, MAX_KILL_GRACE,
-    MAX_OUTPUT_LIMIT, ManagedStorage, NativeRuntimeOverrides, NativeRuntimePaths,
-    NativeSandboxConfig, OutputChannel, Path, Platform, PreparedImage, ProcessBackend, PruneReport,
-    Read, RemoveReport, RootfsMetadataIssueKind, RunArgs, RunBudget, RunSpec, RunStage, Serialize,
-    StoragePaths, Supervisor, TimeoutPolicy, WorkspaceSnapshot, WorkspaceStage, Write, fs, io,
-    resolve_cache_dir, resolve_state_dir, run_interactive,
+    CachedImage, CleanReport, Cli, CliError, CliErrorSource, Command, CommandFactory,
+    CompletionArgs, CreateBox, Credentials, DiskToolPaths, DoctorArgs, DoctorReport, Duration,
+    ExitCode, GlobalOptions, ImageCache, ImageCommand, ImageDefaultArgs, ImageListArgs,
+    ImageProgressStage, ImagePullArgs, ImagePullPolicy, ImageRemoveArgs, IsTerminal,
+    IsolationLevel, LibkrunBackend, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, ManagedStorage,
+    NativeRuntimeOverrides, NativeRuntimePaths, NativeSandboxConfig, OutputChannel, Path, Platform,
+    PreparedImage, ProcessBackend, PruneReport, Read, RemoveReport, RootfsMetadataIssueKind,
+    RunArgs, RunBudget, RunSpec, RunStage, Serialize, StoragePaths, Supervisor, TimeoutPolicy,
+    WorkspaceSnapshot, WorkspaceStage, Write, command_stage, fs, io, resolve_cache_dir,
+    resolve_state_dir, run_interactive,
 };
 use std::collections::BTreeMap;
 
-pub(super) async fn execute(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
+pub(super) async fn execute(cli: Cli) -> Result<i32, CliError> {
     let Cli { global, command } = cli;
+    let stage = command_stage(&command);
     warn_project_local_storage(&global, storage_use(&command));
-    match command {
+    let result = match command {
         Command::Doctor(args) => doctor(&args, &global),
         Command::Run(args) => run(*args, &global).await,
         Command::Image {
@@ -71,7 +73,8 @@ pub(super) async fn execute(cli: Cli) -> Result<i32, Box<dyn std::error::Error>>
             completion(&args);
             Ok(0)
         }
-    }
+    };
+    result.map_err(|source| CliError::for_command(stage, source))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -162,7 +165,7 @@ fn completion(args: &CompletionArgs) {
     clap_complete::generate(args.shell, &mut command, "morae", &mut io::stdout());
 }
 
-fn doctor(args: &DoctorArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::error::Error>> {
+fn doctor(args: &DoctorArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     let paths = NativeRuntimePaths::discover_with_gvproxy(
         global.helper.clone(),
         global.libkrun.clone(),
@@ -232,7 +235,7 @@ fn doctor(args: &DoctorArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std:
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::error::Error>> {
+async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     if args.interactive && global.json {
         return Err("--interactive cannot be combined with --json".into());
     }
@@ -357,7 +360,8 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::
                         move |stage| progress.workspace(stage),
                     ),
                 )
-                .await?,
+                .await
+                .map_err(CliErrorSource::from_stage)?,
         )
     } else {
         None
@@ -513,7 +517,7 @@ fn select_image_reference(
     has_rootfs: bool,
     explicit_image: Option<String>,
     cache_dir: Option<&std::path::Path>,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
+) -> Result<Option<String>, CliErrorSource> {
     if backend != "libkrun" {
         if has_rootfs {
             return Err("--rootfs requires --backend libkrun".into());
@@ -542,7 +546,7 @@ async fn resolve_or_pull(
     credentials: Option<Credentials>,
     policy: ImagePullPolicy,
     progress: CliProgress,
-) -> Result<PreparedImage, Box<dyn std::error::Error>> {
+) -> Result<PreparedImage, CliErrorSource> {
     ImageCache::new(cache_dir)
         .prepare_with_progress(reference, platform, credentials, policy, move |stage| {
             progress.image(stage);
@@ -551,10 +555,7 @@ async fn resolve_or_pull(
         .map_err(Into::into)
 }
 
-async fn box_create(
-    args: BoxCreateArgs,
-    global: &GlobalOptions,
-) -> Result<i32, Box<dyn std::error::Error>> {
+async fn box_create(args: BoxCreateArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
     let cache = ImageCache::new(&cache_dir);
@@ -596,10 +597,7 @@ async fn box_create(
     Ok(0)
 }
 
-fn box_list(
-    _args: &BoxListArgs,
-    global: &GlobalOptions,
-) -> Result<i32, Box<dyn std::error::Error>> {
+fn box_list(_args: &BoxListArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
     let report = BoxStore::new(state_dir).list()?;
     if global.json {
@@ -631,17 +629,14 @@ fn box_list(
     Ok(0)
 }
 
-fn box_show(args: &BoxShowArgs, global: &GlobalOptions) -> Result<i32, Box<dyn std::error::Error>> {
+fn box_show(args: &BoxShowArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
     let metadata = BoxStore::new(state_dir).get(args.box_id)?;
     print_box_result(&metadata, global.json)?;
     Ok(0)
 }
 
-fn box_delete(
-    args: &BoxDeleteArgs,
-    global: &GlobalOptions,
-) -> Result<i32, Box<dyn std::error::Error>> {
+fn box_delete(args: &BoxDeleteArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     debug_assert!(args.yes, "clap requires --yes");
     let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
     let metadata = BoxStore::new(state_dir).delete(args.box_id)?;
@@ -660,10 +655,7 @@ fn box_delete(
     Ok(0)
 }
 
-fn box_reset(
-    args: &BoxResetArgs,
-    global: &GlobalOptions,
-) -> Result<i32, Box<dyn std::error::Error>> {
+fn box_reset(args: &BoxResetArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     debug_assert!(args.yes, "clap requires --yes");
     let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
@@ -687,10 +679,7 @@ fn box_reset(
     Ok(0)
 }
 
-fn box_clone(
-    args: &BoxCloneArgs,
-    global: &GlobalOptions,
-) -> Result<i32, Box<dyn std::error::Error>> {
+fn box_clone(args: &BoxCloneArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     debug_assert!(args.yes, "clap requires --yes");
     let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
     let metadata = BoxStore::new(state_dir).clone_box(args.box_id)?;
@@ -698,10 +687,7 @@ fn box_clone(
     Ok(0)
 }
 
-fn box_repair(
-    args: &BoxRepairArgs,
-    global: &GlobalOptions,
-) -> Result<i32, Box<dyn std::error::Error>> {
+fn box_repair(args: &BoxRepairArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     let apply = destructive_mode(args.dry_run, args.yes, "box repair")?;
     let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
     let report = BoxStore::new(state_dir).repair(apply)?;
@@ -739,7 +725,7 @@ fn print_box_repair_report(report: &BoxRepairReport) {
     }
 }
 
-fn print_box_result(metadata: &BoxMetadata, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn print_box_result(metadata: &BoxMetadata, json: bool) -> Result<(), CliErrorSource> {
     if json {
         println!("{}", serde_json::to_string_pretty(metadata)?);
     } else {
@@ -753,10 +739,7 @@ fn print_box_result(metadata: &BoxMetadata, json: bool) -> Result<(), Box<dyn st
     Ok(())
 }
 
-async fn image_pull(
-    args: ImagePullArgs,
-    global: &GlobalOptions,
-) -> Result<i32, Box<dyn std::error::Error>> {
+async fn image_pull(args: ImagePullArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let platform = Platform {
         os: args.os,
@@ -790,7 +773,7 @@ async fn pull_and_materialize(
     platform: &Platform,
     credentials: Option<Credentials>,
     progress: CliProgress,
-) -> Result<PreparedImage, Box<dyn std::error::Error>> {
+) -> Result<PreparedImage, CliErrorSource> {
     ImageCache::new(cache_dir)
         .pull_with_progress(reference, platform, credentials, move |stage| {
             progress.image(stage);
@@ -799,10 +782,7 @@ async fn pull_and_materialize(
         .map_err(Into::into)
 }
 
-fn image_list(
-    _args: &ImageListArgs,
-    global: &GlobalOptions,
-) -> Result<i32, Box<dyn std::error::Error>> {
+fn image_list(_args: &ImageListArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let images = ImageCache::new(cache_dir).list()?;
     if global.json {
@@ -813,10 +793,7 @@ fn image_list(
     Ok(0)
 }
 
-fn image_remove(
-    args: &ImageRemoveArgs,
-    global: &GlobalOptions,
-) -> Result<i32, Box<dyn std::error::Error>> {
+fn image_remove(args: &ImageRemoveArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let report = ImageCache::new(cache_dir).remove(&args.target, !args.dry_run)?;
     if global.json {
@@ -827,10 +804,7 @@ fn image_remove(
     Ok(0)
 }
 
-fn image_default(
-    args: &ImageDefaultArgs,
-    global: &GlobalOptions,
-) -> Result<i32, Box<dyn std::error::Error>> {
+fn image_default(args: &ImageDefaultArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let cache = ImageCache::new(cache_dir);
     let reference = if args.unset {
@@ -913,10 +887,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn cache_info(
-    _args: &CacheInfoArgs,
-    global: &GlobalOptions,
-) -> Result<i32, Box<dyn std::error::Error>> {
+fn cache_info(_args: &CacheInfoArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let usage = ImageCache::new(cache_dir).usage()?;
     if global.json {
@@ -930,7 +901,7 @@ fn cache_info(
 fn cache_reconcile(
     args: &CacheReconcileArgs,
     global: &GlobalOptions,
-) -> Result<i32, Box<dyn std::error::Error>> {
+) -> Result<i32, CliErrorSource> {
     let apply = destructive_mode(args.dry_run, args.yes, "cache reconcile")?;
     let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let report = ImageCache::new(cache_dir).reconcile(apply)?;
@@ -942,10 +913,7 @@ fn cache_reconcile(
     Ok(0)
 }
 
-fn cache_prune(
-    args: &CachePruneArgs,
-    global: &GlobalOptions,
-) -> Result<i32, Box<dyn std::error::Error>> {
+fn cache_prune(args: &CachePruneArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     let apply = destructive_mode(args.dry_run, args.yes, "cache prune")?;
     let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let report = ImageCache::new(cache_dir).prune(apply)?;
@@ -957,10 +925,7 @@ fn cache_prune(
     Ok(0)
 }
 
-fn cache_clean(
-    args: &CacheCleanArgs,
-    global: &GlobalOptions,
-) -> Result<i32, Box<dyn std::error::Error>> {
+fn cache_clean(args: &CacheCleanArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     debug_assert!(args.all, "clap requires --all");
     let apply = destructive_mode(args.dry_run, args.yes, "cache clean --all")?;
     let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
@@ -1078,10 +1043,7 @@ fn credentials(username: Option<String>, password: Option<String>) -> Option<Cre
         .map(|(username, password)| Credentials { username, password })
 }
 
-async fn benchmark(
-    args: BenchmarkArgs,
-    global: &GlobalOptions,
-) -> Result<i32, Box<dyn std::error::Error>> {
+async fn benchmark(args: BenchmarkArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
     validate_benchmark_pull_policy(&args)?;
     let command = args.command;
     let report = match args.backend.as_str() {
@@ -1167,7 +1129,7 @@ async fn benchmark(
     Ok(i32::from(report.failures > 0))
 }
 
-fn validate_benchmark_pull_policy(args: &BenchmarkArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn validate_benchmark_pull_policy(args: &BenchmarkArgs) -> Result<(), CliErrorSource> {
     if args.pull_policy != ImagePullPolicy::Missing
         && (args.backend != "libkrun" || args.box_id.is_some() || args.rootfs.is_some())
     {
@@ -1182,7 +1144,7 @@ async fn prepare_benchmark_image(
     image: Option<String>,
     credentials: Option<Credentials>,
     policy: ImagePullPolicy,
-) -> Result<PreparedImage, Box<dyn std::error::Error>> {
+) -> Result<PreparedImage, CliErrorSource> {
     let cache = ImageCache::new(cache_dir);
     let reference = image.map_or_else(|| cache.default_reference(), Ok)?;
     cache
@@ -1202,7 +1164,7 @@ async fn run_benchmark<B: Backend>(
     box_id: Option<BoxId>,
     output_limit: usize,
     kill_grace: Duration,
-) -> Result<BenchmarkReport, Box<dyn std::error::Error>> {
+) -> Result<BenchmarkReport, CliErrorSource> {
     let mut samples = Vec::with_capacity(iterations as usize);
     let mut backend_ready_samples = Vec::with_capacity(iterations as usize);
     let mut command_start_samples = Vec::with_capacity(iterations as usize);
@@ -1396,12 +1358,12 @@ pub(super) fn parse_kill_grace(input: &str) -> Result<Duration, String> {
     Ok(duration)
 }
 
-fn parse_timeout(input: &str) -> Result<TimeoutPolicy, Box<dyn std::error::Error>> {
+fn parse_timeout(input: &str) -> Result<TimeoutPolicy, CliErrorSource> {
     if input.eq_ignore_ascii_case("none") || input == "0" {
         return Ok(TimeoutPolicy::Unlimited);
     }
-    let duration: Duration = humantime::parse_duration(input)?;
-    let milliseconds = u64::try_from(duration.as_millis())?;
+    let duration: Duration = humantime::parse_duration(input).map_err(|error| error.to_string())?;
+    let milliseconds = u64::try_from(duration.as_millis()).map_err(|error| error.to_string())?;
     if milliseconds == 0 {
         return Err("timeout must be non-zero or 'none'".into());
     }

@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
+mod errors;
 mod registration;
 mod tools;
 mod transport;
 
+use errors::McpServerError;
 use tools::parse_disk_size;
 use transport::serve;
 
@@ -254,7 +256,11 @@ async fn main() -> ExitCode {
         return match registration::install(&args).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("morae-mcp: {error}");
+                eprintln!(
+                    "morae-mcp: {error} (stage={}, retryable={})",
+                    error.stage(),
+                    error.retryable()
+                );
                 ExitCode::FAILURE
             }
         };
@@ -263,12 +269,20 @@ async fn main() -> ExitCode {
         Ok(server) => match serve(server).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("morae-mcp: {error}");
+                eprintln!(
+                    "morae-mcp: {error} (stage={}, retryable={})",
+                    error.stage(),
+                    error.retryable()
+                );
                 ExitCode::FAILURE
             }
         },
         Err(error) => {
-            eprintln!("morae-mcp: {error}");
+            eprintln!(
+                "morae-mcp: {error} (stage={}, retryable={})",
+                error.stage(),
+                error.retryable()
+            );
             ExitCode::FAILURE
         }
     }
@@ -299,7 +313,7 @@ fn should_show_bare_help(raw_args: &[OsString], parsed: &Args) -> bool {
 }
 
 #[allow(clippy::too_many_lines)]
-fn create_server(args: ServerArgs) -> Result<McpServer, Box<dyn std::error::Error>> {
+fn create_server(args: ServerArgs) -> Result<McpServer, McpServerError> {
     let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
     let state_dir = resolve_state_dir(args.state_dir.as_deref())?;
     let platform = Platform::host_linux();

@@ -35,11 +35,13 @@ use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
 mod commands;
+mod errors;
 mod interactive;
 
 use commands::{
     execute, exit_code, parse_disk_size, parse_env, parse_kill_grace, parse_output_limit,
 };
+use errors::{CliError, CliErrorSource};
 use interactive::run_interactive;
 
 #[derive(Debug, Parser)]
@@ -431,51 +433,20 @@ struct CliErrorDocument {
 #[derive(Debug, Serialize)]
 struct CliErrorEnvelope {
     code: &'static str,
-    stage: &'static str,
+    stage: String,
     retryable: bool,
     message: String,
     remediation: &'static str,
 }
 
 impl CliErrorEnvelope {
-    fn for_command(stage: &'static str, error: &dyn std::error::Error) -> Self {
-        let (code, remediation) = if stage == "run" || stage == "benchmark" {
-            (
-                "execution_failed",
-                "Review the command, backend options, and diagnostics, then retry.",
-            )
-        } else if stage.starts_with("image_") {
-            (
-                "image_operation_failed",
-                "Check the image reference, registry access, cache permissions, and retry.",
-            )
-        } else if stage.starts_with("box_") {
-            (
-                "box_operation_failed",
-                "Inspect Box state and storage permissions before retrying the operation.",
-            )
-        } else if stage.starts_with("cache_") {
-            (
-                "cache_operation_failed",
-                "Inspect cache permissions and the requested operation, then retry.",
-            )
-        } else if stage == "doctor" {
-            (
-                "doctor_failed",
-                "Review native dependency paths and run `morae doctor` for human-readable diagnostics.",
-            )
-        } else {
-            (
-                "command_failed",
-                "Review the command arguments and diagnostics, then retry.",
-            )
-        };
+    fn from_error(error: &CliError) -> Self {
         Self {
-            code,
-            stage,
-            retryable: false,
+            code: error.code,
+            stage: error.stage.clone(),
+            retryable: error.retryable,
             message: error.to_string(),
-            remediation,
+            remediation: error.remediation,
         }
     }
 }
@@ -484,13 +455,12 @@ impl CliErrorEnvelope {
 async fn main() -> ExitCode {
     let cli = Cli::parse_from(normalize_help_alias(std::env::args_os()));
     let json = cli.global.json;
-    let stage = command_stage(&cli.command);
     match execute(cli).await {
         Ok(code) => exit_code(code),
         Err(error) => {
             if json {
                 let document = CliErrorDocument {
-                    error: CliErrorEnvelope::for_command(stage, error.as_ref()),
+                    error: CliErrorEnvelope::from_error(&error),
                 };
                 println!(
                     "{}",

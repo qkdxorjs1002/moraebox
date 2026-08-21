@@ -21,6 +21,51 @@ use tokio::{
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 const PREFLIGHT_CAPTURE_BYTES: usize = 64 * 1024;
 
+#[derive(Debug, thiserror::Error)]
+pub enum RegistrationError {
+    #[error("registration configuration failed: {0}")]
+    Configuration(String),
+    #[error("registration dry-run rendering failed: {0}")]
+    DryRun(String),
+    #[error("server preflight failed before agent configuration was changed: {0}")]
+    Preflight(String),
+    #[error("failed to run {program}: {source}; install the agent CLI or use --dry-run")]
+    AgentLaunch {
+        program: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "{program} failed with status {status}; agent configuration may have been partially updated. Inspect it, then roll back with: `{rollback}`"
+    )]
+    AgentRejected {
+        program: String,
+        status: std::process::ExitStatus,
+        rollback: String,
+    },
+}
+
+impl RegistrationError {
+    pub fn stage(&self) -> &'static str {
+        match self {
+            Self::Configuration(_) => "registration_configuration",
+            Self::DryRun(_) => "registration_render",
+            Self::Preflight(_) => "registration_preflight",
+            Self::AgentLaunch { .. } | Self::AgentRejected { .. } => "agent_registration",
+        }
+    }
+
+    pub fn retryable(&self) -> bool {
+        matches!(self, Self::Preflight(_))
+    }
+}
+
+impl From<String> for RegistrationError {
+    fn from(message: String) -> Self {
+        Self::Configuration(message)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Agent {
     Codex,
@@ -160,7 +205,7 @@ impl CommandPlan {
     }
 }
 
-pub async fn install(args: &InstallArgs) -> Result<(), String> {
+pub async fn install(args: &InstallArgs) -> Result<(), RegistrationError> {
     let server_command = resolve_server_command(args.server_command.as_deref())?;
     let native_paths = resolve_native_registration_paths(args, true)?;
     let (environment, server_args) = server_configuration_with_paths(args, &native_paths)?;
@@ -177,30 +222,28 @@ pub async fn install(args: &InstallArgs) -> Result<(), String> {
         );
     }
     if args.dry_run {
-        return plan.print_json();
+        return plan.print_json().map_err(RegistrationError::DryRun);
     }
 
-    preflight_server(&launch).await.map_err(|error| {
-        format!("server preflight failed before agent configuration was changed: {error}")
-    })?;
+    preflight_server(&launch)
+        .await
+        .map_err(RegistrationError::Preflight)?;
     let status = Command::new(&plan.program)
         .args(&plan.args)
         .status()
         .await
-        .map_err(|error| {
-            format!(
-                "failed to run {}: {error}; install the agent CLI or use --dry-run",
-                plan.program.to_string_lossy()
-            )
+        .map_err(|source| RegistrationError::AgentLaunch {
+            program: plan.program.to_string_lossy().into_owned(),
+            source,
         })?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!(
-            "{} failed with status {status}; agent configuration may have been partially updated. Inspect it, then roll back with: `{}`",
-            plan.program.to_string_lossy(),
-            rollback_command(args.agent, &args.name)
-        ))
+        Err(RegistrationError::AgentRejected {
+            program: plan.program.to_string_lossy().into_owned(),
+            status,
+            rollback: rollback_command(args.agent, &args.name),
+        })
     }
 }
 
@@ -718,6 +761,17 @@ fn parse_server_name(input: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn registration_errors_preserve_stage_and_retryability() {
+        let preflight = RegistrationError::Preflight("handshake timed out".into());
+        assert_eq!(preflight.stage(), "registration_preflight");
+        assert!(preflight.retryable());
+
+        let configuration = RegistrationError::Configuration("invalid path".into());
+        assert_eq!(configuration.stage(), "registration_configuration");
+        assert!(!configuration.retryable());
+    }
 
     fn install_args(agent: Agent) -> InstallArgs {
         InstallArgs {

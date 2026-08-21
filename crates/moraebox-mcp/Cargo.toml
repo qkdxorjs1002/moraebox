@@ -22,6 +22,7 @@ moraebox-sdk = { path = "../moraebox-sdk" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

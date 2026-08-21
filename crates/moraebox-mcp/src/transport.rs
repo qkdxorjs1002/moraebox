@@ -4,6 +4,7 @@ use super::{
     SERVER_INSTRUCTIONS, SUPPORTED_PROTOCOL_VERSIONS, Semaphore, StdMutex, Value, io, json, mpsc,
     oneshot,
 };
+use crate::errors::McpServeError;
 use crate::tools::{call_tool, protocol_error, success, tools_list};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +68,7 @@ pub(super) fn initialize_protocol_version(request: &Value) -> Result<&str, Strin
     }
 }
 
-pub(super) async fn serve(server: McpServer) -> Result<(), Box<dyn std::error::Error>> {
+pub(super) async fn serve(server: McpServer) -> Result<(), McpServeError> {
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let (responses, response_receiver) = mpsc::channel(RESPONSE_QUEUE_CAPACITY);
     let writer = tokio::spawn(write_responses(response_receiver));
@@ -132,28 +133,19 @@ pub(super) async fn serve(server: McpServer) -> Result<(), Box<dyn std::error::E
         if let Err(error) = result
             && request_error.is_none()
         {
-            request_error = Some(io::Error::other(format!(
-                "MCP request task failed: {error}"
-            )));
+            request_error = Some(error);
         }
     }
-    let cleanup_error = server
-        .sdk
-        .shutdown()
-        .await
-        .err()
-        .map(|error| io::Error::other(format!("MCP session cleanup failed: {error}")));
-    let writer_result = writer
-        .await
-        .map_err(|error| io::Error::other(format!("MCP writer task failed: {error}")))?;
+    let cleanup_error = server.sdk.shutdown().await.err();
+    let writer_result = writer.await.map_err(McpServeError::WriterTask)?;
     if let Some(error) = input_error {
         return Err(error.into());
     }
     if let Some(error) = request_error {
-        return Err(error.into());
+        return Err(McpServeError::RequestTask(error));
     }
     if let Some(error) = cleanup_error {
-        return Err(error.into());
+        return Err(McpServeError::SessionCleanup(error));
     }
     writer_result?;
     Ok(())

@@ -1,6 +1,7 @@
 use super::{
-    Arc, AsyncWriteExt, Backend, IsTerminal, OutputChannel, OutputReadError, Read, RunBudget,
-    RunSpec, SessionError, SessionHandle, SessionManager, SessionState, SessionStatus, Signal, io,
+    Arc, AsyncWriteExt, Backend, CliErrorSource, IsTerminal, OutputChannel, OutputReadError, Read,
+    RunBudget, RunSpec, SessionError, SessionHandle, SessionManager, SessionState, SessionStatus,
+    Signal, io,
 };
 
 const INTERACTIVE_READ_BYTES: usize = 64 * 1024;
@@ -9,7 +10,7 @@ pub(super) async fn run_interactive<B>(
     backend: B,
     spec: RunSpec,
     budget: RunBudget,
-) -> Result<i32, Box<dyn std::error::Error>>
+) -> Result<i32, CliErrorSource>
 where
     B: Backend + 'static,
 {
@@ -69,7 +70,7 @@ where
 async fn forward_interactive_input(
     input: &mut InteractiveInput,
     session: SessionHandle,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), CliErrorSource> {
     let mut buffer = vec![0_u8; 16 * 1024];
     loop {
         let count = input.read(&mut buffer).await?;
@@ -86,7 +87,7 @@ async fn drain_interactive_output(
     cursor: &mut u64,
     stdout: &mut tokio::io::Stdout,
     stderr: &mut tokio::io::Stderr,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), CliErrorSource> {
     loop {
         let output = match session.read_output(*cursor, INTERACTIVE_READ_BYTES).await {
             Ok(output) => output,

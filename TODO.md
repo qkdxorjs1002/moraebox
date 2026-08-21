@@ -230,7 +230,7 @@
 
 - [x] 큰 CLI, MCP server, image cache, libkrun adapter를 command/transport/storage/backend 책임별 모듈로 분리한다.
 
-- [ ] 문자열과 `Box<dyn Error>` 중심 오류를 stage와 retryability를 보존하는 typed error로 전환한다.
+- [x] 문자열과 `Box<dyn Error>` 중심 오류를 stage와 retryability를 보존하는 typed error로 전환한다.
 
 - [ ] 다음 회귀 테스트를 보강한다.
   - owner loss, blocked stdin, repeated stop, pump failure, output cap 초과
