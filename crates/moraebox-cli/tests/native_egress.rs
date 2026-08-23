@@ -111,6 +111,11 @@ signal.signal(signal.SIGWINCH, report_size)
 report_size()
 signal.pause()
 "#;
+const TTY_EOF_PROBE: &str = r#"
+import sys
+data = sys.stdin.buffer.read().decode()
+print("tty-eof-result:" + data, end="")
+"#;
 
 #[derive(Debug, Deserialize)]
 struct CachedImage {
@@ -207,6 +212,10 @@ impl NativeHarness {
 
     fn assert_network_state_empty(&self) {
         assert_directory_empty(&self.cache_dir.join("network"));
+    }
+
+    fn assert_control_state_empty(&self) {
+        assert_directory_empty(&self.cache_dir.join("control"));
     }
 
     fn spawn_json(&self, network: bool, timeout: &str, script: &str) -> Child {
@@ -559,6 +568,49 @@ fn assert_tty_resize(harness: &NativeHarness) {
     );
     assert_children_gone(&children);
     harness.assert_network_state_empty();
+    harness.assert_control_state_empty();
+}
+
+fn assert_tty_eof(harness: &NativeHarness) {
+    let mut command = harness.command();
+    command
+        .args([
+            "--timeout",
+            "10s",
+            "--interactive",
+            "--tty",
+            "--",
+            "python3",
+            "-c",
+        ])
+        .arg(python_bootstrap(TTY_EOF_PROBE))
+        .stdin(Stdio::piped());
+    let mut child = command.spawn().expect("spawn TTY EOF probe");
+    let children = wait_for_native_children(&mut child, false);
+    let mut stdin = child.stdin.take().expect("TTY EOF stdin pipe");
+    stdin
+        .write_all(b"tty-eof-input\n")
+        .expect("write TTY EOF input");
+    drop(stdin);
+
+    let output = wait_for_output(child);
+    assert!(
+        output.status.success(),
+        "TTY EOF probe failed with status {}: stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("tty-eof-result:tty-eof-input"));
+    assert_eq!(
+        text.matches("tty-eof-input").count(),
+        2,
+        "TTY input should have one guest echo and one workload result: {text:?}"
+    );
+    assert_children_gone(&children);
+    harness.assert_network_state_empty();
+    harness.assert_control_state_empty();
 }
 
 fn assert_children_gone(children: &NativeChildren) {
@@ -670,6 +722,7 @@ fn assert_helper_crash_cleanup(harness: &NativeHarness) {
 fn signed_native_egress_gate() {
     let harness = NativeHarness::new();
     assert_protocol_io(&harness);
+    assert_tty_eof(&harness);
     assert_tty_resize(&harness);
     assert_successful_probe(&harness, false, "network-off-blocked", NETWORK_OFF_PROBE);
     assert_successful_probe(&harness, true, "network-on-allowed", NETWORK_ON_PROBE);

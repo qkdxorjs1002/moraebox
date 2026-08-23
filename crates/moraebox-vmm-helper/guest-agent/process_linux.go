@@ -196,7 +196,19 @@ func (p *guestProcess) writeStdin(data []byte) error {
 
 func (p *guestProcess) closeStdin() error {
 	if p.pty != nil {
-		return nil
+		var terminal syscall.Termios
+		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, p.pty.Fd(), syscall.TCGETS, uintptr(unsafe.Pointer(&terminal)))
+		if errno != 0 {
+			return errno
+		}
+		eof := terminal.Cc[syscall.VEOF]
+		if eof == 0 {
+			return errors.New("terminal EOF character is disabled")
+		}
+		// In canonical mode the first VEOF drains a pending partial line and the second
+		// completes the following empty read. With no pending line, the workload exits
+		// after the first byte and the second is harmless.
+		return writeAll(p.stdin, []byte{eof, eof})
 	}
 	return p.stdin.Close()
 }

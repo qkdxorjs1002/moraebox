@@ -170,6 +170,7 @@ impl NativeSandboxConfig {
         config.gvproxy_path.clone_from(&self.native_paths.gvproxy);
         config.debugfs_path = self.disk_tools.debugfs_command();
         config.network_runtime_dir = storage.cache_dir().join("network");
+        config.control_runtime_dir = storage.cache_dir().join("control");
         config.workspace_disk = workspace_disk;
         config.vcpus = self.vcpus;
         config.memory_mib = self.memory_mib;
@@ -285,6 +286,10 @@ mod tests {
         assert_eq!(
             config.network_runtime_dir,
             storage.cache_dir().join("network")
+        );
+        assert_eq!(
+            config.control_runtime_dir,
+            storage.cache_dir().join("control")
         );
         assert_eq!(config.workspace_disk, Some("/workspace".into()));
         assert_eq!(config.debugfs_path, PathBuf::from("/native/debugfs"));

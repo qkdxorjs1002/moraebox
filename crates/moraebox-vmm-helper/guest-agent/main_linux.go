@@ -126,7 +126,10 @@ func serve(connection *os.File, sessionID string) (int, error) {
 					return 125, errors.New("duplicate stdin EOF")
 				}
 				stdinClosed = true
-				_ = process.closeStdin()
+				if process.closeStdin() != nil {
+					process.kill(syscall.SIGKILL)
+					return 125, errors.New("failed to close workload stdin")
+				}
 			case payloadResize:
 				rows, cols, err := decodeTwoU32(frame.body)
 				if err != nil || process.resize(rows, cols) != nil {

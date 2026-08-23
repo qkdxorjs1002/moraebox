@@ -5,11 +5,15 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+#[cfg(unix)]
+use std::{io::Write as _, sync::Mutex};
 
 use async_trait::async_trait;
 use moraebox_box::{
     BaseDisk, BaseDiskSpec, BaseDiskStore, BoxState, BoxStore, EphemeralDisk, EphemeralDiskStore,
 };
+#[cfg(unix)]
+use moraebox_core::ensure_private_storage_root;
 use moraebox_core::{OutputChannel, RunSpec, SessionId, Signal, WorkspaceMode};
 use tokio::{
     process::{Child, Command},
@@ -54,6 +58,7 @@ pub struct LibkrunConfig {
     pub workspace_disk: Option<PathBuf>,
     pub gvproxy_path: Option<PathBuf>,
     pub network_runtime_dir: PathBuf,
+    pub control_runtime_dir: PathBuf,
     #[cfg(test)]
     enforce_native_preflight: bool,
 }
@@ -100,6 +105,7 @@ impl LibkrunConfig {
             workspace_disk: None,
             gvproxy_path: None,
             network_runtime_dir: PathBuf::from(".moraebox/network"),
+            control_runtime_dir: PathBuf::from(".moraebox/control"),
             #[cfg(test)]
             enforce_native_preflight: false,
         }
@@ -396,7 +402,6 @@ impl Backend for LibkrunBackend {
         for (key, value) in environment {
             command.arg("--env").arg(format!("{key}={value}"));
         }
-        command.arg("--").args(&spec.argv);
         command.env_clear();
         if let Some(path) = &self.config.library_search_path {
             #[cfg(target_os = "macos")]
@@ -413,8 +418,15 @@ impl Backend for LibkrunBackend {
         }
 
         let helper_started = Instant::now();
-        let mut spawned =
-            Self::spawn_helper(command, spec, prepared_root, network_proxy, budget).await?;
+        let mut spawned = Self::spawn_helper(
+            command,
+            spec,
+            prepared_root,
+            network_proxy,
+            &self.config.control_runtime_dir,
+            budget,
+        )
+        .await?;
         startup.helper_spawn_micros = Some(elapsed_micros(helper_started));
         spawned.startup = startup;
         Ok(spawned)
@@ -423,18 +435,43 @@ impl Backend for LibkrunBackend {
 
 impl LibkrunBackend {
     async fn spawn_helper(
-        command: Command,
+        mut command: Command,
         spec: &RunSpec,
         prepared_root: PreparedRoot,
         mut network_proxy: Option<NetworkProxy>,
+        control_runtime_dir: &Path,
         budget: &RunBudget,
     ) -> Result<SpawnedSandbox, BackendError> {
         let spawn_result = budget.run_sync(RunStage::HelperSpawn, || {
+            let controlled = prepared_root.disk_path().is_some();
             let root_lease = prepared_root.into_lease();
-            if spec.tty {
+            if controlled {
+                let control = HostControlPipe::new(control_runtime_dir)?;
+                command.arg("--control-fifo").arg(control.path());
+                command.arg("--").args(&spec.argv);
+                spawn_piped(
+                    command,
+                    if spec.tty {
+                        OutputChannel::Tty
+                    } else {
+                        OutputChannel::Stdout
+                    },
+                    Some(NativeControl::Protocol(control)),
+                    &mut network_proxy,
+                    root_lease,
+                )
+            } else if spec.tty {
+                command.arg("--").args(&spec.argv);
                 spawn_pty(command, spec, &mut network_proxy, root_lease)
             } else {
-                spawn_piped(command, &mut network_proxy, root_lease)
+                command.arg("--").args(&spec.argv);
+                spawn_piped(
+                    command,
+                    OutputChannel::Stdout,
+                    None,
+                    &mut network_proxy,
+                    root_lease,
+                )
             }
         });
         match spawn_result {
@@ -657,8 +694,126 @@ fn replenish_prepared_root(
     });
 }
 
+#[cfg(unix)]
+const CONTROL_MESSAGE_BYTES: usize = 5;
+#[cfg(unix)]
+const CONTROL_RESIZE: u8 = 1;
+#[cfg(unix)]
+const CONTROL_INTERRUPT: u8 = 2;
+#[cfg(unix)]
+const CONTROL_TERMINATE: u8 = 3;
+#[cfg(unix)]
+const CONTROL_HANGUP: u8 = 4;
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct HostControlPipe {
+    path: PathBuf,
+    writer: Mutex<std::fs::File>,
+}
+
+#[cfg(unix)]
+impl HostControlPipe {
+    fn new(runtime_root: &Path) -> Result<Self, BackendError> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        use nix::{fcntl::OFlag, sys::stat::Mode, unistd::mkfifo};
+
+        ensure_private_storage_root(runtime_root)
+            .map_err(|error| BackendError::Control(error.to_string()))?;
+        let runtime_root = std::fs::canonicalize(runtime_root)?;
+        let path = runtime_root.join(format!("run-{}.fifo", SessionId::new()));
+        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).map_err(std::io::Error::from)?;
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(OFlag::O_NONBLOCK.bits())
+            .open(&path)
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&path);
+            })?;
+        Ok(Self {
+            path,
+            writer: Mutex::new(writer),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn resize(&self, rows: u16, cols: u16) -> Result<(), BackendError> {
+        if rows == 0 || cols == 0 {
+            return Err(BackendError::InvalidSpec(
+                "terminal rows and columns must be non-zero",
+            ));
+        }
+        let mut message = [0_u8; CONTROL_MESSAGE_BYTES];
+        message[0] = CONTROL_RESIZE;
+        message[1..3].copy_from_slice(&rows.to_be_bytes());
+        message[3..].copy_from_slice(&cols.to_be_bytes());
+        self.write(message)
+    }
+
+    fn signal(&self, signal: Signal) -> Result<(), BackendError> {
+        let opcode = match signal {
+            Signal::Interrupt => CONTROL_INTERRUPT,
+            Signal::Terminate => CONTROL_TERMINATE,
+            Signal::Hangup => CONTROL_HANGUP,
+            Signal::Kill => {
+                return Err(BackendError::Control(
+                    "kill cannot be sent through the guest control pipe".into(),
+                ));
+            }
+        };
+        self.write([opcode, 0, 0, 0, 0])
+    }
+
+    fn write(&self, message: [u8; CONTROL_MESSAGE_BYTES]) -> Result<(), BackendError> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|error| BackendError::Control(error.to_string()))?;
+        writer.write_all(&message)?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HostControlPipe {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(not(unix))]
+#[derive(Debug)]
+struct HostControlPipe;
+
+#[cfg(not(unix))]
+impl HostControlPipe {
+    fn new(_runtime_root: &Path) -> Result<Self, BackendError> {
+        Err(BackendError::Unsupported(
+            "native guest control on this platform",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        unreachable!("unsupported native guest control pipe")
+    }
+}
+
+#[derive(Debug)]
+enum NativeControl {
+    #[cfg(unix)]
+    Pty(Arc<std::fs::File>),
+    Protocol(HostControlPipe),
+}
+
 fn spawn_piped(
     mut command: Command,
+    stdout_channel: OutputChannel,
+    control: Option<NativeControl>,
     network_proxy: &mut Option<NetworkProxy>,
     root_lease: Option<ManagedRootLease>,
 ) -> Result<SpawnedSandbox, BackendError> {
@@ -678,15 +833,83 @@ fn spawn_piped(
     Ok(SpawnedSandbox {
         stdin,
         stdout,
-        stdout_channel: OutputChannel::Stdout,
+        stdout_channel,
         stderr,
         exit,
         controller: Box::new(LibkrunController {
             pid: Arc::new(pid),
-            terminal: None,
+            control,
         }),
         startup: StartupMetrics::default(),
     })
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct PtyInput {
+    file: tokio::fs::File,
+    eof: [u8; 2],
+    eof_offset: usize,
+    shutting_down: bool,
+}
+
+#[cfg(unix)]
+impl PtyInput {
+    fn new(file: std::fs::File, eof: u8) -> Self {
+        Self {
+            file: tokio::fs::File::from_std(file),
+            eof: [eof; 2],
+            eof_offset: 0,
+            shutting_down: false,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl tokio::io::AsyncWrite for PtyInput {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        if self.shutting_down {
+            return std::task::Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "terminal input is closed",
+            )));
+        }
+        std::pin::Pin::new(&mut self.file).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.file).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        self.shutting_down = true;
+        while self.eof_offset < self.eof.len() {
+            let offset = self.eof_offset;
+            let eof = self.eof;
+            match std::pin::Pin::new(&mut self.file).poll_write(context, &eof[offset..]) {
+                std::task::Poll::Ready(Ok(0)) => {
+                    return std::task::Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write terminal EOF",
+                    )));
+                }
+                std::task::Poll::Ready(Ok(count)) => self.eof_offset += count,
+                std::task::Poll::Ready(Err(error)) => return std::task::Poll::Ready(Err(error)),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+        std::pin::Pin::new(&mut self.file).poll_shutdown(context)
+    }
 }
 
 #[cfg(unix)]
@@ -708,6 +931,8 @@ fn spawn_pty(
     };
     let pty = openpty(&window, None).map_err(std::io::Error::from)?;
     let master = File::from(pty.master);
+    let terminal = nix::sys::termios::tcgetattr(&master).map_err(std::io::Error::from)?;
+    let eof = terminal.control_chars[nix::sys::termios::SpecialCharacterIndices::VEOF as usize];
     let master_reader = master.try_clone()?;
     let controller_master = master.try_clone()?;
     let slave = File::from(pty.slave);
@@ -719,14 +944,14 @@ fn spawn_pty(
     let pid = child.id().ok_or(BackendError::MissingProcessId)?;
     let exit = managed_exit(child, network_proxy.take(), root_lease);
     Ok(SpawnedSandbox {
-        stdin: Some(Box::pin(tokio::fs::File::from_std(master))),
+        stdin: Some(Box::pin(PtyInput::new(master, eof))),
         stdout: Box::pin(tokio::fs::File::from_std(master_reader)),
         stdout_channel: OutputChannel::Tty,
         stderr: None,
         exit,
         controller: Box::new(LibkrunController {
             pid: Arc::new(pid),
-            terminal: Some(Arc::new(controller_master)),
+            control: Some(NativeControl::Pty(Arc::new(controller_master))),
         }),
         startup: StartupMetrics::default(),
     })
@@ -798,14 +1023,14 @@ struct LibkrunController {
         )
     )]
     pid: Arc<u32>,
-    #[cfg(unix)]
-    terminal: Option<Arc<std::fs::File>>,
-    #[cfg(not(unix))]
-    #[expect(
-        dead_code,
-        reason = "terminal resizing is unsupported by the non-Unix native stub"
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "terminal resizing is unsupported by the non-Unix native stub"
+        )
     )]
-    terminal: Option<Arc<()>>,
+    control: Option<NativeControl>,
 }
 
 impl Drop for LibkrunController {
@@ -832,15 +1057,20 @@ impl BackendController for LibkrunController {
                 unistd::Pid,
             };
 
+            if signal != Signal::Kill
+                && let Some(NativeControl::Protocol(control)) = &self.control
+            {
+                return control.signal(signal);
+            }
             let raw_pid = i32::try_from(*self.pid)
                 .map_err(|error| BackendError::Control(error.to_string()))?;
-            let signal = match signal {
+            let native_signal = match signal {
                 Signal::Interrupt => NixSignal::SIGINT,
                 Signal::Terminate => NixSignal::SIGTERM,
                 Signal::Kill => NixSignal::SIGKILL,
                 Signal::Hangup => NixSignal::SIGHUP,
             };
-            match kill(Pid::from_raw(-raw_pid), signal) {
+            match kill(Pid::from_raw(-raw_pid), native_signal) {
                 Ok(()) | Err(Errno::ESRCH) => Ok(()),
                 Err(error) => Err(BackendError::Control(error.to_string())),
             }
@@ -862,22 +1092,27 @@ impl BackendController for LibkrunController {
                 sys::signal::{Signal as NixSignal, kill},
                 unistd::Pid,
             };
-            use rustix::termios::{Winsize, tcsetwinsize};
-
-            let terminal = self
-                .terminal
+            let control = self
+                .control
                 .as_ref()
                 .ok_or(BackendError::Unsupported("terminal resize"))?;
-            tcsetwinsize(
-                terminal.as_ref(),
-                Winsize {
-                    ws_row: rows,
-                    ws_col: cols,
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
-                },
-            )
-            .map_err(|error| BackendError::Control(error.to_string()))?;
+            match control {
+                NativeControl::Protocol(control) => return control.resize(rows, cols),
+                NativeControl::Pty(terminal) => {
+                    use rustix::termios::{Winsize, tcsetwinsize};
+
+                    tcsetwinsize(
+                        terminal.as_ref(),
+                        Winsize {
+                            ws_row: rows,
+                            ws_col: cols,
+                            ws_xpixel: 0,
+                            ws_ypixel: 0,
+                        },
+                    )
+                    .map_err(|error| BackendError::Control(error.to_string()))?;
+                }
+            }
             let raw_pid = i32::try_from(*self.pid)
                 .map_err(|error| BackendError::Control(error.to_string()))?;
             match kill(Pid::from_raw(-raw_pid), NixSignal::SIGWINCH) {
@@ -951,6 +1186,74 @@ mod tests {
 
         append_bounded_tail(&mut retained, b"ab", 6);
         assert_eq!(retained, b"6789ab");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_control_pipe_frames_resize_and_signals() {
+        use std::io::Read as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("control");
+        let control = HostControlPipe::new(&runtime).unwrap();
+        let path = control.path().to_owned();
+        let mut reader = fs::File::open(control.path()).unwrap();
+
+        control.resize(41, 99).unwrap();
+        let mut message = [0_u8; CONTROL_MESSAGE_BYTES];
+        reader.read_exact(&mut message).unwrap();
+        assert_eq!(message, [CONTROL_RESIZE, 0, 41, 0, 99]);
+
+        control.signal(Signal::Terminate).unwrap();
+        reader.read_exact(&mut message).unwrap();
+        assert_eq!(message, [CONTROL_TERMINATE, 0, 0, 0, 0]);
+        assert!(control.resize(0, 99).is_err());
+        drop(control);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn controlled_terminal_uses_pipes_and_preserves_eof() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let state = tempfile::tempdir().unwrap();
+        let helper = state.path().join("helper");
+        let library = state.path().join("libkrun");
+        let root_disk = state.path().join("root.ext4");
+        let debugfs = state.path().join("debugfs");
+        let control_runtime = state.path().join("control");
+        write_executable(
+            &helper,
+            "#!/bin/sh\ncontrol=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -- ]; then shift; break; fi\n  if [ \"$1\" = --control-fifo ]; then control=$2; shift 2; continue; fi\n  shift\ndone\n[ -p \"$control\" ] || exit 90\ncat\n",
+        );
+        write_executable(&debugfs, "#!/bin/sh\nexit 0\n");
+        fs::write(&library, []).unwrap();
+        fs::write(&root_disk, []).unwrap();
+        let mut config = LibkrunConfig::new(&helper, &library, state.path().join("unused"))
+            .with_root_disk(&root_disk);
+        config.debugfs_path = debugfs;
+        config.control_runtime_dir.clone_from(&control_runtime);
+        let mut spec = RunSpec::command(["/bin/cat"]);
+        spec.tty = true;
+
+        let mut spawned = LibkrunBackend::new(config)
+            .spawn(&spec, &RunBudget::new(spec.timeout))
+            .await
+            .unwrap();
+        assert_eq!(spawned.stdout_channel, OutputChannel::Tty);
+        let mut input = spawned.stdin.take().unwrap();
+        input.write_all(b"pty-eof-probe\n").await.unwrap();
+        input.shutdown().await.unwrap();
+        drop(input);
+
+        let mut output = Vec::new();
+        spawned.stdout.read_to_end(&mut output).await.unwrap();
+        assert!(spawned.exit.await.unwrap().success());
+        drop(spawned.controller);
+
+        assert_eq!(output, b"pty-eof-probe\n");
+        assert_eq!(fs::read_dir(control_runtime).unwrap().count(), 0);
     }
 
     #[cfg(unix)]

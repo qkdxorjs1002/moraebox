@@ -88,6 +88,11 @@ const NETWORK_FEATURES: u32 = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 <<
 const NET_FLAG_VFKIT: u32 = 1 << 0;
 const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
 const NETWORK_FLAGS: u32 = NET_FLAG_VFKIT | NET_FLAG_DHCP_CLIENT;
+const PARENT_CONTROL_MESSAGE_BYTES: usize = 5;
+const PARENT_CONTROL_RESIZE: u8 = 1;
+const PARENT_CONTROL_INTERRUPT: u8 = 2;
+const PARENT_CONTROL_TERMINATE: u8 = 3;
+const PARENT_CONTROL_HANGUP: u8 = 4;
 
 #[derive(Debug, Parser)]
 #[command(about = "Signed libkrun VMM helper; normally invoked by morae")]
@@ -130,6 +135,9 @@ struct Args {
     tty_rows: u16,
     #[arg(long, default_value_t = 80)]
     tty_cols: u16,
+    /// Private FIFO used by the parent runtime for guest signals and terminal resize.
+    #[arg(long, requires = "root_disk")]
+    control_fifo: Option<PathBuf>,
     #[arg(long = "env", value_parser = parse_env)]
     env: Vec<(String, String)>,
     /// Host source to archive and copy into the guest before execution.
@@ -322,6 +330,7 @@ fn run(args: Args) -> Result<i32, HelperError> {
                 tty: args.tty,
                 rows: args.tty_rows,
                 cols: args.tty_cols,
+                control_fifo: args.control_fifo,
                 copy_in: transfers.copy_in,
                 copy_out: transfers.copy_out,
                 copy_limit: args.copy_limit_bytes,
@@ -611,6 +620,7 @@ struct BridgeRequest {
     tty: bool,
     rows: u16,
     cols: u16,
+    control_fifo: Option<PathBuf>,
     copy_in: Vec<CopyInMapping>,
     copy_out: Vec<CopyOutMapping>,
     copy_limit: u64,
@@ -657,10 +667,9 @@ impl ControlEndpoint {
     }
 
     fn spawn(self, request: BridgeRequest) -> Result<JoinHandle<()>, HelperError> {
-        let signals = install_signal_relay()?;
         std::thread::Builder::new()
             .name("morae-vsock-control".into())
-            .spawn(move || match self.serve(request, signals) {
+            .spawn(move || match self.serve(request) {
                 Ok(code) => std::process::exit(code),
                 Err(error) => {
                     eprintln!("morae-vmm-helper: host/guest protocol failed: {error}");
@@ -670,7 +679,12 @@ impl ControlEndpoint {
             .map_err(HelperError::Io)
     }
 
-    fn serve(self, request: BridgeRequest, signals: File) -> Result<i32, BridgeError> {
+    fn serve(self, request: BridgeRequest) -> Result<i32, BridgeError> {
+        let parent_control = request
+            .control_fifo
+            .as_deref()
+            .map(open_parent_control)
+            .transpose()?;
         let (mut reader, _) = self.listener.accept()?;
         let sender = Arc::new(Mutex::new(HostSender {
             stream: reader.try_clone()?,
@@ -722,7 +736,7 @@ impl ControlEndpoint {
             }),
         )?;
         spawn_stdin_forwarder(Arc::clone(&sender))?;
-        spawn_signal_forwarder(Arc::clone(&sender), signals, request.tty)?;
+        spawn_runtime_control_forwarder(Arc::clone(&sender), parent_control, request.tty)?;
 
         let mut active_copy_out = None;
         loop {
@@ -1406,6 +1420,21 @@ fn spawn_stdin_forwarder(sender: Arc<Mutex<HostSender>>) -> Result<(), BridgeErr
 }
 
 #[cfg(unix)]
+fn spawn_runtime_control_forwarder(
+    sender: Arc<Mutex<HostSender>>,
+    parent_control: Option<File>,
+    tty: bool,
+) -> Result<(), BridgeError> {
+    if let Some(control) = parent_control {
+        spawn_parent_control_forwarder(sender, control)
+    } else {
+        // Compatibility for direct helper invocations that predate the parent control FIFO.
+        // Install after guest connection because libkrun may replace dispositions on entry.
+        spawn_signal_forwarder(sender, install_signal_relay()?, tty)
+    }
+}
+
+#[cfg(unix)]
 fn spawn_signal_forwarder(
     sender: Arc<Mutex<HostSender>>,
     mut signals: File,
@@ -1445,6 +1474,75 @@ fn spawn_signal_forwarder(
 }
 
 #[cfg(unix)]
+fn spawn_parent_control_forwarder(
+    sender: Arc<Mutex<HostSender>>,
+    mut control: File,
+) -> Result<(), BridgeError> {
+    std::thread::Builder::new()
+        .name("morae-parent-control".into())
+        .spawn(move || {
+            loop {
+                let mut message = [0_u8; PARENT_CONTROL_MESSAGE_BYTES];
+                if control.read_exact(&mut message).is_err() {
+                    return;
+                }
+                let Some(payload) = decode_parent_control(message) else {
+                    return;
+                };
+                if send_host_frame(&sender, payload).is_err() {
+                    return;
+                }
+            }
+        })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_parent_control(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_fifo() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "parent control path is not a FIFO",
+        ));
+    }
+    let control = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    std::fs::remove_file(path)?;
+    Ok(control)
+}
+
+#[cfg(unix)]
+fn decode_parent_control(message: [u8; PARENT_CONTROL_MESSAGE_BYTES]) -> Option<frame::Payload> {
+    match message[0] {
+        PARENT_CONTROL_RESIZE => {
+            let rows = u16::from_be_bytes([message[1], message[2]]);
+            let cols = u16::from_be_bytes([message[3], message[4]]);
+            (rows != 0 && cols != 0).then(|| {
+                frame::Payload::Resize(Resize {
+                    rows: u32::from(rows),
+                    cols: u32::from(cols),
+                })
+            })
+        }
+        PARENT_CONTROL_INTERRUPT => Some(frame::Payload::Signal(SignalRequest {
+            signal: WireSignal::Interrupt as i32,
+        })),
+        PARENT_CONTROL_TERMINATE => Some(frame::Payload::Signal(SignalRequest {
+            signal: WireSignal::Terminate as i32,
+        })),
+        PARENT_CONTROL_HANGUP => Some(frame::Payload::Signal(SignalRequest {
+            signal: WireSignal::Hangup as i32,
+        })),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
 fn terminal_size() -> Option<(u16, u16)> {
     let mut size = libc::winsize {
         ws_row: 0,
@@ -1476,14 +1574,14 @@ extern "C" fn relay_signal(signal: libc::c_int) {
 }
 
 #[cfg(unix)]
-fn install_signal_relay() -> Result<File, HelperError> {
+fn install_signal_relay() -> io::Result<File> {
     let mut descriptors = [-1; 2];
     if unsafe {
         // SAFETY: descriptors points to two valid integers for libc to initialize.
         libc::pipe(descriptors.as_mut_ptr())
     } != 0
     {
-        return Err(io::Error::last_os_error().into());
+        return Err(io::Error::last_os_error());
     }
     for descriptor in descriptors {
         let result = unsafe {
@@ -1491,7 +1589,7 @@ fn install_signal_relay() -> Result<File, HelperError> {
             libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC)
         };
         if result < 0 {
-            return Err(io::Error::last_os_error().into());
+            return Err(io::Error::last_os_error());
         }
     }
     SIGNAL_WRITE_FD.store(descriptors[1], Ordering::Release);
@@ -1511,7 +1609,7 @@ fn install_signal_relay() -> Result<File, HelperError> {
             libc::sigaction(signal, &raw const action, std::ptr::null_mut())
         } != 0
         {
-            return Err(io::Error::last_os_error().into());
+            return Err(io::Error::last_os_error());
         }
     }
     let reader = unsafe {
@@ -2107,6 +2205,43 @@ mod tests {
         assert_eq!(frame.sequence, 0);
         assert_eq!(frame.session_id, "session");
         assert!(matches!(frame.payload, Some(frame::Payload::Exec(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_control_frames_are_strict_and_typed() {
+        assert!(matches!(
+            decode_parent_control([PARENT_CONTROL_RESIZE, 0, 41, 0, 99]),
+            Some(frame::Payload::Resize(Resize { rows: 41, cols: 99 }))
+        ));
+        assert!(matches!(
+            decode_parent_control([PARENT_CONTROL_TERMINATE, 0, 0, 0, 0]),
+            Some(frame::Payload::Signal(SignalRequest { signal }))
+                if signal == WireSignal::Terminate as i32
+        ));
+        assert!(decode_parent_control([PARENT_CONTROL_RESIZE, 0, 0, 0, 99]).is_none());
+        assert!(decode_parent_control([u8::MAX, 0, 0, 0, 0]).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_control_fifo_is_unlinked_after_open() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("control.fifo");
+        let path_c = path_to_cstring(&path).unwrap();
+        // SAFETY: path_c is a live NUL-terminated path inside the private test directory.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        let _writer = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+
+        let _reader = open_parent_control(&path).unwrap();
+        assert!(!path.exists());
     }
 
     #[cfg(unix)]
