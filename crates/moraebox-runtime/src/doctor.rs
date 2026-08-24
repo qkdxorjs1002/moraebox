@@ -762,6 +762,7 @@ fn probe_cow_clone_at(directory: &Path) -> (Option<bool>, Option<String>) {
         Err(error) => return (None, Some(format!("cannot write cache volume: {error}"))),
     };
     let source = temporary.path().join("source");
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let destination = temporary.path().join("destination");
     let result = fs::File::create(&source).and_then(|file| file.set_len(1024 * 1024));
     if let Err(error) = result {
@@ -785,22 +786,27 @@ fn probe_cow_clone_at(directory: &Path) -> (Option<bool>, Option<String>) {
         .arg(&destination)
         .output();
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    return (
-        None,
-        Some("reflink probing is unsupported on this host".into()),
-    );
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        match output {
+            Ok(output) if output.status.success() && destination.is_file() => (Some(true), None),
+            Ok(output) => (
+                Some(false),
+                Some(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
+            ),
+            Err(error) => (
+                None,
+                Some(format!("failed to execute reflink probe: {error}")),
+            ),
+        }
+    }
 
-    match output {
-        Ok(output) if output.status.success() && destination.is_file() => (Some(true), None),
-        Ok(output) => (
-            Some(false),
-            Some(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
-        ),
-        Err(error) => (
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        (
             None,
-            Some(format!("failed to execute reflink probe: {error}")),
-        ),
+            Some("reflink probing is unsupported on this host".into()),
+        )
     }
 }
 

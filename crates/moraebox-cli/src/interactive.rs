@@ -93,6 +93,10 @@ fn terminal_window_size() -> io::Result<Option<(u16, u16)>> {
 }
 
 #[cfg(not(unix))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the unsupported stub mirrors the fallible Unix terminal interface"
+)]
 fn terminal_window_size() -> io::Result<Option<(u16, u16)>> {
     Ok(None)
 }
@@ -195,6 +199,10 @@ struct RawTerminalGuard;
 
 #[cfg(not(unix))]
 impl RawTerminalGuard {
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the unsupported stub mirrors the fallible Unix terminal interface"
+    )]
     fn enter(_enabled: bool) -> io::Result<Option<Self>> {
         Ok(None)
     }

@@ -19,7 +19,7 @@ use tokio::{
     process::{Child, Command},
     time::Instant,
 };
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use tokio::{task::JoinHandle, time::sleep};
 
 use crate::{
@@ -798,6 +798,10 @@ impl HostControlPipe {
         ))
     }
 
+    #[allow(
+        clippy::unused_self,
+        reason = "the unsupported stub mirrors the Unix control-pipe interface"
+    )]
     fn path(&self) -> &Path {
         unreachable!("unsupported native guest control pipe")
     }
@@ -1132,13 +1136,16 @@ impl BackendController for LibkrunController {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     use moraebox_box::CreateBox;
 
+    #[cfg(unix)]
     const MANAGED_TEST_DISK_BYTES: u64 = 8 * 1024 * 1024;
 
     #[cfg(unix)]
     use std::{fs, os::unix::fs::PermissionsExt};
 
+    #[cfg(unix)]
     fn cow_clone_unavailable(error: &impl std::fmt::Display) -> bool {
         error
             .to_string()

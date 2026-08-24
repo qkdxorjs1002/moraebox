@@ -103,6 +103,7 @@ jobs:
             e2fsprogs
       - name: Run or report native signed smoke
         env:
+          MORAE_CI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
           MORAE_NATIVE_DEPENDENCY_SETUP: ${{ steps.native-dependencies.outcome }}
           MORAE_NATIVE_E2E_CACHE_DIR: ${{ runner.temp }}/moraebox-native-cache
         run: scripts/ci-native-smoke.sh

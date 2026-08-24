@@ -11,17 +11,18 @@ use std::os::{
     },
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     ffi::{CStr, CString, c_char},
-    io::{self, Seek as _},
+    io,
     path::{Path, PathBuf},
     process::ExitCode,
     thread::JoinHandle,
 };
 #[cfg(unix)]
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
-    io::{Read as _, Write as _},
+    io::{Read as _, Seek as _, Write as _},
     process::Command,
     sync::{
         Arc, Mutex,
@@ -79,7 +80,9 @@ const REQUIRED_AGENT_CAPABILITIES: [&str; 7] = [
     "copy-tar-v1",
 ];
 const DEFAULT_COPY_LIMIT: u64 = 64 * 1024 * 1024;
+#[cfg(unix)]
 const COPY_CHUNK_SIZE: usize = 64 * 1024;
+#[cfg(unix)]
 const MAX_COPY_ENTRIES: usize = 100_000;
 const DEFAULT_DAX_WINDOW: u64 = 256 * 1024 * 1024;
 const NETWORK_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
@@ -88,10 +91,15 @@ const NETWORK_FEATURES: u32 = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 <<
 const NET_FLAG_VFKIT: u32 = 1 << 0;
 const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
 const NETWORK_FLAGS: u32 = NET_FLAG_VFKIT | NET_FLAG_DHCP_CLIENT;
+#[cfg(unix)]
 const PARENT_CONTROL_MESSAGE_BYTES: usize = 5;
+#[cfg(unix)]
 const PARENT_CONTROL_RESIZE: u8 = 1;
+#[cfg(unix)]
 const PARENT_CONTROL_INTERRUPT: u8 = 2;
+#[cfg(unix)]
 const PARENT_CONTROL_TERMINATE: u8 = 3;
+#[cfg(unix)]
 const PARENT_CONTROL_HANGUP: u8 = 4;
 
 #[derive(Debug, Parser)]
@@ -627,12 +635,26 @@ struct BridgeRequest {
 }
 
 #[derive(Debug)]
+#[cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "the non-Unix native stub rejects copy transfers before reading mappings"
+    )
+)]
 struct CopyInMapping {
     source: PathBuf,
     destination: String,
 }
 
 #[derive(Debug)]
+#[cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "the non-Unix native stub rejects copy transfers before reading mappings"
+    )
+)]
 struct CopyOutMapping {
     source: String,
     destination: PathBuf,
@@ -1863,6 +1885,7 @@ fn exit_code(code: i32) -> ExitCode {
 enum HelperError {
     #[error("invalid helper request: {0}")]
     Invalid(&'static str),
+    #[cfg(unix)]
     #[error("invalid copy request: {0}")]
     InvalidCopy(String),
     #[error("libkrun has neither krun_set_root nor krun_add_virtiofs3")]

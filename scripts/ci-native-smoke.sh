@@ -72,6 +72,17 @@ export MORAE_E2FSCK="$e2fsprogs_prefix/sbin/e2fsck"
 export MORAE_DEBUGFS="$e2fsprogs_prefix/sbin/debugfs"
 export MORAE_LIB_DIR="$libkrun_prefix/lib:$libkrunfw_prefix/lib"
 
+if [ "${MORAE_CI_RUNNER_ENVIRONMENT:-}" = "github-hosted" ]; then
+    native_detail="native helper build, test, or signature validation failed"
+    cargo test -p moraebox-vmm-helper --locked
+    cargo build --workspace --locked
+    codesign --force --sign - \
+        --entitlements assets/moraebox-vmm.entitlements \
+        target/debug/morae-vmm-helper
+    codesign --verify --strict target/debug/morae-vmm-helper
+    skip_smoke "missing native capability: GitHub-hosted arm64 macOS runners do not support the nested virtualization required by libkrun; helper build, tests, and ad-hoc signature validation passed"
+fi
+
 cache_dir=${MORAE_NATIVE_E2E_CACHE_DIR:-${RUNNER_TEMP:-/private/tmp}/moraebox-native-cache}
 image=${MORAE_NATIVE_E2E_IMAGE:-python:3.12}
 mkdir -p "$cache_dir"

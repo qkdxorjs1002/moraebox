@@ -14,6 +14,13 @@ pub(crate) fn sync_tree(root: &Path) -> io::Result<()> {
     sync_directory(root)
 }
 
+#[cfg_attr(
+    not(unix),
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "callers share one fallible durability interface across platforms"
+    )
+)]
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {

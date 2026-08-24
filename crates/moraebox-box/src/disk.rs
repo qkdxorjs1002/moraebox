@@ -790,8 +790,9 @@ fn to_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::io::SeekFrom;
-    use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    #[cfg(unix)]
+    use std::{thread, time::Instant};
 
     use super::*;
 
@@ -834,6 +835,7 @@ mod tests {
         (executable, calls, release)
     }
 
+    #[cfg(unix)]
     fn wait_for_call_count(path: &Path, expected: usize) -> bool {
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {

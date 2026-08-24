@@ -939,6 +939,13 @@ impl StagingImage {
     }
 }
 
+#[cfg_attr(
+    windows,
+    allow(
+        clippy::permissions_set_readonly_false,
+        reason = "Windows must clear the readonly attribute before deleting the staging file"
+    )
+)]
 impl Drop for StagingImage {
     fn drop(&mut self) {
         #[cfg(windows)]
@@ -1214,6 +1221,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     fn staging_files(cache: &Path) -> Vec<PathBuf> {
         let directory = cache.join("workspaces/sha256");
         fs::read_dir(directory)
