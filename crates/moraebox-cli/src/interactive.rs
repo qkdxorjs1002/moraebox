@@ -208,60 +208,19 @@ impl RawTerminalGuard {
     }
 }
 
-#[cfg(unix)]
-struct InteractiveInput {
-    inner: tokio::io::unix::AsyncFd<io::Stdin>,
-    original_flags: nix::fcntl::OFlag,
-}
-
-#[cfg(unix)]
-impl InteractiveInput {
-    fn new() -> io::Result<Self> {
-        use nix::fcntl::{FcntlArg, OFlag, fcntl};
-
-        let inner = tokio::io::unix::AsyncFd::new(io::stdin())?;
-        let original_flags = OFlag::from_bits_truncate(
-            fcntl(inner.get_ref(), FcntlArg::F_GETFL).map_err(io::Error::from)?,
-        );
-        fcntl(
-            inner.get_ref(),
-            FcntlArg::F_SETFL(original_flags | OFlag::O_NONBLOCK),
-        )
-        .map_err(io::Error::from)?;
-        Ok(Self {
-            inner,
-            original_flags,
-        })
-    }
-
-    async fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        loop {
-            let mut guard = self.inner.readable_mut().await?;
-            if let Ok(result) = guard.try_io(|inner| Read::read(inner.get_mut(), buffer)) {
-                return result;
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for InteractiveInput {
-    fn drop(&mut self) {
-        use nix::fcntl::{FcntlArg, fcntl};
-
-        let _ = fcntl(self.inner.get_ref(), FcntlArg::F_SETFL(self.original_flags));
-    }
-}
-
-#[cfg(not(unix))]
 struct InteractiveInput {
     receiver: tokio::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
 }
 
-#[cfg(not(unix))]
 impl InteractiveInput {
     fn new() -> io::Result<Self> {
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        // Do not set O_NONBLOCK on the process stdin descriptor. A terminal
+        // commonly supplies stdin, stdout, and stderr as duped descriptors for
+        // one open file description, so changing stdin flags also changes the
+        // output descriptors and turns transient terminal backpressure into an
+        // EAGAIN failure. A detached reader keeps the async control loop
+        // cancellable without mutating any host descriptor flags.
         std::thread::Builder::new()
             .name("morae-stdin".into())
             .spawn(move || {

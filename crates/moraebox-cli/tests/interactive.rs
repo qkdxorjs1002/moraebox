@@ -51,6 +51,48 @@ fn interactive_streams_output_before_stdin_eof() {
 }
 
 #[test]
+fn interactive_keeps_session_open_between_input_rounds() {
+    let mut child = interactive_command(interactive_two_round_command())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        for _ in 0..3 {
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            sender.send(line).unwrap();
+        }
+    });
+
+    assert_eq!(
+        receive_or_kill(&receiver, &mut child, "initial interactive output").trim_end(),
+        "ready"
+    );
+    stdin.write_all(b"first\n").unwrap();
+    assert_eq!(
+        receive_or_kill(&receiver, &mut child, "first interactive response").trim_end(),
+        "round:first"
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    stdin.write_all(b"second\n").unwrap();
+    drop(stdin);
+    assert_eq!(
+        receive_or_kill(&receiver, &mut child, "second interactive response").trim_end(),
+        "round:second"
+    );
+
+    let status = wait_or_kill(&mut child);
+    reader.join().unwrap();
+    assert!(status.success());
+}
+
+#[test]
 fn interactive_streams_stderr_before_stdin_eof() {
     let mut child = interactive_command(interactive_stderr_command())
         .stdin(Stdio::piped())
@@ -75,6 +117,46 @@ fn interactive_streams_stderr_before_stdin_eof() {
     let status = wait_or_kill(&mut child);
     reader.join().unwrap();
     assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn interactive_shared_pty_backpressure_does_not_abort_output() {
+    use std::fs::File;
+
+    use nix::{
+        fcntl::{FcntlArg, OFlag, fcntl},
+        pty::openpty,
+    };
+
+    let pty = openpty(None, None).unwrap();
+    let mut master = File::from(pty.master);
+    let slave = File::from(pty.slave);
+    let original_flags = OFlag::from_bits_truncate(fcntl(&slave, FcntlArg::F_GETFL).unwrap());
+    let master_flags = OFlag::from_bits_truncate(fcntl(&master, FcntlArg::F_GETFL).unwrap());
+    fcntl(&master, FcntlArg::F_SETFL(master_flags | OFlag::O_NONBLOCK)).unwrap();
+
+    let mut child = interactive_command(interactive_backpressure_command())
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
+        .spawn()
+        .unwrap();
+    let mut output = Vec::new();
+    read_pty_until(&mut master, &mut output, "ready");
+    let active_flags = OFlag::from_bits_truncate(fcntl(&slave, FcntlArg::F_GETFL).unwrap());
+
+    master.write_all(b"go\n").unwrap();
+    thread::sleep(Duration::from_millis(100));
+    read_pty_until(&mut master, &mut output, "marker:go");
+    let status = wait_or_kill(&mut child);
+
+    assert_eq!(
+        active_flags, original_flags,
+        "interactive input must not change flags shared by PTY output descriptors"
+    );
+    assert!(status.success(), "interactive command failed: {status}");
+    assert!(output.len() >= 256 * 1024, "large output was truncated");
 }
 
 #[cfg(unix)]
@@ -251,6 +333,27 @@ fn wait_or_kill(child: &mut Child) -> std::process::ExitStatus {
 }
 
 #[cfg(unix)]
+fn read_pty_until(reader: &mut std::fs::File, output: &mut Vec<u8>, marker: &str) {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let mut buffer = [0_u8; 4096];
+    while !String::from_utf8_lossy(output).contains(marker) {
+        match reader.read(&mut buffer) {
+            Ok(0) => panic!("PTY closed before output contained {marker:?}"),
+            Ok(count) => output.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "PTY output did not contain {marker:?}: {}",
+                    String::from_utf8_lossy(output)
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("read PTY output while waiting for {marker:?}: {error}"),
+        }
+    }
+}
+
+#[cfg(unix)]
 fn interactive_echo_command() -> Vec<String> {
     [
         "/bin/sh",
@@ -262,10 +365,43 @@ fn interactive_echo_command() -> Vec<String> {
 }
 
 #[cfg(unix)]
+fn interactive_two_round_command() -> Vec<String> {
+    [
+        "/bin/sh",
+        "-c",
+        "printf 'ready\\n'; IFS= read -r first; printf 'round:%s\\n' \"$first\"; IFS= read -r second; printf 'round:%s\\n' \"$second\"",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+#[cfg(windows)]
+fn interactive_two_round_command() -> Vec<String> {
+    vec![
+        windows_system_executable("cmd.exe"),
+        "/D".into(),
+        "/V:ON".into(),
+        "/C".into(),
+        "echo ready&set /p first=&echo round:!first!&set /p second=&echo round:!second!".into(),
+    ]
+}
+
+#[cfg(unix)]
 fn interactive_stderr_command() -> Vec<String> {
     ["/bin/sh", "-c", "printf 'ready-error\\n' >&2; read line"]
         .map(String::from)
         .to_vec()
+}
+
+#[cfg(unix)]
+fn interactive_backpressure_command() -> Vec<String> {
+    [
+        "/bin/sh",
+        "-c",
+        "printf 'ready\\n'; IFS= read -r line; i=0; while [ \"$i\" -lt 8192 ]; do printf 0123456789abcdef0123456789abcdef; i=$((i + 1)); done; printf '\\nmarker:%s\\n' \"$line\"",
+    ]
+    .map(String::from)
+    .to_vec()
 }
 
 #[cfg(windows)]
