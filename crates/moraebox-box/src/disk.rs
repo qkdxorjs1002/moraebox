@@ -16,8 +16,9 @@ use sha2::{Digest as _, Sha256};
 use super::{
     BoxDiskFormat, BoxStoreError, DEFAULT_GC_MIN_AGE, GarbageCollectionLock,
     GarbageCollectionReport, garbage_collection_candidate_is_old, garbage_collection_lock,
-    now_unix_millis, remove_managed_directory, secure_directory, set_file_permissions, sync_parent,
-    validate_directory, validate_regular_file, write_json_atomic,
+    lock_error_is_contended, now_unix_millis, remove_managed_directory, secure_directory,
+    set_file_permissions, sync_parent, validate_directory, validate_regular_file,
+    write_json_atomic,
 };
 
 pub const BASE_DISK_LAYOUT_VERSION: u32 = 1;
@@ -274,7 +275,7 @@ impl BaseDiskStore {
                     sync_parent(&candidate)?;
                     report.removed += 1;
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(error) if lock_error_is_contended(&error) => {
                     report.skipped_busy += 1;
                 }
                 Err(source) => {
@@ -426,9 +427,14 @@ impl EphemeralDiskStore {
                 continue;
             }
             match garbage_collection_lock(&directory)? {
-                GarbageCollectionLock::Acquired(_lock) => {
+                GarbageCollectionLock::Acquired(lock) => {
+                    // Windows cannot remove a directory while its lock file handle is open.
+                    #[cfg(windows)]
+                    drop(lock);
                     remove_managed_directory(&directory)?;
                     sync_parent(&directory)?;
+                    #[cfg(not(windows))]
+                    drop(lock);
                     report.removed += 1;
                 }
                 GarbageCollectionLock::Busy => report.skipped_busy += 1,
@@ -760,6 +766,13 @@ fn finish_disk_copy(
             "copied disk size {destination_size} does not match {source_label} size {source_size}"
         )));
     }
+    #[cfg(windows)]
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(destination)?
+        .sync_all()?;
+    #[cfg(not(windows))]
     File::open(destination)?.sync_all()?;
     Ok(())
 }

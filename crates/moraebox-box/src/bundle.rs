@@ -495,8 +495,20 @@ impl BoxStore {
         if destination.symlink_metadata().is_ok() {
             return Err(BoxStoreError::InvalidPath(destination.into()));
         }
+        // The verified staging directory is still invisible under its final UUID. Windows
+        // requires the contained byte-range lock to be closed before the directory rename.
+        #[cfg(windows)]
+        {
+            let _ = FileExt::unlock(&lock);
+            drop(lock);
+        }
         fs::rename(staging, destination)?;
         sync_parent(destination)?;
+        #[cfg(not(windows))]
+        {
+            let _ = FileExt::unlock(&lock);
+            drop(lock);
+        }
         Ok(metadata)
     }
 }
@@ -940,6 +952,13 @@ mod tests {
         let mut tail = [0_u8; 1];
         imported_file.read_exact(&mut tail).unwrap();
         assert_eq!(tail, [7]);
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "illumos",
+            target_os = "solaris"
+        ))]
         assert!(allocated_size_bytes(&imported_disk).unwrap() < SPARSE_DISK_BYTES / 4);
     }
 

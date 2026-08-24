@@ -554,7 +554,7 @@ impl BoxStore {
     }
 
     fn quarantine_entry(entry: &CorruptBoxEntry, batch: &Path) -> Result<PathBuf, BoxStoreError> {
-        let _lock = if let Some(box_id) = entry.error.box_id {
+        let lock = if let Some(box_id) = entry.error.box_id {
             lock_for_quarantine(&entry.source, box_id)?
         } else {
             None
@@ -563,7 +563,12 @@ impl BoxStore {
         if destination.symlink_metadata().is_ok() {
             return Err(BoxStoreError::InvalidPath(destination));
         }
+        // Windows rejects renaming a directory that contains an open byte-range-locked file.
+        #[cfg(windows)]
+        drop(lock);
         fs::rename(&entry.source, &destination)?;
+        #[cfg(not(windows))]
+        drop(lock);
         sync_parent(&entry.source)?;
         sync_parent(&destination)?;
         Ok(destination)
@@ -653,8 +658,13 @@ impl BoxStore {
     pub fn delete(&self, box_id: BoxId) -> Result<BoxMetadata, BoxStoreError> {
         let lease = self.try_acquire(box_id)?;
         let metadata = (*lease.metadata).clone();
+        let directory = lease.directory.clone();
         let tombstone = self.temporary_path("deleted", box_id);
-        fs::rename(&lease.directory, &tombstone)?;
+        // Windows requires the contained lock handle to be closed before a directory rename.
+        #[cfg(windows)]
+        drop(lease);
+        fs::rename(&directory, &tombstone)?;
+        #[cfg(not(windows))]
         drop(lease);
         fs::remove_dir_all(tombstone)?;
         Ok(metadata)
@@ -779,13 +789,23 @@ impl BoxStore {
             };
             write_json_atomic(&staging.join(METADATA_FILE), &metadata)?;
             lock_file.sync_all()?;
+            // The completed staging directory is still invisible under its final UUID. Windows
+            // requires its contained byte-range lock to be closed before the directory rename.
+            #[cfg(windows)]
+            {
+                let _ = FileExt::unlock(&lock_file);
+                drop(lock_file);
+            }
             fs::rename(&staging, &destination)?;
             sync_parent(&destination)?;
             // Do not rely only on descriptor drop here. Callers may acquire the newly published
             // Box immediately after create returns, and explicit unlock avoids transient
             // self-contention observed on Linux CI filesystems.
-            let _ = FileExt::unlock(&lock_file);
-            drop(lock_file);
+            #[cfg(not(windows))]
+            {
+                let _ = FileExt::unlock(&lock_file);
+                drop(lock_file);
+            }
             Ok(metadata)
         })();
         if result.is_err() && staging.symlink_metadata().is_ok() {
@@ -898,7 +918,7 @@ impl BoxStore {
                 }
                 Ok(metadata)
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(fallback),
+            Err(error) if lock_error_is_contended(&error) => Ok(fallback),
             Err(source) => Err(BoxStoreError::Busy {
                 box_id: fallback.box_id,
                 source,
@@ -1029,8 +1049,23 @@ pub(crate) fn garbage_collection_lock(
     validate_regular_file(&lock_path, "garbage collection lock")?;
     match FileExt::try_lock_exclusive(&lock) {
         Ok(()) => Ok(GarbageCollectionLock::Acquired(Some(lock))),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(GarbageCollectionLock::Busy),
+        Err(error) if lock_error_is_contended(&error) => Ok(GarbageCollectionLock::Busy),
         Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn lock_error_is_contended(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // LockFileEx reports ERROR_LOCK_VIOLATION without mapping it to WouldBlock.
+        error.raw_os_error() == Some(33)
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -1055,9 +1090,14 @@ fn collect_stale_directory(
         return Ok(());
     }
     match garbage_collection_lock(path)? {
-        GarbageCollectionLock::Acquired(_lock) => {
+        GarbageCollectionLock::Acquired(lock) => {
+            // Windows cannot remove a directory while its lock file handle is open.
+            #[cfg(windows)]
+            drop(lock);
             remove_managed_directory(path)?;
             sync_parent(path)?;
+            #[cfg(not(windows))]
+            drop(lock);
             report.removed += 1;
         }
         GarbageCollectionLock::Busy => report.skipped_busy += 1,
