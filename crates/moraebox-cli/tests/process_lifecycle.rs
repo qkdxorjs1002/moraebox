@@ -16,10 +16,16 @@ fn propagates_exit_code_and_separate_output() {
 #[test]
 fn timeout_uses_the_conventional_exit_code() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_morae"));
-    command.args(["run", "--backend", "process", "--timeout", "20ms", "--"]);
+    command.args(["run", "--backend", "process", "--timeout", "500ms", "--"]);
     command.args(long_running_command());
     let output = command.output().unwrap();
-    assert_eq!(output.status.code(), Some(124));
+    assert_eq!(
+        output.status.code(),
+        Some(124),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
