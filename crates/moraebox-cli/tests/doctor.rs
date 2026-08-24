@@ -24,7 +24,17 @@ fn json_doctor_probes_the_effective_cache_volume_and_remediates_failures() {
         cache.path().to_string_lossy().as_ref()
     );
     assert!(report["cache_volume"]["available_bytes"].is_u64());
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     assert!(report["cache_volume"]["reflink_supported"].is_boolean());
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        assert!(report["cache_volume"]["reflink_supported"].is_null());
+        assert!(
+            report["cache_volume"]["reflink_error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty())
+        );
+    }
 
     let checks = report["checks"].as_array().expect("doctor checks");
     assert!(checks.len() >= 9);
