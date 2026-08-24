@@ -252,6 +252,9 @@ fn find_sparse_map(source: &mut File, logical_size: u64) -> io::Result<Option<Sp
     target_os = "illumos",
     target_os = "solaris"
 )))]
+// Keep the fallible signature aligned with the sparse-filesystem implementation above so callers
+// can remain platform-neutral.
+#[allow(clippy::unnecessary_wraps)]
 fn find_sparse_map(_source: &mut File, _logical_size: u64) -> io::Result<Option<SparseMap>> {
     Ok(None)
 }

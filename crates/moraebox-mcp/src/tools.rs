@@ -2229,7 +2229,11 @@ mod tests {
             json!({"box_id": metadata.box_id, "destination": bundle}),
         )
         .await;
-        assert_eq!(exported.pointer("/result/isError"), Some(&json!(false)));
+        assert_eq!(
+            exported.pointer("/result/isError"),
+            Some(&json!(false)),
+            "box export response: {exported}"
+        );
         let imported = call(
             &server,
             "sandbox_box_import",

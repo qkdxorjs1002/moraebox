@@ -460,8 +460,13 @@ fn assert_protocol_io(harness: &NativeHarness) {
         .expect("write protocol I/O stdin");
     let children = wait_for_native_children(&mut child, false);
     let output = wait_for_output(child);
-    assert_eq!(output.status.code(), Some(23));
     let report = parse_report(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "protocol I/O probe failed: report={report}; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_dead_report(&report);
     assert_eq!(report["exit_code"], 23);
     assert_eq!(report["timed_out"], false);

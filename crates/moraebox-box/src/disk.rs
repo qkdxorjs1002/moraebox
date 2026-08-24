@@ -679,6 +679,9 @@ fn copy_sparse_extents(source: &mut File, destination: &mut File, length: u64) -
     target_os = "illumos",
     target_os = "solaris"
 )))]
+// Keep the fallible signature aligned with the sparse-filesystem implementation above so callers
+// can remain platform-neutral.
+#[allow(clippy::unnecessary_wraps)]
 fn copy_sparse_extents(
     _source: &mut File,
     _destination: &mut File,
@@ -687,6 +690,13 @@ fn copy_sparse_extents(
     Ok(false)
 }
 
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "illumos",
+    target_os = "solaris"
+))]
 fn copy_exact_range(
     source: &mut File,
     destination: &mut File,

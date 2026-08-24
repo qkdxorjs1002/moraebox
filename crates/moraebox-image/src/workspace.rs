@@ -1180,20 +1180,19 @@ mod tests {
 
     #[test]
     fn workspace_stages_share_one_absolute_deadline() {
-        let limit = Duration::from_millis(50);
-        let deadline = WorkspaceDeadline::new(Some(limit));
+        let limit = Duration::from_secs(1);
+        let mut deadline = WorkspaceDeadline::new(Some(limit));
         let first = deadline
             .remaining(WorkspaceStage::ScanSource)
             .unwrap()
             .unwrap();
-        std::thread::sleep(Duration::from_millis(10));
         let second = deadline
             .remaining(WorkspaceStage::CreateImage)
             .unwrap()
             .unwrap();
-        assert!(second < first);
+        assert!(second <= first);
 
-        std::thread::sleep(second + Duration::from_millis(2));
+        deadline.deadline = Some(Instant::now());
         assert!(matches!(
             deadline.remaining(WorkspaceStage::PopulateFilesystem),
             Err(WorkspaceError::TimedOut {

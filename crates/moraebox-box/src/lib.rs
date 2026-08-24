@@ -781,6 +781,11 @@ impl BoxStore {
             lock_file.sync_all()?;
             fs::rename(&staging, &destination)?;
             sync_parent(&destination)?;
+            // Do not rely only on descriptor drop here. Callers may acquire the newly published
+            // Box immediately after create returns, and explicit unlock avoids transient
+            // self-contention observed on Linux CI filesystems.
+            let _ = FileExt::unlock(&lock_file);
+            drop(lock_file);
             Ok(metadata)
         })();
         if result.is_err() && staging.symlink_metadata().is_ok() {
@@ -1331,6 +1336,8 @@ fn set_directory_permissions(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+// These no-op adapters preserve one fallible API at platform-neutral call sites.
+#[allow(clippy::unnecessary_wraps)]
 fn set_directory_permissions(_path: &Path) -> io::Result<()> {
     Ok(())
 }
@@ -1342,6 +1349,7 @@ fn set_file_permissions(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_file_permissions(_path: &Path) -> io::Result<()> {
     Ok(())
 }
@@ -1353,6 +1361,7 @@ fn owner_uid(path: &Path) -> Result<Option<u32>, BoxStoreError> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn owner_uid(_path: &Path) -> Result<Option<u32>, BoxStoreError> {
     Ok(None)
 }
@@ -1366,6 +1375,7 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn sync_parent(_path: &Path) -> io::Result<()> {
     Ok(())
 }
