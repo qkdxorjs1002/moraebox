@@ -1057,8 +1057,8 @@ impl BackendController for LibkrunController {
                 unistd::Pid,
             };
 
-            if signal != Signal::Kill
-                && let Some(NativeControl::Protocol(control)) = &self.control
+            if let Some(NativeControl::Protocol(control)) =
+                self.control.as_ref().filter(|_| signal != Signal::Kill)
             {
                 return control.signal(signal);
             }

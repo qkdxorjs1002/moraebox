@@ -779,7 +779,7 @@ fn to_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+    use std::io::SeekFrom;
     use std::thread;
     use std::time::{Duration, Instant};
 

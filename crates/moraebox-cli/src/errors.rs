@@ -115,7 +115,7 @@ pub(super) struct CliError {
     pub(super) retryable: bool,
     pub(super) remediation: &'static str,
     #[source]
-    pub(super) source: CliErrorSource,
+    pub(super) source: Box<CliErrorSource>,
 }
 
 impl CliError {
@@ -129,7 +129,7 @@ impl CliError {
             stage,
             retryable: source.retryable(),
             remediation,
-            source,
+            source: Box::new(source),
         }
     }
 }
@@ -182,6 +182,11 @@ fn is_retryable_io(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_error_stays_within_clippy_large_error_threshold() {
+        assert!(std::mem::size_of::<CliError>() <= 128);
+    }
 
     #[test]
     fn timeout_preserves_runtime_stage_and_retryability() {

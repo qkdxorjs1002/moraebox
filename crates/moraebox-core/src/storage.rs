@@ -236,7 +236,7 @@ fn windows_home_directory() -> Option<PathBuf> {
     if drive.is_empty() || path.is_empty() {
         return None;
     }
-    let mut home = std::ffi::OsString::from(drive);
+    let mut home = drive;
     home.push(path);
     Some(PathBuf::from(home))
 }

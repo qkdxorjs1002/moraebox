@@ -81,6 +81,20 @@ jobs:
         continue-on-error: true
         run: |
           brew tap qkdxorjs1002/tap
+          libkrunfw_formula="$(brew --repository qkdxorjs1002/tap)/Formula/libkrunfw.rb"
+          if ! grep -Fq 'version "5.5.0"' "$libkrunfw_formula"; then
+            python3 - "$libkrunfw_formula" <<'PY'
+          import sys
+          from pathlib import Path
+
+          formula = Path(sys.argv[1])
+          content = formula.read_text(encoding="utf-8")
+          url = '  url "https://github.com/containers/libkrunfw/releases/download/v5.5.0/libkrunfw-prebuilt-aarch64.tgz"\n'
+          if content.count(url) != 1:
+              raise SystemExit("cannot locate the pinned libkrunfw URL in the tapped formula")
+          formula.write_text(content.replace(url, url + '  version "5.5.0"\n'), encoding="utf-8")
+          PY
+          fi
           brew trust --tap qkdxorjs1002/tap
           brew install \
             qkdxorjs1002/tap/libkrun \
