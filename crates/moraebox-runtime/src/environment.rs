@@ -4,13 +4,22 @@ use moraebox_core::RunSpec;
 
 use crate::{BackendError, EnvironmentComponent};
 
+const DEFAULT_TTY_TERM: &str = "xterm";
+
 pub(crate) fn resolve_environment(
     spec: &RunSpec,
 ) -> Result<BTreeMap<String, String>, BackendError> {
-    if !spec.inherit_env {
-        return Ok(spec.env.clone());
+    let mut resolved = if spec.inherit_env {
+        resolve_environment_from(std::env::vars_os(), &spec.env)?
+    } else {
+        spec.env.clone()
+    };
+    if spec.tty {
+        resolved
+            .entry("TERM".into())
+            .or_insert_with(|| DEFAULT_TTY_TERM.into());
     }
-    resolve_environment_from(std::env::vars_os(), &spec.env)
+    Ok(resolved)
 }
 
 fn resolve_environment_from(
@@ -67,6 +76,32 @@ mod tests {
         spec.env.insert("ONLY".into(), "explicit".into());
 
         assert_eq!(resolve_environment(&spec).unwrap(), spec.env);
+    }
+
+    #[test]
+    fn tty_adds_a_minimal_default_terminal_environment() {
+        let mut spec = RunSpec::command(["true"]);
+        spec.tty = true;
+
+        assert_eq!(
+            resolve_environment(&spec).unwrap(),
+            BTreeMap::from([("TERM".into(), "xterm".into())])
+        );
+    }
+
+    #[test]
+    fn explicit_terminal_overrides_the_tty_default() {
+        let mut spec = RunSpec::command(["true"]);
+        spec.tty = true;
+        spec.env.insert("TERM".into(), "screen-256color".into());
+
+        assert_eq!(
+            resolve_environment(&spec)
+                .unwrap()
+                .get("TERM")
+                .map(String::as_str),
+            Some("screen-256color")
+        );
     }
 
     #[cfg(unix)]

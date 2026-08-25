@@ -101,6 +101,11 @@ sys.exit(23)
 const TTY_RESIZE_PROBE: &str = r#"
 import os, signal, sys
 
+term = os.environ.get("TERM")
+if term != "xterm":
+    raise RuntimeError(f"unexpected TERM: {term!r}")
+print(f"tty-term:{term}", flush=True)
+
 def report_size(*_):
     size = os.get_terminal_size(sys.stdin.fileno())
     print(f"tty-size:{size.lines}x{size.columns}", flush=True)
@@ -537,6 +542,11 @@ fn assert_tty_resize(harness: &NativeHarness) {
 
     let mut pty_output = Vec::new();
     read_pty_until(&mut master, &mut pty_output, "tty-size:24x80");
+    assert!(
+        String::from_utf8_lossy(&pty_output).contains("tty-term:xterm"),
+        "TTY probe did not receive the safe default terminal: {}",
+        String::from_utf8_lossy(&pty_output)
+    );
 
     rustix::termios::tcsetwinsize(
         &master,
