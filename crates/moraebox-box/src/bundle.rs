@@ -452,6 +452,7 @@ impl BoxStore {
         let mut metadata: BoxMetadata = serde_json::from_slice(&metadata_bytes)
             .map_err(|error| BoxStoreError::InvalidBundle(error.to_string()))?;
         validate_imported_metadata(&metadata)?;
+        let requires_reconciliation = metadata.schema_version < SCHEMA_VERSION;
         if metadata.virtual_size_bytes != manifest.root_disk_size_bytes {
             return Err(BoxStoreError::InvalidBundle(
                 "Box metadata virtual size does not match the root disk entry".into(),
@@ -486,7 +487,11 @@ impl BoxStore {
         let now = now_unix_millis()?;
         metadata.schema_version = SCHEMA_VERSION;
         metadata.box_id = box_id;
-        metadata.state = BoxState::Ready;
+        metadata.state = if requires_reconciliation {
+            BoxState::Dirty
+        } else {
+            BoxState::Ready
+        };
         metadata.updated_at_unix_ms = now;
         metadata.owner_uid = owner_uid(staging)?;
         metadata.physical_size_bytes = allocated_size_bytes(&disk_path)?;
@@ -650,7 +655,7 @@ fn unpack_gnu_sparse_and_hash<R: Read>(
 }
 
 fn validate_imported_metadata(metadata: &BoxMetadata) -> Result<(), BoxStoreError> {
-    if !matches!(metadata.schema_version, 1 | SCHEMA_VERSION) {
+    if !matches!(metadata.schema_version, 1 | 2 | SCHEMA_VERSION) {
         return Err(BoxStoreError::InvalidBundle(format!(
             "unsupported Box metadata schema {}",
             metadata.schema_version
@@ -960,6 +965,28 @@ mod tests {
             target_os = "solaris"
         ))]
         assert!(allocated_size_bytes(&imported_disk).unwrap() < SPARSE_DISK_BYTES / 4);
+    }
+
+    #[test]
+    fn legacy_bundle_import_requires_filesystem_reconciliation() {
+        let (temporary, store, disk) = fixture();
+        let mut created = store
+            .create(
+                &CreateBox::new("sha256:test", "linux/arm64", DISK_BYTES),
+                &disk,
+            )
+            .unwrap();
+        created.schema_version = 2;
+        let metadata = serde_json::to_vec(&created).unwrap();
+        let root = fs::read(&disk).unwrap();
+        let manifest = manifest_for(&metadata, &root);
+        let bundle = temporary.path().join("legacy-box.tar");
+        write_test_bundle(&bundle, &manifest, &metadata, &root, None).unwrap();
+
+        let imported = store.import_bundle(&bundle).unwrap();
+
+        assert_eq!(imported.schema_version, SCHEMA_VERSION);
+        assert_eq!(imported.state, BoxState::Dirty);
     }
 
     #[test]

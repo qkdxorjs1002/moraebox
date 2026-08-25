@@ -30,8 +30,9 @@ pub use disk::{
     DEFAULT_BOX_DISK_SIZE_BYTES, EphemeralDisk, EphemeralDiskStore, EphemeralGcReport,
 };
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const LEGACY_SCHEMA_VERSION: u32 = 1;
+const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 const BOXES_DIRECTORY: &str = "boxes";
 const METADATA_FILE: &str = "metadata.json";
 const ROOT_DISK_FILE: &str = "root.ext4";
@@ -1153,8 +1154,11 @@ fn read_metadata(path: &Path, expected_id: BoxId) -> Result<(BoxMetadata, bool),
     })?;
     let migrated = match value.schema_version {
         SCHEMA_VERSION => false,
-        LEGACY_SCHEMA_VERSION => {
+        LEGACY_SCHEMA_VERSION | PREVIOUS_SCHEMA_VERSION => {
             value.schema_version = SCHEMA_VERSION;
+            if value.state == BoxState::Ready {
+                value.state = BoxState::Dirty;
+            }
             true
         }
         actual => {
@@ -1536,6 +1540,7 @@ mod tests {
             prop_assert_eq!(migrated.manifest_digest, manifest_digest);
             prop_assert_eq!(migrated.platform, platform);
             prop_assert_eq!(migrated.generation, u64::from(generation));
+            prop_assert_eq!(migrated.state, BoxState::Dirty);
         }
     }
 
@@ -1579,7 +1584,7 @@ mod tests {
         assert_eq!(loaded.state, BoxState::Ready);
         assert_eq!(loaded.disk_format, BoxDiskFormat::RawExt4);
         assert_eq!(loaded.generation, 0);
-        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.schema_version, 3);
         assert!(loaded.physical_size_bytes <= loaded.virtual_size_bytes);
         assert_eq!(
             fs::metadata(
@@ -1620,11 +1625,35 @@ mod tests {
         let persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
 
-        assert_eq!(migrated.schema_version, 2);
+        assert_eq!(migrated.schema_version, 3);
+        assert_eq!(migrated.state, BoxState::Dirty);
         assert_eq!(migrated.manifest_digest, created.manifest_digest);
-        assert_eq!(persisted["schema_version"], 2);
+        assert_eq!(persisted["schema_version"], 3);
+        assert_eq!(persisted["state"], "dirty");
         assert_eq!(persisted["labels"], serde_json::json!({}));
         assert_eq!(persisted["tags"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn migrates_v2_ready_metadata_to_dirty_for_reconciliation() {
+        let fixture = Fixture::new();
+        let created = fixture.create();
+        let path = fixture
+            .store
+            .box_directory(created.box_id)
+            .join(METADATA_FILE);
+        let mut previous = serde_json::to_value(&created).unwrap();
+        previous["schema_version"] = serde_json::json!(PREVIOUS_SCHEMA_VERSION);
+        fs::write(&path, serde_json::to_vec_pretty(&previous).unwrap()).unwrap();
+
+        let migrated = fixture.store.get(created.box_id).unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+
+        assert_eq!(migrated.schema_version, SCHEMA_VERSION);
+        assert_eq!(migrated.state, BoxState::Dirty);
+        assert_eq!(persisted["schema_version"], SCHEMA_VERSION);
+        assert_eq!(persisted["state"], "dirty");
     }
 
     #[test]

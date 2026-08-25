@@ -1526,6 +1526,31 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn legacy_ready_box_is_repaired_before_helper_spawn() {
+        let fixture = ManagedFixture::new(
+            "#!/bin/sh\nprintf started > \"$0.called\"\nexit 0\n",
+            "#!/bin/sh\nexit 4\n",
+        );
+        let (box_id, _) = fixture.create_box();
+        fixture.mark_box_legacy_ready(box_id);
+        let backend = fixture.backend(None);
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.box_id = Some(box_id);
+
+        assert!(matches!(
+            backend.spawn(&spec, &RunBudget::new(spec.timeout)).await,
+            Err(BackendError::Control(message)) if message.contains("could not repair")
+        ));
+
+        assert!(!fixture.helper.with_extension("called").exists());
+        assert_eq!(
+            fixture.boxes.get(box_id).unwrap().state,
+            BoxState::NeedsRepair
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn persistent_box_rejects_a_second_writer_and_stays_dirty_when_dropped() {
         let fixture =
             ManagedFixture::new("#!/bin/sh\nwhile :; do /bin/sleep 1; done\n", "exit 0\n");
@@ -2333,6 +2358,19 @@ mod tests {
         fn mark_box_dirty(&self, box_id: moraebox_core::BoxId) {
             let mut lease = self.boxes.try_acquire(box_id).unwrap();
             self.boxes.begin_writable_use(&mut lease).unwrap();
+        }
+
+        fn mark_box_legacy_ready(&self, box_id: moraebox_core::BoxId) {
+            let path = self
+                .boxes
+                .boxes_directory()
+                .join(box_id.to_string())
+                .join("metadata.json");
+            let mut metadata: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            metadata["schema_version"] = serde_json::json!(2);
+            metadata["state"] = serde_json::json!("ready");
+            fs::write(path, serde_json::to_vec_pretty(&metadata).unwrap()).unwrap();
         }
 
         fn make_helper_non_executable(&self) {
