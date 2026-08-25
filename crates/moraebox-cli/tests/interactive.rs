@@ -50,6 +50,39 @@ fn interactive_streams_output_before_stdin_eof() {
     assert!(status.success(), "interactive command failed: {stderr}");
 }
 
+#[cfg(unix)]
+#[test]
+fn interactive_ignores_host_eof_during_command_cleanup() {
+    let mut child = interactive_command(interactive_cleanup_race_command())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    assert_eq!(ready.trim_end(), "ready");
+
+    stdin.write_all(b"hello\n").unwrap();
+    thread::sleep(Duration::from_millis(200));
+    drop(stdin);
+
+    let mut remainder = String::new();
+    stdout.read_to_string(&mut remainder).unwrap();
+    let status = wait_or_kill(&mut child);
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "interactive command failed: {stderr}");
+    assert_eq!(remainder.trim_end(), "done:hello");
+}
+
 #[test]
 fn interactive_keeps_session_open_between_input_rounds() {
     let mut child = interactive_command(interactive_two_round_command())
@@ -370,6 +403,17 @@ fn interactive_two_round_command() -> Vec<String> {
         "/bin/sh",
         "-c",
         "printf 'ready\\n'; IFS= read -r first; printf 'round:%s\\n' \"$first\"; IFS= read -r second; printf 'round:%s\\n' \"$second\"",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+#[cfg(unix)]
+fn interactive_cleanup_race_command() -> Vec<String> {
+    [
+        "/bin/sh",
+        "-c",
+        "printf 'ready\\n'; IFS= read -r line; sleep 1 & printf 'done:%s\\n' \"$line\"",
     ]
     .map(String::from)
     .to_vec()

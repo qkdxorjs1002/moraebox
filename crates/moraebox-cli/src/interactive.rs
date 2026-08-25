@@ -48,7 +48,11 @@ where
             input_result = &mut input_future, if input_open => {
                 match input_result {
                     Ok(()) => input_open = false,
-                    Err(_) if session.status().state == SessionState::Dead => {
+                    Err(_) if session_is_terminating(session.status().state) => {
+                        // The command can exit after consuming the final input
+                        // chunk while the host reader is about to report EOF.
+                        // Session cleanup then closes stdin first, so let the
+                        // session own its final status and output drain.
                         input_open = false;
                     }
                     Err(error) => return Err(error),
@@ -166,6 +170,13 @@ fn session_exit_code(status: &SessionStatus) -> i32 {
     } else {
         125
     }
+}
+
+fn session_is_terminating(state: SessionState) -> bool {
+    matches!(
+        state,
+        SessionState::Stopping | SessionState::Failed | SessionState::TimedOut | SessionState::Dead
+    )
 }
 
 #[cfg(unix)]
@@ -350,7 +361,7 @@ impl HostSignals {
 
 #[cfg(test)]
 mod tests {
-    use super::dropped_output_warning;
+    use super::{SessionState, dropped_output_warning, session_is_terminating};
 
     #[test]
     fn dropped_output_warning_returns_to_the_first_column() {
@@ -358,5 +369,14 @@ mod tests {
             dropped_output_warning(42, "\r\n"),
             "morae: interactive output before cursor 42 was dropped\r\n"
         );
+    }
+
+    #[test]
+    fn input_errors_are_ignored_only_after_session_termination_starts() {
+        assert!(!session_is_terminating(SessionState::Running));
+        assert!(session_is_terminating(SessionState::Stopping));
+        assert!(session_is_terminating(SessionState::Failed));
+        assert!(session_is_terminating(SessionState::TimedOut));
+        assert!(session_is_terminating(SessionState::Dead));
     }
 }
