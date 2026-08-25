@@ -29,7 +29,11 @@ impl PreparedRoot {
 }
 
 pub(super) enum ManagedRootLease {
-    Persistent { store: BoxStore, lease: BoxLease },
+    Persistent {
+        store: BoxStore,
+        lease: BoxLease,
+        e2fsck_path: PathBuf,
+    },
     Ephemeral(EphemeralDisk),
 }
 
@@ -41,9 +45,14 @@ impl ManagedRootLease {
         }
     }
 
-    pub(super) fn mark_clean(&mut self) -> Result<(), BoxStoreError> {
-        if let Self::Persistent { store, lease } = self {
-            store.finish_clean_use(lease)?;
+    pub(super) async fn finish_clean(&mut self) -> Result<(), BackendError> {
+        if let Self::Persistent {
+            store,
+            lease,
+            e2fsck_path,
+        } = self
+        {
+            repair_dirty_box(store, lease, e2fsck_path).await?;
         }
         Ok(())
     }

@@ -732,10 +732,67 @@ fn assert_helper_crash_cleanup(harness: &NativeHarness) {
     harness.assert_network_state_empty();
 }
 
+fn assert_persistent_box_immediate_reuse(harness: &NativeHarness) {
+    let state_dir = harness.state.path().join("state");
+    let created = Command::new(&harness.morae)
+        .args([
+            "box",
+            "create",
+            "--pull",
+            "never",
+            "--name",
+            "immediate-reuse",
+        ])
+        .arg("--image")
+        .arg(&harness.image)
+        .arg("--cache-dir")
+        .arg(&harness.cache_dir)
+        .arg("--state-dir")
+        .arg(&state_dir)
+        .output()
+        .expect("create persistent Box for immediate reuse");
+    assert!(
+        created.status.success(),
+        "persistent Box creation failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    for iteration in 1..=10 {
+        let output = Command::new(&harness.morae)
+            .arg("run")
+            .arg("--helper")
+            .arg(&harness.helper)
+            .arg("--cache-dir")
+            .arg(&harness.cache_dir)
+            .arg("--state-dir")
+            .arg(&state_dir)
+            .args([
+                "--network",
+                "--box",
+                "immediate-reuse",
+                "--",
+                "python3",
+                "-c",
+                "import time; time.sleep(0.1)",
+            ])
+            .output()
+            .expect("run persistent Box without a reuse delay");
+        assert!(
+            output.status.success(),
+            "persistent Box immediate reuse failed on iteration {iteration}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        harness.assert_network_state_empty();
+        harness.assert_control_state_empty();
+    }
+}
+
 #[test]
 #[ignore = "requires signed Apple Silicon libkrun, gvproxy, and a ready cached image"]
 fn signed_native_egress_gate() {
     let harness = NativeHarness::new();
+    assert_persistent_box_immediate_reuse(&harness);
     assert_protocol_io(&harness);
     assert_tty_eof(&harness);
     assert_tty_resize(&harness);

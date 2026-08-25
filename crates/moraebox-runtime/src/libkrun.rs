@@ -560,6 +560,7 @@ impl LibkrunBackend {
             PreparedRoot::Managed(ManagedRootLease::Persistent {
                 store: runtime.boxes.clone(),
                 lease,
+                e2fsck_path: runtime.e2fsck_path.clone(),
             }),
             startup,
         ))
@@ -980,7 +981,8 @@ fn managed_exit(
         let status = child.wait().await;
         let root_cleanup = match (status.as_ref(), root_lease.as_mut()) {
             (Ok(status), Some(lease)) if helper_exit_is_clean(*status) => lease
-                .mark_clean()
+                .finish_clean()
+                .await
                 .map_err(|error| io::Error::other(error.to_string())),
             _ => Ok(()),
         };
@@ -1478,7 +1480,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn persistent_box_lease_is_cleaned_after_helper_exit() {
-        let fixture = ManagedFixture::new("#!/bin/sh\nprintf '%s\\n' \"$@\"\n", "exit 0\n");
+        let fixture = ManagedFixture::new(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\"\n",
+            "#!/bin/sh\nprintf checked > \"$0.called\"\nexit 1\n",
+        );
         let (box_id, disk_path) = fixture.create_box();
         let backend = fixture.backend(None);
         let mut spec = RunSpec::command(["/usr/bin/true"]);
@@ -1497,7 +1502,26 @@ mod tests {
         assert_eq!(report.startup.root_mode, Some(RootMode::Persistent));
         assert!(report.startup.box_lock_micros.is_some());
         assert!(report.startup.helper_spawn_micros.is_some());
+        assert!(fixture.e2fsck.with_extension("called").exists());
         assert_eq!(fixture.boxes.get(box_id).unwrap().state, BoxState::Ready);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_helper_exit_blocks_a_box_when_post_exit_repair_fails() {
+        let fixture = ManagedFixture::new("#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 4\n");
+        let (box_id, _) = fixture.create_box();
+        let backend = fixture.backend(None);
+        let mut spec = RunSpec::command(["/usr/bin/true"]);
+        spec.box_id = Some(box_id);
+
+        let error = crate::Supervisor::new(backend).run(spec).await.unwrap_err();
+
+        assert!(error.to_string().contains("could not repair"));
+        assert_eq!(
+            fixture.boxes.get(box_id).unwrap().state,
+            BoxState::NeedsRepair
+        );
     }
 
     #[cfg(unix)]
