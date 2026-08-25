@@ -230,9 +230,9 @@ struct RunArgs {
     /// Image acquisition policy: cache-first, forced refresh, or cache-only.
     #[arg(long = "pull", default_value_t = ImagePullPolicy::Missing)]
     pull_policy: ImagePullPolicy,
-    /// Reuse the persistent root filesystem identified by this `BoxId`.
+    /// Reuse the persistent root filesystem identified by this `BoxId` or name.
     #[arg(long = "box", conflicts_with_all = ["rootfs", "image", "workspace"])]
-    box_id: Option<BoxId>,
+    box_id: Option<String>,
     #[arg(long, default_value_t = 2)]
     cpus: u8,
     #[arg(long, default_value_t = 512)]
@@ -569,8 +569,9 @@ struct BenchmarkArgs {
     /// Image acquisition policy: cache-first, forced refresh, or cache-only.
     #[arg(long = "pull", default_value_t = ImagePullPolicy::Missing)]
     pull_policy: ImagePullPolicy,
+    /// Reuse the persistent root filesystem identified by this `BoxId` or name.
     #[arg(long = "box", conflicts_with_all = ["rootfs", "image"])]
-    box_id: Option<BoxId>,
+    box_id: Option<String>,
     #[arg(long, default_value = "8GiB", value_parser = parse_disk_size)]
     disk_size: u64,
     #[arg(long, env = "MORAE_REGISTRY_USERNAME", requires = "registry_password")]

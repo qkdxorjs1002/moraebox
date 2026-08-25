@@ -256,8 +256,8 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, CliErrorSourc
     if args.interactive && global.json {
         return Err("--interactive cannot be combined with --json".into());
     }
+    let box_selected = args.box_id.is_some();
     let mut spec = RunSpec::command(args.command);
-    spec.box_id = args.box_id;
     spec.image_pull_policy = args.pull_policy;
     spec.timeout = parse_timeout(&args.timeout)?;
     spec.output_limit = args.output_limit;
@@ -309,16 +309,14 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, CliErrorSourc
     if args.rootfs.is_some() && args.image.is_some() {
         return Err("--rootfs and --image are mutually exclusive".into());
     }
-    if spec.box_id.is_some() && !capabilities.box_persistence.is_supported() {
+    if box_selected && !capabilities.box_persistence.is_supported() {
         return Err("--box requires --backend libkrun".into());
     }
-    if spec.box_id.is_some()
-        && (args.rootfs.is_some() || args.image.is_some() || args.workspace.is_some())
-    {
+    if box_selected && (args.rootfs.is_some() || args.image.is_some() || args.workspace.is_some()) {
         return Err("--box cannot be combined with --rootfs, --image, or --workspace".into());
     }
     if args.pull_policy != ImagePullPolicy::Missing
-        && (args.backend != "libkrun" || args.rootfs.is_some() || spec.box_id.is_some())
+        && (args.backend != "libkrun" || args.rootfs.is_some() || box_selected)
     {
         return Err("--pull always|never requires an image-backed libkrun run".into());
     }
@@ -333,6 +331,16 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, CliErrorSourc
         .transpose()?;
     let state_dir = (args.backend == "libkrun")
         .then(|| resolve_state_dir(global.state_dir.as_deref()))
+        .transpose()?;
+    spec.box_id = args
+        .box_id
+        .as_deref()
+        .map(|selector| {
+            let state_dir = state_dir
+                .as_deref()
+                .ok_or("--box requires a state directory")?;
+            resolve_box_id(&BoxStore::new(state_dir), selector)
+        })
         .transpose()?;
     if let Some(source) = args.workspace.as_deref() {
         if !capabilities.workspace.is_supported() {
@@ -1249,8 +1257,13 @@ async fn run_native_benchmark(
 ) -> Result<BenchmarkReport, CliErrorSource> {
     let cache_dir = resolve_cache_dir(global.cache_dir.as_deref())?;
     let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
+    let box_id = args
+        .box_id
+        .as_deref()
+        .map(|selector| resolve_box_id(&BoxStore::new(&state_dir), selector))
+        .transpose()?;
     let platform = Platform::host_linux();
-    let prepared_image = if args.box_id.is_none() && args.rootfs.is_none() {
+    let prepared_image = if box_id.is_none() && args.rootfs.is_none() {
         Some(
             prepare_benchmark_image(
                 &cache_dir,
@@ -1286,7 +1299,7 @@ async fn run_native_benchmark(
         args.memory_mib,
     );
     let digest = prepared_digest(prepared_image.as_ref());
-    let root_source = if args.box_id.is_some() {
+    let root_source = if box_id.is_some() {
         None
     } else if let Some(prepared) = prepared_image {
         Some(native.prepared_image_source(prepared, &platform))
@@ -1316,7 +1329,7 @@ async fn run_native_benchmark(
     };
     let mut report = run_benchmark(
         &Supervisor::new(backend),
-        BenchmarkRunConfig::from_args(&args, args.box_id),
+        BenchmarkRunConfig::from_args(&args, box_id),
     )
     .await?;
     report.resolved_image_digest = digest;
@@ -1350,6 +1363,22 @@ async fn prepare_benchmark_image(
 
 fn prepared_digest(image: Option<&PreparedImage>) -> Option<String> {
     image.map(|image| image.manifest_digest.clone())
+}
+
+fn resolve_box_id(store: &BoxStore, selector: &str) -> Result<BoxId, CliErrorSource> {
+    if let Ok(box_id) = selector.parse() {
+        return Ok(box_id);
+    }
+
+    let report = store.list_with(&BoxQuery {
+        name: Some(selector.into()),
+        ..BoxQuery::default()
+    })?;
+    report
+        .boxes
+        .first()
+        .map(|metadata| metadata.box_id)
+        .ok_or_else(|| format!("box not found by id or name: {selector}").into())
 }
 
 async fn run_benchmark<B: Backend>(
@@ -2570,7 +2599,14 @@ mod tests {
         let Command::Run(run) = run.command else {
             panic!("expected run command");
         };
-        assert_eq!(run.box_id, Some(box_id));
+        assert_eq!(run.box_id, Some(box_id.to_string()));
+
+        let named =
+            Cli::try_parse_from(["morae", "run", "--box", "test", "--", "/bin/true"]).unwrap();
+        let Command::Run(named) = named.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(named.box_id.as_deref(), Some("test"));
 
         assert!(
             Cli::try_parse_from([
@@ -2588,6 +2624,33 @@ mod tests {
         assert!(Cli::try_parse_from(["morae", "box", "delete", &box_id.to_string()]).is_err());
         assert!(Cli::try_parse_from(["morae", "box", "reset", &box_id.to_string()]).is_err());
         assert!(Cli::try_parse_from(["morae", "box", "clone", &box_id.to_string()]).is_err());
+    }
+
+    #[test]
+    fn resolves_box_ids_and_names() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_disk = temporary.path().join("root.ext4");
+        fs::write(&source_disk, [0_u8; 1]).unwrap();
+        let store = BoxStore::new(temporary.path().join("state"));
+        let metadata = store
+            .create(
+                &CreateBox::new("sha256:test", "linux/arm64", 1).with_name("test"),
+                &source_disk,
+            )
+            .unwrap();
+
+        assert_eq!(
+            resolve_box_id(&store, &metadata.box_id.to_string()).unwrap(),
+            metadata.box_id
+        );
+        assert_eq!(resolve_box_id(&store, "test").unwrap(), metadata.box_id);
+        assert_eq!(resolve_box_id(&store, "TEST").unwrap(), metadata.box_id);
+        assert!(
+            resolve_box_id(&store, "missing")
+                .unwrap_err()
+                .to_string()
+                .contains("box not found by id or name: missing")
+        );
     }
 
     #[test]
