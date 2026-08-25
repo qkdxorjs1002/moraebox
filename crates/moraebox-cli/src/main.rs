@@ -47,6 +47,36 @@ use commands::{
 use errors::{CliError, CliErrorSource};
 use interactive::run_interactive;
 
+fn stderr_line_ending() -> &'static str {
+    let stderr = io::stderr();
+    let stderr_is_terminal = stderr.is_terminal();
+    #[cfg(unix)]
+    let output_processing = if stderr_is_terminal {
+        use nix::sys::termios::{OutputFlags, tcgetattr};
+
+        tcgetattr(&stderr)
+            .ok()
+            .map(|termios| termios.output_flags.contains(OutputFlags::OPOST))
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let output_processing = None;
+
+    terminal_line_ending(stderr_is_terminal, output_processing)
+}
+
+const fn terminal_line_ending(
+    stderr_is_terminal: bool,
+    output_processing: Option<bool>,
+) -> &'static str {
+    if !stderr_is_terminal || matches!(output_processing, Some(true)) {
+        "\n"
+    } else {
+        "\r\n"
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "morae",

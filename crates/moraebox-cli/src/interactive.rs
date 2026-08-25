@@ -1,7 +1,7 @@
 use super::{
     Arc, AsyncWriteExt, Backend, CliErrorSource, IsTerminal, OutputChannel, OutputReadError, Read,
     RunBudget, RunSpec, SessionError, SessionHandle, SessionManager, SessionState, SessionStatus,
-    Signal, io,
+    Signal, io, stderr_line_ending,
 };
 
 const INTERACTIVE_READ_BYTES: usize = 64 * 1024;
@@ -126,8 +126,9 @@ async fn drain_interactive_output(
         let output = match session.read_output(*cursor, INTERACTIVE_READ_BYTES).await {
             Ok(output) => output,
             Err(SessionError::Output(OutputReadError::CursorExpired { earliest, .. })) => {
-                let warning =
-                    format!("morae: interactive output before cursor {earliest} was dropped\n");
+                // A host terminal can be in raw mode while this message is
+                // emitted, so LF alone could retain the current cursor column.
+                let warning = dropped_output_warning(earliest, stderr_line_ending());
                 stderr.write_all(warning.as_bytes()).await?;
                 *cursor = earliest;
                 continue;
@@ -149,6 +150,10 @@ async fn drain_interactive_output(
         stdout.flush().await?;
         stderr.flush().await?;
     }
+}
+
+fn dropped_output_warning(earliest: u64, line_ending: &str) -> String {
+    format!("morae: interactive output before cursor {earliest} was dropped{line_ending}")
 }
 
 fn session_exit_code(status: &SessionStatus) -> i32 {
@@ -340,5 +345,18 @@ impl HostSignals {
     async fn recv(&mut self) -> io::Result<HostEvent> {
         tokio::signal::ctrl_c().await?;
         Ok(HostEvent::Signal(Signal::Interrupt))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dropped_output_warning;
+
+    #[test]
+    fn dropped_output_warning_returns_to_the_first_column() {
+        assert_eq!(
+            dropped_output_warning(42, "\r\n"),
+            "morae: interactive output before cursor 42 was dropped\r\n"
+        );
     }
 }

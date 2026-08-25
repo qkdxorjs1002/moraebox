@@ -14,7 +14,7 @@ use super::{
     RootfsMetadataIssueKind, RunArgs, RunBudget, RunSpec, RunStage, Serialize, StoragePaths,
     Supervisor, TimeoutPolicy, UpdateBox, WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode,
     WorkspaceSnapshot, WorkspaceStage, Write, command_stage, fs, io, resolve_cache_dir,
-    resolve_state_dir, run_interactive,
+    resolve_state_dir, run_interactive, stderr_line_ending,
 };
 use futures_util::{StreamExt, stream};
 use std::collections::BTreeMap;
@@ -540,27 +540,43 @@ impl CliProgress {
 
     fn image(self, stage: ImageProgressStage) {
         if self.enabled {
-            eprintln!("morae: image: {stage}");
+            write_terminal_progress("image", stage);
         }
     }
 
     fn workspace(self, stage: WorkspaceStage) {
         if self.enabled {
-            eprintln!("morae: workspace: {stage}");
+            write_terminal_progress("workspace", stage);
         }
     }
 
     fn workspace_message(self, message: &str) {
         if self.enabled {
-            eprintln!("morae: workspace: {message}");
+            write_terminal_progress("workspace", message);
         }
     }
 
     fn runtime(self, stage: RunStage) {
         if let (true, Some(message)) = (self.enabled, run_stage_progress_message(stage)) {
-            eprintln!("morae: runtime: {message}");
+            write_terminal_progress("runtime", message);
         }
     }
+}
+
+fn write_terminal_progress(scope: &str, message: impl std::fmt::Display) {
+    let line_ending = stderr_line_ending();
+    let mut stderr = io::stderr().lock();
+    write_terminal_progress_to(&mut stderr, scope, message, line_ending)
+        .expect("failed to write progress message to stderr");
+}
+
+fn write_terminal_progress_to(
+    output: &mut impl Write,
+    scope: &str,
+    message: impl std::fmt::Display,
+    line_ending: &str,
+) -> io::Result<()> {
+    write!(output, "morae: {scope}: {message}{line_ending}")
 }
 
 fn run_stage_progress_message(stage: RunStage) -> Option<&'static str> {
@@ -2439,6 +2455,23 @@ mod tests {
             CliProgress::for_output(false, false),
             CliProgress { enabled: false }
         );
+    }
+
+    #[test]
+    fn terminal_progress_returns_to_the_first_column() {
+        let mut output = Vec::new();
+
+        write_terminal_progress_to(
+            &mut output,
+            "runtime",
+            "spawning the microVM helper",
+            super::super::terminal_line_ending(true, Some(false)),
+        )
+        .unwrap();
+
+        assert_eq!(output, b"morae: runtime: spawning the microVM helper\r\n");
+        assert_eq!(super::super::terminal_line_ending(true, Some(true)), "\n");
+        assert_eq!(super::super::terminal_line_ending(false, None), "\n");
     }
 
     #[test]
