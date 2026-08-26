@@ -20,11 +20,16 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod bundle;
+mod checkpoint;
 mod disk;
 
-use disk::copy_disk;
+use disk::{copy_disk, set_read_only};
 
 pub use bundle::{BOX_BUNDLE_SCHEMA_VERSION, BoxBundleReport};
+pub use checkpoint::{
+    CheckpointId, CheckpointListReport, CheckpointMetadata, CheckpointStore, CreateCheckpoint,
+    ForkCheckpoint,
+};
 pub use disk::{
     BASE_DISK_LAYOUT_VERSION, BaseDisk, BaseDiskMetadata, BaseDiskSpec, BaseDiskStore,
     DEFAULT_BOX_DISK_SIZE_BYTES, EphemeralDisk, EphemeralDiskStore, EphemeralGcReport,
@@ -310,6 +315,46 @@ impl BoxStore {
 
     pub fn boxes_directory(&self) -> PathBuf {
         self.state_root.join(BOXES_DIRECTORY)
+    }
+
+    /// Returns the checkpoint store rooted beside this Box store.
+    pub fn checkpoint_store(&self) -> CheckpointStore {
+        CheckpointStore::new(&self.state_root)
+    }
+
+    /// Creates an immutable checkpoint of an idle, ready Box.
+    pub fn create_checkpoint(&self, box_id: BoxId) -> Result<CheckpointMetadata, BoxStoreError> {
+        self.checkpoint_store().create(box_id)
+    }
+
+    /// Lists valid checkpoints and reports invalid entries without following them.
+    pub fn list_checkpoints(&self) -> Result<CheckpointListReport, BoxStoreError> {
+        self.checkpoint_store().list()
+    }
+
+    /// Loads one checkpoint after validating its directory, metadata, and disk.
+    pub fn get_checkpoint(
+        &self,
+        checkpoint_id: CheckpointId,
+    ) -> Result<CheckpointMetadata, BoxStoreError> {
+        self.checkpoint_store().get(checkpoint_id)
+    }
+
+    /// Deletes a checkpoint once its exclusive lease is available.
+    pub fn delete_checkpoint(
+        &self,
+        checkpoint_id: CheckpointId,
+    ) -> Result<CheckpointMetadata, BoxStoreError> {
+        self.checkpoint_store().delete(checkpoint_id)
+    }
+
+    /// Forks a checkpoint into a new independent ready Box.
+    pub fn fork_checkpoint(
+        &self,
+        checkpoint_id: CheckpointId,
+        request: &ForkCheckpoint,
+    ) -> Result<BoxMetadata, BoxStoreError> {
+        self.checkpoint_store().fork(checkpoint_id, request)
     }
 
     pub fn create(
@@ -975,7 +1020,9 @@ struct CorruptBoxEntry {
 impl BoxEntryError {
     fn from_store_error(entry_name: String, box_id: Option<BoxId>, error: &BoxStoreError) -> Self {
         let code = match error {
-            BoxStoreError::Busy { .. } => BoxEntryErrorCode::Busy,
+            BoxStoreError::Busy { .. } | BoxStoreError::CheckpointBusy { .. } => {
+                BoxEntryErrorCode::Busy
+            }
             BoxStoreError::UnsupportedSchema { .. } => BoxEntryErrorCode::UnsupportedSchema,
             BoxStoreError::InvalidMetadata(_)
             | BoxStoreError::InvalidBundle(_)
@@ -983,7 +1030,9 @@ impl BoxEntryError {
             BoxStoreError::UnsafeFileType { .. } | BoxStoreError::InvalidPath(_) => {
                 BoxEntryErrorCode::UnsafeFileType
             }
-            BoxStoreError::NotFound(_) => BoxEntryErrorCode::MissingData,
+            BoxStoreError::NotFound(_) | BoxStoreError::CheckpointNotFound(_) => {
+                BoxEntryErrorCode::MissingData
+            }
             BoxStoreError::Io(source) if source.kind() == io::ErrorKind::NotFound => {
                 BoxEntryErrorCode::MissingData
             }
@@ -991,6 +1040,7 @@ impl BoxEntryError {
                 BoxEntryErrorCode::CorruptStore
             }
             BoxStoreError::NeedsRepair(_)
+            | BoxStoreError::CheckpointSourceNotReady { .. }
             | BoxStoreError::BaseDiskBusy { .. }
             | BoxStoreError::Mke2fs { .. }
             | BoxStoreError::CowCloneUnavailable { .. }
@@ -1443,6 +1493,16 @@ pub enum BoxStoreError {
     },
     #[error("box requires repair before it can run: {0}")]
     NeedsRepair(BoxId),
+    #[error("checkpoint not found: {0}")]
+    CheckpointNotFound(CheckpointId),
+    #[error("checkpoint is already in use: {checkpoint_id}")]
+    CheckpointBusy {
+        checkpoint_id: CheckpointId,
+        #[source]
+        source: io::Error,
+    },
+    #[error("Box {box_id} must be ready to create a checkpoint (found {state:?})")]
+    CheckpointSourceNotReady { box_id: BoxId, state: BoxState },
     #[error("box name is already in use: {0}")]
     NameConflict(String),
     #[error(

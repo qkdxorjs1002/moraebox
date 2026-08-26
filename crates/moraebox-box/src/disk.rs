@@ -778,13 +778,13 @@ fn finish_disk_copy(
 }
 
 #[cfg(unix)]
-fn set_read_only(path: &Path) -> std::io::Result<()> {
+pub(crate) fn set_read_only(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o400))
 }
 
 #[cfg(not(unix))]
-fn set_read_only(path: &Path) -> std::io::Result<()> {
+pub(crate) fn set_read_only(path: &Path) -> std::io::Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_readonly(true);
     fs::set_permissions(path, permissions)
