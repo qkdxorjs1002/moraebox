@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::{IpAddr, Ipv4Addr},
+    path::PathBuf,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -13,6 +18,9 @@ pub const DEFAULT_TTY_COLUMNS: u16 = 80;
 pub const DEFAULT_COPY_LIMIT: u64 = 64 * 1024 * 1024;
 pub const MAX_COPY_LIMIT: u64 = 1024 * 1024 * 1024;
 pub const WORKSPACE_DIFF_GUEST_PATH: &str = "/run/moraebox-workspace/diff.json";
+pub const MAX_NETWORK_CIDRS: usize = 128;
+pub const MAX_NETWORK_DOMAINS: usize = 128;
+pub const MAX_PUBLISH_REQUESTS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -163,6 +171,53 @@ pub struct CopyOutSpec {
     pub destination: PathBuf,
 }
 
+/// The egress behavior requested for a run.
+///
+/// `RunSpec::network_policy == None` is intentionally distinct from `Disabled`: absence keeps the
+/// legacy `RunSpec::network` boolean authoritative for serialized and programmatic callers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    #[default]
+    Disabled,
+    Unrestricted,
+    Allowlist,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkPolicy {
+    #[serde(default)]
+    pub mode: NetworkMode,
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
+    #[serde(default)]
+    pub allow_domains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishProtocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+/// An explicit host-to-guest port forwarding request.
+///
+/// Preview listeners are deliberately limited to host loopback. A zero host port requests an
+/// ephemeral loopback port selected during network setup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishRequest {
+    #[serde(default)]
+    pub protocol: PublishProtocol,
+    #[serde(default = "default_publish_address")]
+    pub host_address: IpAddr,
+    pub host_port: u16,
+    pub guest_port: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSpec {
     pub session_id: SessionId,
@@ -174,6 +229,10 @@ pub struct RunSpec {
     pub inherit_env: bool,
     #[serde(default)]
     pub network: bool,
+    #[serde(default)]
+    pub network_policy: Option<NetworkPolicy>,
+    #[serde(default)]
+    pub publish: Vec<PublishRequest>,
     #[serde(default)]
     pub image_pull_policy: ImagePullPolicy,
     pub stdin: Vec<u8>,
@@ -204,6 +263,8 @@ impl RunSpec {
             env: BTreeMap::new(),
             inherit_env: false,
             network: false,
+            network_policy: None,
+            publish: Vec::new(),
             image_pull_policy: ImagePullPolicy::default(),
             stdin: Vec::new(),
             timeout: TimeoutPolicy::default(),
@@ -241,6 +302,7 @@ impl RunSpec {
         if self.copy_limit_bytes == 0 || self.copy_limit_bytes > MAX_COPY_LIMIT {
             return Err("copy_limit_bytes must be between 1 byte and 1 GiB");
         }
+        self.validate_network()?;
         if self.copy_in.iter().any(|copy| {
             copy.source.as_os_str().is_empty() || !valid_guest_transfer_path(&copy.destination)
         }) {
@@ -273,6 +335,140 @@ impl RunSpec {
         }
         Ok(())
     }
+
+    /// Resolves the additive typed policy while preserving the original boolean contract.
+    pub fn effective_network_mode(&self) -> NetworkMode {
+        self.network_policy.as_ref().map_or_else(
+            || {
+                if self.network {
+                    NetworkMode::Unrestricted
+                } else {
+                    NetworkMode::Disabled
+                }
+            },
+            |policy| policy.mode,
+        )
+    }
+
+    pub fn network_enabled(&self) -> bool {
+        self.effective_network_mode() != NetworkMode::Disabled
+    }
+
+    fn validate_network(&self) -> Result<(), &'static str> {
+        let Some(policy) = &self.network_policy else {
+            if !self.publish.is_empty() && !self.network {
+                return Err("publish requests require networking to be enabled");
+            }
+            return validate_publish_requests(&self.publish);
+        };
+        if policy.allow_cidrs.len() > MAX_NETWORK_CIDRS {
+            return Err("network policy must not contain more than 128 CIDRs");
+        }
+        if policy.allow_domains.len() > MAX_NETWORK_DOMAINS {
+            return Err("network policy must not contain more than 128 domain patterns");
+        }
+        if policy.allow_cidrs.iter().any(|cidr| !valid_cidr(cidr)) {
+            return Err("network policy contains an invalid CIDR");
+        }
+        if policy
+            .allow_domains
+            .iter()
+            .any(|domain| !valid_domain_pattern(domain))
+        {
+            return Err("network policy contains an invalid domain pattern");
+        }
+        match policy.mode {
+            NetworkMode::Disabled | NetworkMode::Unrestricted
+                if !policy.allow_cidrs.is_empty() || !policy.allow_domains.is_empty() =>
+            {
+                return Err("CIDR and domain rules require allowlist network mode");
+            }
+            NetworkMode::Allowlist
+                if policy.allow_cidrs.is_empty()
+                    && policy.allow_domains.is_empty()
+                    && self.publish.is_empty() =>
+            {
+                return Err("allowlist network mode requires a rule or published preview port");
+            }
+            _ => {}
+        }
+        if !self.publish.is_empty() && policy.mode == NetworkMode::Disabled {
+            return Err("publish requests require networking to be enabled");
+        }
+        validate_publish_requests(&self.publish)
+    }
+}
+
+const fn default_publish_address() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::LOCALHOST)
+}
+
+fn validate_publish_requests(requests: &[PublishRequest]) -> Result<(), &'static str> {
+    if requests.len() > MAX_PUBLISH_REQUESTS {
+        return Err("a run must not contain more than 32 publish requests");
+    }
+    if requests.iter().any(|request| request.guest_port == 0) {
+        return Err("published guest ports must be non-zero");
+    }
+    if requests
+        .iter()
+        .any(|request| request.protocol != PublishProtocol::Tcp)
+    {
+        return Err("preview port publishing supports TCP only");
+    }
+    if requests
+        .iter()
+        .any(|request| !request.host_address.is_loopback())
+    {
+        return Err("preview port publishing supports loopback listeners only");
+    }
+    let mut listeners = BTreeSet::new();
+    if requests
+        .iter()
+        .filter(|request| request.host_port != 0)
+        .any(|request| {
+            !listeners.insert((request.protocol, request.host_address, request.host_port))
+        })
+    {
+        return Err("published host listeners must be unique");
+    }
+    Ok(())
+}
+
+fn valid_cidr(cidr: &str) -> bool {
+    let Some((address, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    if address.is_empty() || prefix.is_empty() || prefix.contains('/') {
+        return false;
+    }
+    let Ok(address) = address.parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    prefix <= if address.is_ipv4() { 32 } else { 128 }
+}
+
+fn valid_domain_pattern(pattern: &str) -> bool {
+    let domain = pattern.strip_prefix("*.").unwrap_or(pattern);
+    if domain.is_empty()
+        || domain.len() > 253
+        || domain.ends_with('.')
+        || pattern.starts_with('*') && !pattern.starts_with("*.")
+    {
+        return false;
+    }
+    domain.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
 }
 
 const fn default_copy_limit() -> u64 {
@@ -376,10 +572,136 @@ mod tests {
     fn older_serialized_specs_default_to_no_network() {
         let mut value = serde_json::to_value(RunSpec::command(["true"])).unwrap();
         value.as_object_mut().unwrap().remove("network");
+        value.as_object_mut().unwrap().remove("network_policy");
+        value.as_object_mut().unwrap().remove("publish");
 
         let spec: RunSpec = serde_json::from_value(value).unwrap();
 
         assert!(!spec.network);
+        assert_eq!(spec.network_policy, None);
+        assert!(spec.publish.is_empty());
+        assert_eq!(spec.effective_network_mode(), NetworkMode::Disabled);
+    }
+
+    #[test]
+    fn legacy_network_true_remains_unrestricted() {
+        let mut spec = RunSpec::command(["true"]);
+        spec.network = true;
+
+        let round_trip: RunSpec =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+
+        assert_eq!(
+            round_trip.effective_network_mode(),
+            NetworkMode::Unrestricted
+        );
+        assert!(round_trip.network_enabled());
+    }
+
+    #[test]
+    fn explicit_policy_is_authoritative_over_legacy_boolean() {
+        let mut spec = RunSpec::command(["true"]);
+        spec.network = true;
+        spec.network_policy = Some(NetworkPolicy::default());
+
+        assert_eq!(spec.effective_network_mode(), NetworkMode::Disabled);
+        assert!(!spec.network_enabled());
+
+        spec.network = false;
+        spec.network_policy = Some(NetworkPolicy {
+            mode: NetworkMode::Allowlist,
+            allow_cidrs: vec!["192.0.2.0/24".into(), "2001:db8::/32".into()],
+            allow_domains: vec!["*.example.com".into()],
+        });
+        assert!(spec.validate().is_ok());
+        assert!(spec.network_enabled());
+    }
+
+    #[test]
+    fn network_rules_are_strict_and_bounded() {
+        let mut spec = RunSpec::command(["true"]);
+        spec.network_policy = Some(NetworkPolicy {
+            mode: NetworkMode::Allowlist,
+            allow_cidrs: vec!["192.0.2.1/33".into()],
+            allow_domains: Vec::new(),
+        });
+        assert_eq!(
+            spec.validate(),
+            Err("network policy contains an invalid CIDR")
+        );
+
+        spec.network_policy.as_mut().unwrap().allow_cidrs.clear();
+        spec.network_policy.as_mut().unwrap().allow_domains = vec!["*example.com".into()];
+        assert_eq!(
+            spec.validate(),
+            Err("network policy contains an invalid domain pattern")
+        );
+
+        spec.network_policy.as_mut().unwrap().allow_domains =
+            vec!["example.com".into(); MAX_NETWORK_DOMAINS + 1];
+        assert_eq!(
+            spec.validate(),
+            Err("network policy must not contain more than 128 domain patterns")
+        );
+
+        spec.network_policy.as_mut().unwrap().allow_domains.clear();
+        assert_eq!(
+            spec.validate(),
+            Err("allowlist network mode requires a rule or published preview port")
+        );
+        spec.publish.push(PublishRequest {
+            protocol: PublishProtocol::Tcp,
+            host_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host_port: 0,
+            guest_port: 3000,
+        });
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn publish_requests_default_to_loopback_and_validate_ports() {
+        let request: PublishRequest = serde_json::from_value(serde_json::json!({
+            "host_port": 8080,
+            "guest_port": 80
+        }))
+        .unwrap();
+        assert_eq!(request.protocol, PublishProtocol::Tcp);
+        assert_eq!(request.host_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        let mut spec = RunSpec::command(["true"]);
+        spec.network_policy = Some(NetworkPolicy {
+            mode: NetworkMode::Unrestricted,
+            ..NetworkPolicy::default()
+        });
+        spec.publish.push(request.clone());
+        assert!(spec.validate().is_ok());
+
+        spec.publish.push(request);
+        assert_eq!(
+            spec.validate(),
+            Err("published host listeners must be unique")
+        );
+        spec.publish[1].host_port = 0;
+        assert!(spec.validate().is_ok());
+        spec.publish[1].guest_port = 0;
+        assert_eq!(
+            spec.validate(),
+            Err("published guest ports must be non-zero")
+        );
+
+        spec.publish[1].guest_port = 81;
+        spec.publish[1].protocol = PublishProtocol::Udp;
+        assert_eq!(
+            spec.validate(),
+            Err("preview port publishing supports TCP only")
+        );
+
+        spec.publish[1].protocol = PublishProtocol::Tcp;
+        spec.publish[1].host_address = "192.0.2.10".parse().unwrap();
+        assert_eq!(
+            spec.validate(),
+            Err("preview port publishing supports loopback listeners only")
+        );
     }
 
     #[test]

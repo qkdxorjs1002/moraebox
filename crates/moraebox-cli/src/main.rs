@@ -14,12 +14,14 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use moraebox_box::{
     BaseDiskSpec, BaseDiskStore, BoxMetadata, BoxQuery, BoxRepairReport, BoxSortBy, BoxState,
-    BoxStore, CreateBox, UpdateBox,
+    BoxStore, CheckpointId, CheckpointMetadata, CreateBox, CreateCheckpoint, ForkCheckpoint,
+    UpdateBox,
 };
 use moraebox_core::{
-    BoxId, CopyInSpec, CopyOutSpec, ImagePullPolicy, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT,
-    OutputChannel, OutputReadError, RunSpec, SessionState, Signal, StoragePaths, TimeoutPolicy,
-    WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode, resolve_cache_dir, resolve_state_dir,
+    BoxId, CopyInSpec, CopyOutSpec, ImagePullPolicy, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, NetworkMode,
+    NetworkPolicy, OutputChannel, OutputReadError, PublishProtocol, PublishRequest, RunSpec,
+    SessionState, Signal, StoragePaths, TimeoutPolicy, WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode,
+    resolve_cache_dir, resolve_state_dir,
 };
 use moraebox_image::{
     CacheReconcileReport, CacheUsage, CachedImage, CleanReport, Credentials, ImageCache,
@@ -42,7 +44,7 @@ mod interactive;
 use commands::{
     execute, exit_code, parse_box_label, parse_box_label_filter, parse_box_label_key,
     parse_box_name, parse_box_tag, parse_copy_in, parse_copy_out, parse_disk_size, parse_env,
-    parse_kill_grace, parse_output_limit,
+    parse_kill_grace, parse_output_limit, parse_publish,
 };
 use errors::{CliError, CliErrorSource};
 use interactive::run_interactive;
@@ -206,6 +208,27 @@ enum BoxCommand {
     /// Preview or quarantine corrupt Box entries without deleting their data.
     #[command(visible_alias = "quarantine")]
     Repair(BoxRepairArgs),
+    /// Create, inspect, delete, or fork immutable Box disk checkpoints.
+    Checkpoint {
+        #[command(subcommand)]
+        command: CheckpointCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CheckpointCommand {
+    /// Capture one idle Ready Box disk as an immutable checkpoint.
+    Create(CheckpointCreateArgs),
+    /// List immutable checkpoints.
+    #[command(visible_alias = "ls")]
+    List,
+    /// Show one checkpoint.
+    Show(CheckpointShowArgs),
+    /// Permanently delete one idle checkpoint.
+    #[command(visible_alias = "rm")]
+    Delete(CheckpointDeleteArgs),
+    /// Create an independent writable Box from one checkpoint.
+    Fork(CheckpointForkArgs),
 }
 
 #[derive(Debug, Args)]
@@ -289,8 +312,17 @@ struct RunArgs {
     #[arg(long)]
     inherit_env: bool,
     /// Allow outbound network access from the native VM.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["allow_cidrs", "allow_domains"])]
     network: bool,
+    /// Allow outbound traffic to a CIDR (repeatable, native VM only).
+    #[arg(long = "allow-cidr")]
+    allow_cidrs: Vec<String>,
+    /// Allow HTTPS and DNS traffic for a domain pattern such as example.com or *.example.com.
+    #[arg(long = "allow-domain")]
+    allow_domains: Vec<String>,
+    /// Publish loopback TCP `HOST_PORT:GUEST_PORT` for a local preview.
+    #[arg(long, value_parser = parse_publish)]
+    publish: Vec<PublishRequest>,
     #[arg(long)]
     cwd: Option<PathBuf>,
     /// Add one guest environment value as KEY=VALUE.
@@ -379,6 +411,50 @@ struct BoxCloneArgs {
     /// Confirm creation of a new durable Box disk.
     #[arg(long, required = true)]
     yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct CheckpointCreateArgs {
+    box_id: BoxId,
+    /// Optional checkpoint display name.
+    #[arg(long, value_parser = parse_box_name)]
+    name: Option<String>,
+    /// Add a key/value label as KEY=VALUE.
+    #[arg(long = "label", value_parser = parse_box_label)]
+    labels: Vec<(String, String)>,
+    /// Add a tag.
+    #[arg(long = "tag", value_parser = parse_box_tag)]
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct CheckpointShowArgs {
+    checkpoint_id: CheckpointId,
+}
+
+#[derive(Debug, Args)]
+struct CheckpointDeleteArgs {
+    checkpoint_id: CheckpointId,
+    /// Confirm permanent deletion of the checkpoint disk.
+    #[arg(long, required = true)]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct CheckpointForkArgs {
+    checkpoint_id: CheckpointId,
+    /// Confirm creation of a new durable Box disk.
+    #[arg(long, required = true)]
+    yes: bool,
+    /// Optional unique name for the new Box.
+    #[arg(long, value_parser = parse_box_name)]
+    name: Option<String>,
+    /// Replace inherited checkpoint labels with KEY=VALUE values.
+    #[arg(long = "label", value_parser = parse_box_label)]
+    labels: Vec<(String, String)>,
+    /// Replace inherited checkpoint tags.
+    #[arg(long = "tag", value_parser = parse_box_tag)]
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -723,6 +799,15 @@ fn command_stage(command: &Command) -> &'static str {
         Command::Box {
             command: BoxCommand::Repair(_),
         } => "box_repair",
+        Command::Box {
+            command: BoxCommand::Checkpoint { command },
+        } => match command {
+            CheckpointCommand::Create(_) => "checkpoint_create",
+            CheckpointCommand::List => "checkpoint_list",
+            CheckpointCommand::Show(_) => "checkpoint_show",
+            CheckpointCommand::Delete(_) => "checkpoint_delete",
+            CheckpointCommand::Fork(_) => "checkpoint_fork",
+        },
         Command::Benchmark(_) => "benchmark",
         Command::Completion(_) => "completion",
     }

@@ -61,6 +61,40 @@ fn stdio_has_one_json_response_per_request() {
     assert!(trailing.is_empty(), "unexpected stdout: {trailing}");
 }
 
+#[cfg(unix)]
+#[test]
+fn stdio_exec_applies_cwd_and_explicit_environment() {
+    let (mut child, mut stdin, responses, reader) = spawn_server();
+    initialize(&mut stdin, &responses);
+    write_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"sandbox_exec","arguments":{
+                "argv":["/bin/sh","-c","printf '%s:' \"$MORAEBOX_STDIO_TEST\"; /bin/pwd"],
+                "cwd":"/",
+                "env":{"MORAEBOX_STDIO_TEST":"explicit"}
+            }}
+        }),
+    );
+    let response = read_response(&responses);
+    assert_eq!(response.get("id"), Some(&json!(2)));
+    assert_eq!(response.pointer("/result/isError"), Some(&json!(false)));
+    let output = response
+        .pointer("/result/structuredContent/output")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(|chunk| chunk.get("text").and_then(Value::as_str))
+        .collect::<String>();
+    assert_eq!(output, "explicit:/\n");
+
+    drop(stdin);
+    assert!(wait_for_child(&mut child).success());
+    reader.join().unwrap();
+    assert!(responses.try_iter().next().is_none());
+}
+
 #[test]
 fn stateless_direct_tools_reject_a_late_initialize() {
     let (mut child, mut stdin, responses, reader) = spawn_server();

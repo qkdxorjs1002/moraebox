@@ -2,7 +2,8 @@
 
 use std::{
     env, fs,
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
+    net::{Shutdown, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     thread,
@@ -88,6 +89,45 @@ if response[:2] != b"\x12\x34":
     raise RuntimeError("UDP DNS response ID mismatch")
 print("network-on-allowed")
 time.sleep(1)
+"#;
+
+const DOMAIN_ALLOWLIST_PROBE: &str = r#"
+import os, socket, ssl, time
+host = os.environ["MORAE_EGRESS_HOST"]
+socket.setdefaulttimeout(5)
+
+addresses = socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)
+if not addresses:
+    raise RuntimeError("allowlisted DNS returned no IPv4 address")
+plain = socket.create_connection((host, 443), 5)
+tls = ssl._create_unverified_context().wrap_socket(plain, server_hostname=host)
+tls.close()
+
+try:
+    socket.create_connection(("1.1.1.1", 80), 3)
+except OSError:
+    pass
+else:
+    raise RuntimeError("unlisted direct IP unexpectedly connected")
+
+print("domain-allowlist-enforced")
+time.sleep(1)
+"#;
+
+const PREVIEW_PROBE: &str = r#"
+import socket
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("0.0.0.0", 3000))
+server.listen(1)
+print("preview-listening", flush=True)
+connection, _ = server.accept()
+connection.recv(4096)
+connection.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 16\r\n\r\nmoraebox-preview")
+connection.close()
+server.close()
+print("preview-served")
 "#;
 
 const SLEEP_PROBE: &str = "import time; time.sleep(60)";
@@ -251,6 +291,30 @@ impl NativeHarness {
             .arg(python_bootstrap(script))
             .stdin(Stdio::piped());
         command.spawn().expect("spawn interactive morae native run")
+    }
+
+    fn spawn_domain_allowlist(&self) -> Child {
+        let mut command = self.command();
+        command
+            .args(["--timeout", "20s", "--json", "--allow-domain"])
+            .arg(&self.egress_host)
+            .arg("--")
+            .arg("python3")
+            .arg("-c")
+            .arg(python_bootstrap(DOMAIN_ALLOWLIST_PROBE));
+        command.spawn().expect("spawn domain allowlist probe")
+    }
+
+    fn spawn_preview(&self, host_port: u16) -> Child {
+        let mut command = self.command();
+        command
+            .args(["--timeout", "20s", "--interactive", "--publish"])
+            .arg(format!("{host_port}:3000"))
+            .arg("--")
+            .arg("python3")
+            .arg("-c")
+            .arg(python_bootstrap(PREVIEW_PROBE));
+        command.spawn().expect("spawn preview probe")
     }
 }
 
@@ -690,6 +754,107 @@ fn assert_successful_probe(harness: &NativeHarness, network: bool, marker: &str,
     harness.assert_network_state_empty();
 }
 
+fn assert_domain_allowlist(harness: &NativeHarness) {
+    let mut child = harness.spawn_domain_allowlist();
+    let children = wait_for_native_children(&mut child, true);
+    let output = wait_for_output(child);
+    assert!(
+        output.status.success(),
+        "domain allowlist probe failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = parse_report(&output);
+    assert_dead_report(&report);
+    assert!(report_output_text(&report).contains("domain-allowlist-enforced"));
+    assert_children_gone(&children);
+    harness.assert_network_state_empty();
+}
+
+fn assert_loopback_preview(harness: &NativeHarness) {
+    let reservation = TcpListener::bind(("127.0.0.1", 0)).expect("reserve preview port");
+    let host_port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+
+    let mut child = harness.spawn_preview(host_port);
+    let children = wait_for_native_children(&mut child, true);
+    let mut guest_stdout = BufReader::new(child.stdout.take().expect("preview stdout pipe"));
+    let mut guest_output = String::new();
+    guest_stdout
+        .read_line(&mut guest_output)
+        .expect("read preview readiness marker");
+    assert!(
+        guest_output.contains("preview-listening"),
+        "preview command did not become ready: {guest_output:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let response = loop {
+        let attempt = (|| -> std::io::Result<Vec<u8>> {
+            let mut stream = TcpStream::connect(("127.0.0.1", host_port))?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")?;
+            stream.shutdown(Shutdown::Write)?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            Ok(response)
+        })();
+        match attempt {
+            Ok(response)
+                if response
+                    .windows(b"moraebox-preview".len())
+                    .any(|window| window == b"moraebox-preview") =>
+            {
+                break response;
+            }
+            Ok(_) | Err(_) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Ok(response) => {
+                drop(guest_stdout);
+                let _ = child.kill();
+                let output = wait_for_output(child);
+                panic!(
+                    "preview returned an unexpected response: {}; child stdout={} stderr={}",
+                    String::from_utf8_lossy(&response),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(error) => {
+                drop(guest_stdout);
+                let _ = child.kill();
+                let output = wait_for_output(child);
+                panic!(
+                    "preview listener did not become ready: {error}; child stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    };
+    assert!(
+        response
+            .windows(b"moraebox-preview".len())
+            .any(|window| window == b"moraebox-preview"),
+        "unexpected preview response: {}",
+        String::from_utf8_lossy(&response)
+    );
+
+    guest_stdout
+        .read_to_string(&mut guest_output)
+        .expect("read remaining preview output");
+    let output = wait_for_output(child);
+    assert!(
+        output.status.success(),
+        "preview run failed: guest stdout={} stderr={}",
+        guest_output,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(guest_output.contains("preview-served"));
+    assert_children_gone(&children);
+    harness.assert_network_state_empty();
+}
+
 fn assert_timeout_cleanup(harness: &NativeHarness) {
     let mut child = harness.spawn_json(true, "1s", SLEEP_PROBE);
     let children = wait_for_native_children(&mut child, true);
@@ -798,6 +963,8 @@ fn signed_native_egress_gate() {
     assert_tty_resize(&harness);
     assert_successful_probe(&harness, false, "network-off-blocked", NETWORK_OFF_PROBE);
     assert_successful_probe(&harness, true, "network-on-allowed", NETWORK_ON_PROBE);
+    assert_domain_allowlist(&harness);
+    assert_loopback_preview(&harness);
     assert_timeout_cleanup(&harness);
     assert_cancellation_cleanup(&harness);
     assert_helper_crash_cleanup(&harness);

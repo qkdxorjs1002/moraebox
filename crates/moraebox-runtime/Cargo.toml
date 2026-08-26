@@ -12,13 +12,14 @@ fs2.workspace = true
 moraebox-box = { path = "../moraebox-box", version = "0.1.0" }
 moraebox-core = { path = "../moraebox-core", version = "0.1.0" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 rustix = { workspace = true, features = ["termios"] }
 
 [target.'cfg(unix)'.dependencies]
-nix.workspace = true
+nix = { workspace = true, features = ["socket"] }
 
 [dev-dependencies]
 loom.workspace = true

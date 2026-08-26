@@ -29,6 +29,11 @@ use crate::{
 };
 
 mod network;
+#[allow(
+    dead_code,
+    reason = "the audited policy API is staged for the follow-up Ethernet relay integration"
+)]
+pub(crate) mod policy;
 mod root;
 
 use network::NetworkProxy;
@@ -274,7 +279,7 @@ impl Backend for LibkrunBackend {
     ) -> Result<SpawnedSandbox, BackendError> {
         spec.validate().map_err(BackendError::InvalidSpec)?;
         self.config
-            .validate(self.box_runtime.is_some(), spec.network)?;
+            .validate(self.box_runtime.is_some(), spec.network_enabled())?;
         if spec.box_id.is_some() && self.box_runtime.is_none() {
             return Err(BackendError::Control(
                 "run requested a BoxId but no Box store is configured".into(),
@@ -328,13 +333,17 @@ impl Backend for LibkrunBackend {
         startup.disk_clone_micros = root_startup.disk_clone_micros;
         startup.repair_micros = root_startup.repair_micros;
 
-        let network_proxy = if spec.network {
+        let network_proxy = if spec.network_enabled() {
             let started = Instant::now();
             let proxy = budget
-                .run(RunStage::NetworkSetup, NetworkProxy::start(&self.config))
+                .run(
+                    RunStage::NetworkSetup,
+                    NetworkProxy::start_for_spec(&self.config, spec),
+                )
                 .await
                 .map_err(BackendError::from)?;
             startup.network_setup_micros = Some(elapsed_micros(started));
+            startup.published_ports = proxy.published_ports().to_vec();
             Some(proxy)
         } else {
             None
@@ -378,7 +387,7 @@ impl Backend for LibkrunBackend {
             }
         }
         if let Some(proxy) = &network_proxy {
-            command.arg("--network-socket").arg(&proxy.socket_path);
+            proxy.append_helper_network_argument(&mut command);
         }
         for copy in &spec.copy_in {
             command
@@ -826,6 +835,9 @@ fn spawn_piped(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     let mut child = command.spawn()?;
+    if let Some(proxy) = network_proxy.as_mut() {
+        proxy.helper_spawned();
+    }
     let pid = child.id().ok_or(BackendError::MissingProcessId)?;
     let stdin = child.stdin.take().map(|writer| Box::pin(writer) as _);
     let stdout = child
@@ -946,6 +958,9 @@ fn spawn_pty(
     command.stderr(Stdio::from(slave));
 
     let child = command.spawn()?;
+    if let Some(proxy) = network_proxy.as_mut() {
+        proxy.helper_spawned();
+    }
     let pid = child.id().ok_or(BackendError::MissingProcessId)?;
     let exit = managed_exit(child, network_proxy.take(), root_lease);
     Ok(SpawnedSandbox {

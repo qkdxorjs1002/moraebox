@@ -4,22 +4,29 @@ use super::{
     BoxImportArgs, BoxListArgs, BoxMetadata, BoxQuery, BoxRenameArgs, BoxRepairArgs,
     BoxRepairReport, BoxResetArgs, BoxShowArgs, BoxStore, BoxUpdateArgs, CacheCleanArgs,
     CacheCommand, CacheInfoArgs, CachePruneArgs, CacheReconcileArgs, CacheReconcileReport,
-    CacheUsage, CachedImage, CleanReport, Cli, CliError, CliErrorSource, Command, CommandFactory,
-    CompletionArgs, CopyInSpec, CopyOutSpec, CreateBox, Credentials, DiskToolPaths, DoctorArgs,
-    DoctorReport, Duration, ExitCode, GlobalOptions, ImageCache, ImageCommand, ImageDefaultArgs,
-    ImageListArgs, ImageProgressStage, ImagePullArgs, ImagePullPolicy, ImageRemoveArgs, IsTerminal,
+    CacheUsage, CachedImage, CheckpointCommand, CheckpointCreateArgs, CheckpointDeleteArgs,
+    CheckpointForkArgs, CheckpointMetadata, CheckpointShowArgs, CleanReport, Cli, CliError,
+    CliErrorSource, Command, CommandFactory, CompletionArgs, CopyInSpec, CopyOutSpec, CreateBox,
+    CreateCheckpoint, Credentials, DiskToolPaths, DoctorArgs, DoctorReport, Duration, ExitCode,
+    ForkCheckpoint, GlobalOptions, ImageCache, ImageCommand, ImageDefaultArgs, ImageListArgs,
+    ImageProgressStage, ImagePullArgs, ImagePullPolicy, ImageRemoveArgs, IsTerminal,
     IsolationLevel, LibkrunBackend, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, ManagedStorage,
-    NativeRuntimeOverrides, NativeRuntimePaths, NativeSandboxConfig, OutputChannel, Path, Platform,
-    PoolConfig, PreparedImage, PreparedRootPool, ProcessBackend, PruneReport, Read, RemoveReport,
-    RootfsMetadataIssueKind, RunArgs, RunBudget, RunSpec, RunStage, Serialize, StoragePaths,
-    Supervisor, TimeoutPolicy, UpdateBox, WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode,
-    WorkspaceSnapshot, WorkspaceStage, Write, command_stage, fs, io, resolve_cache_dir,
-    resolve_state_dir, run_interactive, stderr_line_ending,
+    NativeRuntimeOverrides, NativeRuntimePaths, NativeSandboxConfig, NetworkMode, NetworkPolicy,
+    OutputChannel, Path, Platform, PoolConfig, PreparedImage, PreparedRootPool, ProcessBackend,
+    PruneReport, PublishProtocol, PublishRequest, Read, RemoveReport, RootfsMetadataIssueKind,
+    RunArgs, RunBudget, RunSpec, RunStage, Serialize, StoragePaths, Supervisor, TimeoutPolicy,
+    UpdateBox, WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode, WorkspaceSnapshot, WorkspaceStage, Write,
+    command_stage, fs, io, resolve_cache_dir, resolve_state_dir, run_interactive,
+    stderr_line_ending,
 };
 use futures_util::{StreamExt, stream};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "top-level dispatch keeps every CLI command mapped to one typed handler"
+)]
 pub(super) async fn execute(cli: Cli) -> Result<i32, CliError> {
     let Cli { global, command } = cli;
     let stage = command_stage(&command);
@@ -84,6 +91,36 @@ pub(super) async fn execute(cli: Cli) -> Result<i32, CliError> {
         Command::Box {
             command: BoxCommand::Repair(args),
         } => box_repair(&args, &global),
+        Command::Box {
+            command:
+                BoxCommand::Checkpoint {
+                    command: CheckpointCommand::Create(args),
+                },
+        } => checkpoint_create(&args, &global),
+        Command::Box {
+            command:
+                BoxCommand::Checkpoint {
+                    command: CheckpointCommand::List,
+                },
+        } => checkpoint_list(&global),
+        Command::Box {
+            command:
+                BoxCommand::Checkpoint {
+                    command: CheckpointCommand::Show(args),
+                },
+        } => checkpoint_show(&args, &global),
+        Command::Box {
+            command:
+                BoxCommand::Checkpoint {
+                    command: CheckpointCommand::Delete(args),
+                },
+        } => checkpoint_delete(&args, &global),
+        Command::Box {
+            command:
+                BoxCommand::Checkpoint {
+                    command: CheckpointCommand::Fork(args),
+                },
+        } => checkpoint_fork(&args, &global),
         Command::Benchmark(args) => benchmark(*args, &global).await,
         Command::Completion(args) => {
             completion(&args);
@@ -265,6 +302,17 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, CliErrorSourc
     spec.tty = args.tty;
     spec.inherit_env = args.inherit_env;
     spec.network = args.network;
+    spec.publish = args.publish;
+    if !args.allow_cidrs.is_empty()
+        || !args.allow_domains.is_empty()
+        || (!spec.publish.is_empty() && !spec.network)
+    {
+        spec.network_policy = Some(NetworkPolicy {
+            mode: NetworkMode::Allowlist,
+            allow_cidrs: args.allow_cidrs,
+            allow_domains: args.allow_domains,
+        });
+    }
     spec.cwd = args.cwd;
     spec.env = args.env.into_iter().collect::<BTreeMap<_, _>>();
     spec.workspace_mode = if args.workspace_writable {
@@ -320,7 +368,7 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, CliErrorSourc
     {
         return Err("--pull always|never requires an image-backed libkrun run".into());
     }
-    validate_network_option(capabilities, spec.network)?;
+    validate_network_option(capabilities, spec.network_enabled())?;
     validate_tty_option(capabilities, spec.tty)?;
     let progress = CliProgress::new(global.json);
     let budget = RunBudget::new(spec.timeout).with_progress(move |stage| {
@@ -342,6 +390,7 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, CliErrorSourc
             resolve_box_id(&BoxStore::new(state_dir), selector)
         })
         .transpose()?;
+    spec.validate()?;
     if let Some(source) = args.workspace.as_deref() {
         if !capabilities.workspace.is_supported() {
             return Err("--workspace requires --backend libkrun".into());
@@ -510,6 +559,16 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, CliErrorSourc
     } else {
         let mut stdout = io::stdout().lock();
         let mut stderr = io::stderr().lock();
+        for published in &report.startup.published_ports {
+            write!(
+                stderr,
+                "morae: preview: tcp://{}:{} -> guest:{}{}",
+                published.host_address,
+                published.host_port,
+                published.guest_port,
+                stderr_line_ending()
+            )?;
+        }
         for chunk in &report.output {
             match chunk.channel {
                 OutputChannel::Stdout | OutputChannel::Tty => stdout.write_all(&chunk.data)?,
@@ -789,6 +848,113 @@ fn box_clone(args: &BoxCloneArgs, global: &GlobalOptions) -> Result<i32, CliErro
     let metadata = BoxStore::new(state_dir).clone_box(args.box_id)?;
     print_box_result(&metadata, global.json)?;
     Ok(0)
+}
+
+fn checkpoint_create(
+    args: &CheckpointCreateArgs,
+    global: &GlobalOptions,
+) -> Result<i32, CliErrorSource> {
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
+    let request = CreateCheckpoint {
+        name: args.name.clone(),
+        labels: args.labels.iter().cloned().collect(),
+        tags: args.tags.iter().cloned().collect(),
+    };
+    let metadata = BoxStore::new(state_dir).create_checkpoint_with(args.box_id, &request)?;
+    print_checkpoint_result(&metadata, global.json)?;
+    Ok(0)
+}
+
+fn checkpoint_list(global: &GlobalOptions) -> Result<i32, CliErrorSource> {
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
+    let report = BoxStore::new(state_dir).list_checkpoints()?;
+    if global.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("CHECKPOINT ID\tSOURCE BOX\tNAME\tVIRTUAL\tPHYSICAL\tCREATED");
+        for metadata in report.checkpoints {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                metadata.checkpoint_id,
+                metadata.source_box_id,
+                metadata.name.as_deref().unwrap_or("-"),
+                format_bytes(metadata.virtual_size_bytes),
+                format_bytes(metadata.physical_size_bytes),
+                metadata.created_at_unix_ms,
+            );
+        }
+        for error in report.errors {
+            eprintln!(
+                "warning: checkpoint entry {}: {}",
+                error.entry_name, error.message
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn checkpoint_show(
+    args: &CheckpointShowArgs,
+    global: &GlobalOptions,
+) -> Result<i32, CliErrorSource> {
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
+    let metadata = BoxStore::new(state_dir).get_checkpoint(args.checkpoint_id)?;
+    print_checkpoint_result(&metadata, global.json)?;
+    Ok(0)
+}
+
+fn checkpoint_delete(
+    args: &CheckpointDeleteArgs,
+    global: &GlobalOptions,
+) -> Result<i32, CliErrorSource> {
+    debug_assert!(args.yes, "clap requires --yes");
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
+    let metadata = BoxStore::new(state_dir).delete_checkpoint(args.checkpoint_id)?;
+    if global.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "deleted": metadata.checkpoint_id
+            }))?
+        );
+    } else {
+        println!("deleted checkpoint {}", metadata.checkpoint_id);
+    }
+    Ok(0)
+}
+
+fn checkpoint_fork(
+    args: &CheckpointForkArgs,
+    global: &GlobalOptions,
+) -> Result<i32, CliErrorSource> {
+    debug_assert!(args.yes, "clap requires --yes");
+    let state_dir = resolve_state_dir(global.state_dir.as_deref())?;
+    let request = ForkCheckpoint {
+        name: args.name.clone(),
+        labels: (!args.labels.is_empty()).then(|| args.labels.iter().cloned().collect()),
+        tags: (!args.tags.is_empty()).then(|| args.tags.iter().cloned().collect::<BTreeSet<_>>()),
+    };
+    let metadata = BoxStore::new(state_dir).fork_checkpoint(args.checkpoint_id, &request)?;
+    print_box_result(&metadata, global.json)?;
+    Ok(0)
+}
+
+fn print_checkpoint_result(
+    metadata: &CheckpointMetadata,
+    json: bool,
+) -> Result<(), CliErrorSource> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(metadata)?);
+    } else {
+        println!(
+            "checkpoint {} from Box {} ({} virtual, {} physical)",
+            metadata.checkpoint_id,
+            metadata.source_box_id,
+            format_bytes(metadata.virtual_size_bytes),
+            format_bytes(metadata.physical_size_bytes),
+        );
+    }
+    Ok(())
 }
 
 fn box_rename(args: &BoxRenameArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
@@ -1933,6 +2099,33 @@ fn validate_network_option(
     Ok(())
 }
 
+pub(super) fn parse_publish(input: &str) -> Result<PublishRequest, String> {
+    let (host_port, guest_port) = input
+        .split_once(':')
+        .ok_or_else(|| "publish values must use HOST_PORT:GUEST_PORT".to_owned())?;
+    if guest_port.contains(':') {
+        return Err("publish values must use HOST_PORT:GUEST_PORT".into());
+    }
+    let host_port = host_port
+        .parse::<u16>()
+        .map_err(|_| "published host port must be between 1 and 65535")?;
+    let guest_port = guest_port
+        .parse::<u16>()
+        .map_err(|_| "published guest port must be between 1 and 65535")?;
+    if host_port == 0 {
+        return Err("published host port must be between 1 and 65535".into());
+    }
+    if guest_port == 0 {
+        return Err("published guest port must be between 1 and 65535".into());
+    }
+    Ok(PublishRequest {
+        protocol: PublishProtocol::Tcp,
+        host_address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        host_port,
+        guest_port,
+    })
+}
+
 fn validate_tty_option(capabilities: BackendCapabilities, tty: bool) -> Result<(), &'static str> {
     if tty && !capabilities.tty.is_supported() {
         return Err("--tty requires a backend with TTY support");
@@ -2186,6 +2379,54 @@ mod tests {
             panic!("expected run command");
         };
         assert!(enabled.network);
+
+        let restricted = Cli::try_parse_from([
+            "morae",
+            "run",
+            "--allow-cidr",
+            "203.0.113.0/24",
+            "--allow-domain",
+            "*.example.com",
+            "--publish",
+            "8080:3000",
+            "--",
+            "/usr/bin/true",
+        ])
+        .unwrap();
+        let Command::Run(restricted) = restricted.command else {
+            panic!("expected run command");
+        };
+        assert!(!restricted.network);
+        assert_eq!(restricted.allow_cidrs, ["203.0.113.0/24"]);
+        assert_eq!(restricted.allow_domains, ["*.example.com"]);
+        assert_eq!(restricted.publish[0].host_port, 8080);
+        assert_eq!(restricted.publish[0].guest_port, 3000);
+
+        assert!(
+            Cli::try_parse_from([
+                "morae",
+                "run",
+                "--network",
+                "--allow-cidr",
+                "203.0.113.0/24",
+                "--",
+                "/usr/bin/true",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_loopback_preview_ports_strictly() {
+        let request = parse_publish("8080:3000").unwrap();
+        assert_eq!(request.protocol, PublishProtocol::Tcp);
+        assert_eq!(request.host_address, std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(request.host_port, 8080);
+        assert_eq!(request.guest_port, 3000);
+        assert!(parse_publish("3000").is_err());
+        assert!(parse_publish("0:3000").is_err());
+        assert!(parse_publish("8080:0").is_err());
+        assert!(parse_publish("8080:3000:1").is_err());
     }
 
     #[test]
@@ -2715,6 +2956,44 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["morae", "box", "backup", &box_id, "box.tar"]).is_ok());
         assert!(Cli::try_parse_from(["morae", "box", "import", "box.tar"]).is_ok());
+
+        let checkpoint = Cli::try_parse_from([
+            "morae",
+            "box",
+            "checkpoint",
+            "create",
+            &box_id,
+            "--name",
+            "baseline",
+            "--label",
+            "suite=smoke",
+        ])
+        .unwrap();
+        let Command::Box {
+            command:
+                BoxCommand::Checkpoint {
+                    command: CheckpointCommand::Create(checkpoint),
+                },
+        } = checkpoint.command
+        else {
+            panic!("expected checkpoint create command");
+        };
+        assert_eq!(checkpoint.name.as_deref(), Some("baseline"));
+        let checkpoint_id = moraebox_box::CheckpointId::new().to_string();
+        assert!(
+            Cli::try_parse_from(["morae", "box", "checkpoint", "fork", &checkpoint_id,]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "morae",
+                "box",
+                "checkpoint",
+                "fork",
+                &checkpoint_id,
+                "--yes",
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

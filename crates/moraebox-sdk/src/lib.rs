@@ -8,10 +8,13 @@ pub use configuration::{
     ManagedStorage, NativeConfigurationError, NativeRuntimeOverrides, NativeSandboxConfig,
 };
 pub use moraebox_box::{
-    BoxBundleReport, BoxListReport, BoxMetadata, BoxQuery, BoxSortBy, CreateBox, UpdateBox,
+    BoxBundleReport, BoxListReport, BoxMetadata, BoxQuery, BoxSortBy, CheckpointId,
+    CheckpointListReport, CheckpointMetadata, CreateBox, CreateCheckpoint, ForkCheckpoint,
+    UpdateBox,
 };
 pub use moraebox_core::{
-    CopyInSpec, CopyOutSpec, RunSpec, WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode,
+    CopyInSpec, CopyOutSpec, NetworkMode, NetworkPolicy, PublishProtocol, PublishRequest, RunSpec,
+    WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode,
 };
 
 use std::{
@@ -596,6 +599,60 @@ impl SandboxSdk {
             .map_err(Into::into)
     }
 
+    pub async fn create_checkpoint(
+        &self,
+        box_id: BoxId,
+        request: CreateCheckpoint,
+    ) -> Result<CheckpointMetadata, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.create_checkpoint_with(box_id, &request))
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
+    pub async fn list_checkpoints(&self) -> Result<CheckpointListReport, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.list_checkpoints())
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
+    pub async fn get_checkpoint(
+        &self,
+        checkpoint_id: CheckpointId,
+    ) -> Result<CheckpointMetadata, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.get_checkpoint(checkpoint_id))
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
+    pub async fn delete_checkpoint(
+        &self,
+        checkpoint_id: CheckpointId,
+    ) -> Result<CheckpointMetadata, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.delete_checkpoint(checkpoint_id))
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
+    pub async fn fork_checkpoint(
+        &self,
+        checkpoint_id: CheckpointId,
+        request: ForkCheckpoint,
+    ) -> Result<BoxMetadata, SdkError> {
+        let store = self.box_store()?;
+        tokio::task::spawn_blocking(move || store.fork_checkpoint(checkpoint_id, &request))
+            .await
+            .map_err(|error| SdkError::BoxTask(error.to_string()))?
+            .map_err(Into::into)
+    }
+
     pub async fn delete_box(&self, box_id: BoxId) -> Result<BoxMetadata, SdkError> {
         let store = self.box_store()?;
         tokio::task::spawn_blocking(move || store.delete(box_id))
@@ -877,7 +934,34 @@ mod tests {
         let listed = sdk.list_boxes().await.unwrap();
         assert_eq!(listed.boxes.as_slice(), std::slice::from_ref(&created));
         assert!(listed.errors.is_empty());
+        let checkpoint = sdk
+            .create_checkpoint(
+                created.box_id,
+                CreateCheckpoint::default().with_name("baseline"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sdk.get_checkpoint(checkpoint.checkpoint_id).await.unwrap(),
+            checkpoint
+        );
+        assert_eq!(
+            sdk.list_checkpoints().await.unwrap().checkpoints.as_slice(),
+            std::slice::from_ref(&checkpoint)
+        );
+        let forked = sdk
+            .fork_checkpoint(
+                checkpoint.checkpoint_id,
+                ForkCheckpoint::default().with_name("forked"),
+            )
+            .await
+            .unwrap();
+        assert_ne!(forked.box_id, created.box_id);
+        sdk.delete_checkpoint(checkpoint.checkpoint_id)
+            .await
+            .unwrap();
         sdk.delete_box(created.box_id).await.unwrap();
+        sdk.delete_box(forked.box_id).await.unwrap();
         assert!(sdk.list_boxes().await.unwrap().boxes.is_empty());
     }
 

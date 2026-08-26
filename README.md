@@ -112,7 +112,7 @@ morae run --image alpine:latest --env MESSAGE=hello \
 
 Use `--env KEY=VALUE` to add individual values. `--inherit-env` forwards the host environment and should be used only when that exposure is intentional. Explicit `--env` values override inherited values; a non-Unicode host variable name or value rejects the run instead of being silently dropped or altered.
 
-### Opt into outbound network access
+### Control outbound network access and local previews
 
 Guest networking is disabled by default. Enable it for one native VM run with `--network`:
 
@@ -122,9 +122,29 @@ morae run --network -- curl -I https://example.com
 
 Network-enabled runs require `gvproxy`, which the Homebrew formula installs automatically. moraebox discovers `gvproxy` on `PATH`; for non-Homebrew installations, use `--gvproxy /path/to/gvproxy` or `MORAE_GVPROXY_PATH` when it is installed elsewhere. The native runtime starts a fresh gvproxy process and virtio-net endpoint for the run, then tears both down with the VM. The control vsock remains separate with all TSI feature flags disabled.
 
-The same opt-in is `RunSpec.network = true` in the Rust SDK and `"network": true` in an MCP `sandbox_exec` call. The `process` backend rejects this VM-specific option because it already runs directly in the host network context and does not provide VM isolation.
+For narrower egress, use repeatable CIDR and domain rules instead of `--network`:
 
-Enabling network access gives guest code outbound access available through the host user's network context. It is not a destination allowlist or a separate network security boundary.
+```sh
+morae run \
+  --allow-cidr 203.0.113.0/24 \
+  --allow-domain '*.example.com' \
+  -- curl -I https://api.example.com
+```
+
+CIDR rules admit TCP and UDP only for the listed ranges. Domain rules are stricter: moraebox observes trusted DNS answers and then requires a matching TLS ClientHello SNI. QUIC, ECH-only handshakes, direct-IP TLS without observable SNI, malformed packets, expired DNS bindings, and unsolicited reverse flows fail closed. DNS, DHCP, and gvproxy control traffic are limited to the per-run infrastructure endpoints. This is a host-side egress filter for reducing accidental or guest-originated reachability; it is not a substitute for an independently administered network firewall.
+
+Expose a guest development server only on host loopback with `--publish HOST_PORT:GUEST_PORT`:
+
+```sh
+morae run --publish 8080:3000 -- python3 -m http.server 3000 --bind 0.0.0.0
+# preview: http://127.0.0.1:8080
+```
+
+Publishing alone opens only the correlated inbound preview flow and does not grant general outbound access. Listeners are TCP-only, loopback-only, per-run, and removed during cleanup. The Rust SDK additionally accepts `host_port: 0` for automatic allocation; MCP accepts the same form and returns the resolved listener in `status.published_ports` (use `wait=false` for a live preview).
+
+The Rust SDK represents these choices with `RunSpec.network_policy` and `RunSpec.publish`. MCP `sandbox_exec` uses `allow_cidrs`, `allow_domains`, and `publish`; `"network": true` remains the explicit unrestricted option. The `process` backend rejects every VM-network option because it runs directly in the host network context and does not provide VM isolation.
+
+Enabling unrestricted network access gives guest code outbound access available through the host user's network context.
 
 ### Select an OCI image
 
@@ -172,6 +192,18 @@ morae box delete "$BOX_ID" --yes
 `BoxId` identifies a persistent root filesystem lineage, not a VM or an authentication credential. Every `morae run --box` still creates a new microVM and `SessionId`; only files on that Box disk continue. Different Boxes have independent disks, and a second writer for the same Box fails immediately. `--box` cannot be combined with `--image`, `--rootfs`, or `--workspace`, and the non-isolating `process` backend rejects it.
 
 Before a writable Box disk is exposed to a guest, moraebox atomically records `Dirty` metadata and flushes both the file and its parent directory. Only a clean helper shutdown returns it to `Ready`. A host crash, timeout, signal, helper failure, or failed spawn leaves it `Dirty`, so the next run executes `e2fsck -p` while holding the Box lease. Successful repair is recorded before the disk can be used again; an unrecoverable filesystem is marked `NeedsRepair` and blocked.
+
+Capture an idle `Ready` Box as an immutable checkpoint, then fork independent writable Boxes from it:
+
+```sh
+CHECKPOINT_ID=$(morae box checkpoint create "$BOX_ID" --name clean-deps --json | jq -r .checkpoint_id)
+morae box checkpoint list
+morae box checkpoint show "$CHECKPOINT_ID"
+morae box checkpoint fork "$CHECKPOINT_ID" --name experiment-a --yes
+morae box checkpoint delete "$CHECKPOINT_ID" --yes
+```
+
+Checkpoint creation holds the source Box's exclusive lease and never snapshots a running or `Dirty` disk. A fork receives a new `BoxId` and an independent writable disk; deleting or changing that Box cannot mutate the checkpoint or sibling forks. Checkpoints retain untrusted filesystem content and therefore share the same trust-boundary guidance as Boxes.
 
 ### Attach a workspace and transfer files
 
@@ -311,8 +343,10 @@ The server exposes execution tools plus persistent Box management:
 | `sandbox_box_export` / `sandbox_box_import` | Back up or restore a verified versioned Box bundle under a new ID |
 | `sandbox_box_delete` / `sandbox_box_reset` | Permanently mutate an idle Box with explicit confirmation |
 | `sandbox_box_clone` | Create a new independent durable Box with explicit confirmation |
+| `sandbox_checkpoint_create` / `sandbox_checkpoint_list` / `sandbox_checkpoint_get` | Capture and inspect immutable Box disk checkpoints |
+| `sandbox_checkpoint_fork` / `sandbox_checkpoint_delete` | Fork an independent Box or delete a checkpoint with explicit confirmation |
 
-Commands remain argv arrays in the MCP schema. Output chunks are exposed as UTF-8 text so agents can read them directly; invalid UTF-8 bytes are replaced with `U+FFFD`. Stdin bytes remain base64-encoded. A waiting `sandbox_exec` response includes at most 1 MiB of output. When `has_more` is true, pass its `status.session_id` and `continuation_cursor` to `sandbox_io` within five minutes; executions whose output fits inline are removed immediately. `sandbox_io.wait_ms` can wait up to 30 seconds for output or session completion without a fixed polling interval, and reports `wait_timed_out` when the bound expires. The server permits up to 32 active runs. Completed asynchronous sessions remain readable for five minutes, can be inspected with `sandbox_session_list` and `sandbox_session_status`, or are released explicitly by `sandbox_remove`; disconnecting the stdio client removes all connection-owned sessions.
+Commands remain argv arrays in the MCP schema. `sandbox_exec.cwd` is a normalized absolute guest path, and `env` accepts at most 64 explicit variables; neither option causes host-environment inheritance. Network policy and preview fields follow the security behavior described above. Output chunks are exposed as UTF-8 text so agents can read them directly; invalid UTF-8 bytes are replaced with `U+FFFD`. Stdin bytes remain base64-encoded. A waiting `sandbox_exec` response includes at most 1 MiB of output. When `has_more` is true, pass its `status.session_id` and `continuation_cursor` to `sandbox_io` within five minutes; executions whose output fits inline are removed immediately. `sandbox_io.wait_ms` can wait up to 30 seconds for output or session completion without a fixed polling interval, and reports `wait_timed_out` when the bound expires. The server permits up to 32 active runs. Completed asynchronous sessions remain readable for five minutes, can be inspected with `sandbox_session_list` and `sandbox_session_status`, or are released explicitly by `sandbox_remove`; disconnecting the stdio client removes all connection-owned sessions.
 
 ## How it works
 
@@ -376,7 +410,8 @@ Security-relevant defaults include:
 - a control vsock with Transparent Socket Impersonation flags set to zero;
 - version, session, stream, sequence, direction, and state validation on every control message, with an 8 MiB frame limit;
 - a guest agent embedded in the signed helper and re-injected, mode-checked, and byte-verified for every root-disk lease, including persistent Boxes;
-- opt-in egress uses a per-run gvproxy virtio-net process that is cleaned up with the VM;
+- unrestricted or host-filtered egress uses a per-run gvproxy virtio-net process and policy relay that are cleaned up with the VM;
+- preview listeners bind only to host loopback, admit correlated guest replies, and share the run lifecycle;
 - no host environment forwarding;
 - no implicit shell parsing;
 - immutable, read-only workspace snapshots;
@@ -385,6 +420,8 @@ Security-relevant defaults include:
 - single-use prepared units and cleanup after parent loss.
 
 Persistent Boxes are an explicit exception to filesystem disposal, not to VM disposal. They can retain untrusted guest changes across runs, so reuse a Box only for related work and delete or reset it before crossing a trust boundary. Exclusive leases prevent concurrent writers to one Box.
+
+Immutable checkpoints also retain untrusted guest state. They can be forked repeatedly, but neither a checkpoint nor a fork implies that its contents are trusted or freshly scanned.
 
 moraebox does **not** claim to protect against a hostile host user, a compromised hypervisor or VMM, or hostile multi-tenant operation. The process backend does not provide isolation.
 
@@ -398,7 +435,9 @@ moraebox does **not** claim to protect against a hostile host user, a compromise
 | Image sources | Remote OCI registries, local OCI layouts, and explicitly selected Docker archives |
 | VM reuse | Materialized artifacts may be cached; booted untrusted VMs are never reused |
 | Box persistence | Opt-in full root filesystem persistence; each run still uses a fresh microVM |
+| Box checkpoints | Immutable idle-disk snapshots with independent writable forks |
 | Workspaces | Immutable snapshots with optional disposable writable overlays and bounded copy-out/diff |
+| Networking | Disabled, unrestricted, or CIDR/domain-filtered egress; loopback TCP previews |
 | Interactive I/O | PTY and live terminal resize supported over the bounded control protocol |
 
 This is an early-stage project. Review the boundaries above before using it for security-sensitive workloads.
@@ -450,7 +489,7 @@ On Apple Silicon macOS, run the signed network security gate after the portable 
 scripts/native-egress-e2e.sh
 ```
 
-The gate ad-hoc signs the debug helper with `assets/moraebox-vmm.entitlements`, requires a ready default cached image, and verifies network-off DNS/TCP/UDP denial, network-on egress, and cleanup after timeout, cancellation, and helper failure. Set `MORAE_NATIVE_E2E_IMAGE` to select another ready cached image, or `MORAE_NATIVE_E2E_CACHE_DIR` for a non-default cache. `MORAE_EGRESS_HOST` and `MORAE_EGRESS_UDP_DNS` override the external TCP/DNS probe targets when required by the test environment.
+The gate ad-hoc signs the debug helper with `assets/moraebox-vmm.entitlements`, requires a ready default cached image, and verifies network-off DNS/TCP/UDP denial, unrestricted egress, domain-filtered TLS with unrelated direct-IP denial, loopback preview forwarding, and cleanup after timeout, cancellation, and helper failure. Set `MORAE_NATIVE_E2E_IMAGE` to select another ready cached image, or `MORAE_NATIVE_E2E_CACHE_DIR` for a non-default cache. `MORAE_EGRESS_HOST` and `MORAE_EGRESS_UDP_DNS` override the external TCP/DNS probe targets when required by the test environment; the domain override must support TLS on port 443.
 
 Bug reports and focused pull requests are welcome. Please include the backend, host platform, exact command, and `morae doctor --json` output when reporting native runtime problems. Remove local paths or other sensitive values before sharing diagnostics.
 

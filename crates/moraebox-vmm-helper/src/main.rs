@@ -102,6 +102,12 @@ const PARENT_CONTROL_TERMINATE: u8 = 3;
 #[cfg(unix)]
 const PARENT_CONTROL_HANGUP: u8 = 4;
 
+#[derive(Clone, Copy)]
+enum NetworkAttachment<'a> {
+    Path(&'a Path),
+    Fd(i32),
+}
+
 #[derive(Debug, Parser)]
 #[command(about = "Signed libkrun VMM helper; normally invoked by morae")]
 struct Args {
@@ -132,8 +138,11 @@ struct Args {
     #[arg(long, requires = "workspace_disk")]
     workspace_writable: bool,
     /// gvproxy vfkit Unix datagram endpoint for opt-in guest egress.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "network_fd")]
     network_socket: Option<PathBuf>,
+    /// Inherited, connected Unix datagram descriptor for policy-filtered guest egress.
+    #[arg(long, conflicts_with = "network_socket", value_parser = parse_network_fd)]
+    network_fd: Option<i32>,
     /// Supervisor PID. The helper self-terminates if ownership is lost.
     #[arg(long)]
     parent_pid: Option<u32>,
@@ -242,12 +251,17 @@ fn run(args: Args) -> Result<i32, HelperError> {
             "exactly one of --root or --root-disk is required",
         ));
     }
+    let network = args
+        .network_socket
+        .as_deref()
+        .map(NetworkAttachment::Path)
+        .or(args.network_fd.map(NetworkAttachment::Fd));
     api.configure_networking(
         context.id,
         control
             .as_ref()
             .map(|endpoint| endpoint.socket_path.as_path()),
-        args.network_socket.as_deref(),
+        network,
     )?;
     #[cfg(unix)]
     let protocol_console_input = if control.is_some() {
@@ -456,12 +470,12 @@ impl KrunApi {
         &self,
         context: u32,
         control_socket: Option<&Path>,
-        network_socket: Option<&Path>,
+        network: Option<NetworkAttachment<'_>>,
     ) -> Result<(), HelperError> {
         Self::configure_networking_with(
             context,
             control_socket,
-            network_socket,
+            network,
             self.disable_implicit_vsock,
             self.add_vsock,
             self.add_vsock_port,
@@ -500,7 +514,7 @@ impl KrunApi {
     fn configure_networking_with(
         context: u32,
         control_socket: Option<&Path>,
-        network_socket: Option<&Path>,
+        network: Option<NetworkAttachment<'_>>,
         disable_implicit_vsock: Option<DisableImplicitVsock>,
         add_vsock: AddVsock,
         add_vsock_port: Option<AddVsockPort>,
@@ -524,8 +538,14 @@ impl KrunApi {
                 add_port(context, CONTROL_VSOCK_PORT, socket.as_ptr())
             })?;
         }
-        if let Some(socket) = network_socket {
-            Self::configure_network_with(context, socket, add_network)?;
+        match network {
+            Some(NetworkAttachment::Path(socket)) => {
+                Self::configure_network_with(context, socket, add_network)?;
+            }
+            Some(NetworkAttachment::Fd(fd)) => {
+                Self::configure_network_fd_with(context, fd, add_network)?;
+            }
+            None => {}
         }
         Ok(())
     }
@@ -548,6 +568,27 @@ impl KrunApi {
                 mac.as_mut_ptr(),
                 NETWORK_FEATURES,
                 NETWORK_FLAGS,
+            )
+        })
+    }
+
+    fn configure_network_fd_with(
+        context: u32,
+        fd: i32,
+        add_network: Option<AddNetUnixgram>,
+    ) -> Result<(), HelperError> {
+        let add_network = add_network.ok_or(HelperError::MissingNetworkApi)?;
+        let mut mac = NETWORK_MAC;
+        Self::check("krun_add_net_unixgram(policy fd)", unsafe {
+            // SAFETY: the descriptor was inherited from the runtime as an initialized,
+            // connected Unix datagram socket. A null path selects libkrun's fd mode.
+            add_network(
+                context,
+                std::ptr::null(),
+                fd,
+                mac.as_mut_ptr(),
+                NETWORK_FEATURES,
+                NET_FLAG_DHCP_CLIENT,
             )
         })
     }
@@ -1767,6 +1808,16 @@ fn parse_env(input: &str) -> Result<(String, String), String> {
     Ok((key.to_owned(), value.to_owned()))
 }
 
+fn parse_network_fd(input: &str) -> Result<i32, String> {
+    let fd = input
+        .parse::<i32>()
+        .map_err(|_| "network fd must be a non-negative integer".to_owned())?;
+    if fd < 0 {
+        return Err("network fd must be non-negative".to_owned());
+    }
+    Ok(fd)
+}
+
 #[cfg(unix)]
 fn validate_copy_arguments(args: &Args) -> Result<ValidatedTransfers, HelperError> {
     if args.copy_in_sources.len() != args.copy_in_destinations.len() {
@@ -1985,6 +2036,31 @@ mod tests {
         0
     }
 
+    unsafe extern "C" fn record_add_network_fd(
+        context: u32,
+        socket: *const c_char,
+        fd: i32,
+        mac: *mut u8,
+        features: u32,
+        flags: u32,
+    ) -> i32 {
+        let mac = unsafe {
+            // SAFETY: configure_network_fd_with passes a live six-byte MAC buffer.
+            std::slice::from_raw_parts(mac, NETWORK_MAC.len())
+        };
+        if context == 9
+            && socket.is_null()
+            && fd == 42
+            && mac == NETWORK_MAC
+            && features == NETWORK_FEATURES
+            && flags == NET_FLAG_DHCP_CLIENT
+        {
+            let _ =
+                NETWORK_CALL_SEQUENCE.compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst);
+        }
+        0
+    }
+
     unsafe extern "C" fn record_disable_implicit_vsock(context: u32) -> i32 {
         if context == 9 {
             let _ =
@@ -2115,7 +2191,7 @@ mod tests {
         KrunApi::configure_networking_with(
             9,
             None,
-            Some(Path::new("/tmp/gvproxy.sock")),
+            Some(NetworkAttachment::Path(Path::new("/tmp/gvproxy.sock"))),
             Some(record_disable_implicit_vsock),
             record_add_vsock,
             None,
@@ -2125,6 +2201,25 @@ mod tests {
 
         assert_eq!(NETWORK_CALL_SEQUENCE.load(Ordering::SeqCst), 3);
         assert_eq!(NETWORK_FLAGS & !0b11, 0);
+    }
+
+    #[test]
+    fn configures_a_preconnected_policy_socket_without_vfkit_framing() {
+        let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+        NETWORK_CALL_SEQUENCE.store(0, Ordering::SeqCst);
+
+        KrunApi::configure_networking_with(
+            9,
+            None,
+            Some(NetworkAttachment::Fd(42)),
+            Some(record_disable_implicit_vsock),
+            record_add_vsock,
+            None,
+            Some(record_add_network_fd),
+        )
+        .unwrap();
+
+        assert_eq!(NETWORK_CALL_SEQUENCE.load(Ordering::SeqCst), 3);
     }
 
     #[test]

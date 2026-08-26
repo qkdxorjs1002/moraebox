@@ -12,8 +12,10 @@ pub use output::{
 };
 pub use spec::{
     BoxId, CopyInSpec, CopyOutSpec, DEFAULT_COPY_LIMIT, DEFAULT_KILL_GRACE, DEFAULT_OUTPUT_LIMIT,
-    DEFAULT_TIMEOUT, ImagePullPolicy, MAX_COPY_LIMIT, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, RunSpec,
-    SessionId, Signal, TimeoutPolicy, WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode,
+    DEFAULT_TIMEOUT, ImagePullPolicy, MAX_COPY_LIMIT, MAX_KILL_GRACE, MAX_NETWORK_CIDRS,
+    MAX_NETWORK_DOMAINS, MAX_OUTPUT_LIMIT, MAX_PUBLISH_REQUESTS, NetworkMode, NetworkPolicy,
+    PublishProtocol, PublishRequest, RunSpec, SessionId, Signal, TimeoutPolicy,
+    WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode,
 };
 pub use state::{Lifecycle, LifecycleError, LifecycleEvent, SessionState, TerminationReason};
 pub use storage::{

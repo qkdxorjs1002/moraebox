@@ -25,14 +25,15 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand};
 use moraebox_box::{
-    BaseDiskSpec, BaseDiskStore, BoxQuery, BoxSortBy, BoxState, BoxStore, BoxStoreError, CreateBox,
-    UpdateBox,
+    BaseDiskSpec, BaseDiskStore, BoxQuery, BoxSortBy, BoxState, BoxStore, BoxStoreError,
+    CheckpointId, CreateBox, CreateCheckpoint, ForkCheckpoint, UpdateBox,
 };
 use moraebox_core::{
     BoxId, CopyInSpec, CopyOutSpec, DEFAULT_COPY_LIMIT, DEFAULT_KILL_GRACE, DEFAULT_OUTPUT_LIMIT,
-    ImagePullPolicy, MAX_COPY_LIMIT, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, OutputChunk,
-    OutputReadError, RunSpec, SessionId, Signal, TimeoutPolicy, WorkspaceMode, resolve_cache_dir,
-    resolve_state_dir,
+    ImagePullPolicy, MAX_COPY_LIMIT, MAX_KILL_GRACE, MAX_NETWORK_CIDRS, MAX_NETWORK_DOMAINS,
+    MAX_OUTPUT_LIMIT, MAX_PUBLISH_REQUESTS, NetworkMode, NetworkPolicy, OutputChunk,
+    OutputReadError, PublishProtocol, PublishRequest, RunSpec, SessionId, Signal, TimeoutPolicy,
+    WorkspaceMode, resolve_cache_dir, resolve_state_dir,
 };
 use moraebox_image::{Credentials, ImageCache, Platform, WorkspaceSnapshot};
 use moraebox_runtime::{
@@ -78,7 +79,12 @@ const SERVER_INSTRUCTIONS: &str = concat!(
     "run timeout; preparation failures report image_prepare_failed at the image_pull stage. ",
     "Pass box_id to continue from a persistent Box while ",
     "still receiving a new microVM and SessionId for every run. Use the sandbox_box_* tools ",
-    "to create and manage persistent root filesystems. Only the libkrun backend provides VM isolation; the ",
+    "to create and manage persistent root filesystems, and sandbox_checkpoint_* to capture ",
+    "idle Ready Box disks and fork independent writable Boxes. sandbox_exec cwd and env are ",
+    "guest-scoped and never imply host environment inheritance. Network is disabled by default; ",
+    "use allow_cidrs or allow_domains for filtered native egress, network=true only for explicit ",
+    "unrestricted egress, and publish for loopback TCP previews. Auto-assigned preview ports are ",
+    "reported in status.published_ports. Only the libkrun backend provides VM isolation; the ",
     "process backend is for deterministic development and is not isolated. Host workspace ",
     "files are not attached automatically, so use this server only when required inputs ",
     "already exist in the guest."

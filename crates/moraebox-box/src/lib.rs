@@ -327,6 +327,15 @@ impl BoxStore {
         self.checkpoint_store().create(box_id)
     }
 
+    /// Creates an immutable checkpoint with optional user metadata.
+    pub fn create_checkpoint_with(
+        &self,
+        box_id: BoxId,
+        request: &CreateCheckpoint,
+    ) -> Result<CheckpointMetadata, BoxStoreError> {
+        self.checkpoint_store().create_with(box_id, request)
+    }
+
     /// Lists valid checkpoints and reports invalid entries without following them.
     pub fn list_checkpoints(&self) -> Result<CheckpointListReport, BoxStoreError> {
         self.checkpoint_store().list()

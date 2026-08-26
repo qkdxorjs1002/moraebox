@@ -7,8 +7,8 @@ use std::{
 };
 
 use moraebox_core::{
-    Lifecycle, LifecycleEvent, OutputBuffer, OutputChannel, OutputRead, OutputReadError, RunSpec,
-    SessionId, SessionState, Signal, TerminationReason,
+    Lifecycle, LifecycleEvent, OutputBuffer, OutputChannel, OutputRead, OutputReadError,
+    PublishRequest, RunSpec, SessionId, SessionState, Signal, TerminationReason,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -77,17 +77,7 @@ pub(crate) async fn start_session<B: Backend + ?Sized>(
     record_trace(&trace, TraceKind::CommandStarted);
     let startup = spawned.startup.clone();
     let (command_stage_started, command_timeout) = begin_command_stage(&budget);
-    let initial = SessionStatus {
-        session_id: spec.session_id,
-        backend: backend.name().into(),
-        resolved_image_digest: startup.resolved_image_digest.clone(),
-        state: lifecycle.state(),
-        termination_reason: lifecycle.termination_reason(),
-        exit_code: None,
-        signal: None,
-        timed_out: false,
-        elapsed_micros: 0,
-    };
+    let initial = initial_status(backend.name(), &spec, &startup, &lifecycle);
     let (status_sender, status_receiver) = watch::channel(initial);
     let output = Arc::new(Mutex::new(OutputBuffer::new(spec.output_limit)));
     let (output_cursor_sender, output_cursor_receiver) = watch::channel(0_u64);
@@ -121,7 +111,6 @@ pub(crate) async fn start_session<B: Backend + ?Sized>(
         ))
     });
     drop(output_cursor_sender);
-
     let session_id = spec.session_id;
     tokio::spawn(drive_session(
         spec,
@@ -154,6 +143,26 @@ pub(crate) async fn start_session<B: Backend + ?Sized>(
         terminal_errors,
         budget,
     })
+}
+
+fn initial_status(
+    backend: &str,
+    spec: &RunSpec,
+    startup: &StartupMetrics,
+    lifecycle: &Lifecycle,
+) -> SessionStatus {
+    SessionStatus {
+        session_id: spec.session_id,
+        backend: backend.into(),
+        resolved_image_digest: startup.resolved_image_digest.clone(),
+        published_ports: startup.published_ports.clone(),
+        state: lifecycle.state(),
+        termination_reason: lifecycle.termination_reason(),
+        exit_code: None,
+        signal: None,
+        timed_out: false,
+        elapsed_micros: 0,
+    }
 }
 
 fn begin_command_stage(budget: &RunBudget) -> (Instant, Option<Duration>) {
@@ -888,11 +897,13 @@ fn publish_status(
     let current = sender.borrow();
     let backend = current.backend.clone();
     let resolved_image_digest = current.resolved_image_digest.clone();
+    let published_ports = current.published_ports.clone();
     drop(current);
     let _ = sender.send(SessionStatus {
         session_id: spec.session_id,
         backend,
         resolved_image_digest,
+        published_ports,
         state: lifecycle.state(),
         termination_reason: lifecycle.termination_reason(),
         exit_code,
@@ -1098,6 +1109,8 @@ pub struct SessionStatus {
     pub backend: String,
     #[serde(default)]
     pub resolved_image_digest: Option<String>,
+    #[serde(default)]
+    pub published_ports: Vec<PublishRequest>,
     pub state: SessionState,
     pub termination_reason: Option<TerminationReason>,
     pub exit_code: Option<i32>,
@@ -1256,7 +1269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_image_digest_survives_status_updates() {
+    async fn startup_metadata_survives_status_updates() {
         let manager = SessionManager::new(Arc::new(ResolvedImageProcessBackend));
         let session = manager
             .start(RunSpec::command(stdin_echo_command()))
@@ -1274,6 +1287,8 @@ mod tests {
             session.startup().resolved_image_digest.as_deref(),
             Some("sha256:resolved")
         );
+        assert_eq!(status.published_ports, session.startup().published_ports);
+        assert_eq!(status.published_ports[0].host_port, 41_337);
     }
 
     struct ResolvedImageProcessBackend;
@@ -1295,6 +1310,12 @@ mod tests {
         ) -> Result<crate::SpawnedSandbox, BackendError> {
             let mut spawned = ProcessBackend.spawn(spec, budget).await?;
             spawned.startup.resolved_image_digest = Some("sha256:resolved".into());
+            spawned.startup.published_ports.push(PublishRequest {
+                protocol: moraebox_core::PublishProtocol::Tcp,
+                host_address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                host_port: 41_337,
+                guest_port: 3000,
+            });
             Ok(spawned)
         }
     }

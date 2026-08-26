@@ -1,7 +1,7 @@
 use std::{future::Future, io, pin::Pin, process::ExitStatus, time::Duration};
 
 use async_trait::async_trait;
-use moraebox_core::{OutputChannel, RunSpec, Signal};
+use moraebox_core::{OutputChannel, PublishRequest, RunSpec, Signal};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -86,6 +86,8 @@ pub struct StartupMetrics {
     #[serde(default)]
     pub prepared_lease_micros: Option<u64>,
     pub network_setup_micros: Option<u64>,
+    #[serde(default)]
+    pub published_ports: Vec<PublishRequest>,
     pub root_prepare_micros: Option<u64>,
     pub cache_lookup_micros: Option<u64>,
     pub box_lock_micros: Option<u64>,

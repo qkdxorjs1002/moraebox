@@ -29,6 +29,21 @@ where
         .await?;
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
+    for published in session.status().published_ports {
+        stderr
+            .write_all(
+                format!(
+                    "morae: preview: tcp://{}:{} -> guest:{}{}",
+                    published.host_address,
+                    published.host_port,
+                    published.guest_port,
+                    stderr_line_ending()
+                )
+                .as_bytes(),
+            )
+            .await?;
+    }
+    stderr.flush().await?;
     let mut cursor = 0_u64;
     let mut input_open = true;
 

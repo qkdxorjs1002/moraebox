@@ -91,7 +91,7 @@ morae run --image alpine:latest --env MESSAGE=hello \
 
 개별 환경값은 `--env KEY=VALUE`로 추가합니다. `--inherit-env`는 호스트 환경을 전달하므로 해당 노출이 의도된 경우에만 사용해야 합니다.
 
-### 외부 네트워크 접속 허용
+### 외부 네트워크와 로컬 프리뷰 제어
 
 게스트 네트워크는 기본적으로 꺼져 있습니다. 네이티브 VM 실행 하나에만 허용하려면 `--network`를 지정합니다.
 
@@ -101,9 +101,29 @@ morae run --network -- curl -I https://example.com
 
 네트워크 실행에는 Homebrew formula가 자동으로 설치하는 `gvproxy`가 필요합니다. moraebox는 `PATH`에서 `gvproxy`를 찾으며, Homebrew 외의 방식으로 다른 위치에 설치했다면 `--gvproxy /path/to/gvproxy` 또는 `MORAE_GVPROXY_PATH`를 사용합니다. 네이티브 런타임은 실행마다 새 gvproxy 프로세스와 virtio-net endpoint를 시작하고 VM과 함께 정리합니다. control vsock은 별도로 유지하며 모든 TSI feature flag를 끕니다.
 
-Rust SDK에서는 `RunSpec.network = true`, MCP `sandbox_exec`에서는 `"network": true`가 같은 실행별 opt-in입니다. `process` 백엔드는 호스트 네트워크 문맥에서 직접 실행되고 VM 격리를 제공하지 않으므로 이 VM 전용 옵션을 거부합니다.
+전체 egress 대신 반복 가능한 CIDR·도메인 규칙으로 목적지를 좁힐 수 있습니다.
 
-네트워크를 켜면 게스트 코드는 호스트 사용자 네트워크 문맥에서 가능한 외부 접속을 사용할 수 있습니다. 목적지 allowlist나 별도 네트워크 보안 경계는 아닙니다.
+```sh
+morae run \
+  --allow-cidr 203.0.113.0/24 \
+  --allow-domain '*.example.com' \
+  -- curl -I https://api.example.com
+```
+
+CIDR 규칙은 지정 범위의 TCP·UDP만 허용합니다. 도메인 규칙은 신뢰한 DNS 응답과 일치하는 TLS ClientHello SNI를 함께 요구합니다. QUIC, ECH-only, SNI가 보이지 않는 direct-IP TLS, 잘못된 packet, 만료된 DNS binding, 요청되지 않은 reverse flow는 fail-closed로 차단합니다. 이는 guest reachability를 줄이는 host-side filter이며 독립적으로 관리되는 firewall을 대체하지 않습니다.
+
+게스트 개발 서버는 host loopback에만 공개할 수 있습니다.
+
+```sh
+morae run --publish 8080:3000 -- python3 -m http.server 3000 --bind 0.0.0.0
+# preview: http://127.0.0.1:8080
+```
+
+`--publish`만 사용하면 대응하는 inbound preview flow만 열리고 일반 egress는 허용하지 않습니다. listener는 TCP·loopback·실행별로 한정되고 cleanup 때 제거됩니다. Rust SDK와 MCP는 `host_port: 0` 자동 할당도 지원하며 실제 포트는 `status.published_ports`에 반환합니다. live preview에는 MCP `wait=false`를 사용합니다.
+
+Rust SDK는 `RunSpec.network_policy`와 `RunSpec.publish`, MCP `sandbox_exec`은 `allow_cidrs`, `allow_domains`, `publish`를 사용합니다. `"network": true`는 계속 명시적인 unrestricted 옵션입니다. `process` 백엔드는 VM 격리를 제공하지 않으므로 모든 VM network 옵션을 거부합니다.
+
+unrestricted 네트워크를 켜면 게스트 코드는 호스트 사용자 네트워크 문맥에서 가능한 외부 접속을 사용할 수 있습니다.
 
 ### OCI 이미지 선택
 
@@ -145,6 +165,18 @@ morae box delete "$BOX_ID" --yes
 `BoxId`는 persistent root filesystem 계보를 식별하며 VM identity나 인증 수단이 아닙니다. `morae run --box`도 매번 새 microVM과 `SessionId`를 만들고 Box disk의 파일만 이어받습니다. 서로 다른 Box는 독립된 disk를 사용하며 같은 Box의 두 번째 writer는 즉시 실패합니다. `--box`는 `--image`, `--rootfs`, `--workspace`와 함께 사용할 수 없고, 격리 없는 `process` 백엔드는 이를 거부합니다.
 
 writable Box disk를 guest에 연결하기 전에 moraebox는 `Dirty` metadata를 원자적으로 기록하고 file과 parent directory를 모두 flush합니다. clean helper shutdown만 Box를 `Ready`로 되돌립니다. host crash, timeout, signal, helper 실패 또는 spawn 실패는 `Dirty`를 유지하므로 다음 실행은 Box lease를 잡은 상태에서 `e2fsck -p`를 수행합니다. 복구 성공은 disk를 다시 사용하기 전에 기록되며, 복구할 수 없는 filesystem은 `NeedsRepair`로 표시하고 실행을 차단합니다.
+
+idle `Ready` Box를 immutable checkpoint로 저장하고 독립된 writable Box를 fork할 수 있습니다.
+
+```sh
+CHECKPOINT_ID=$(morae box checkpoint create "$BOX_ID" --name clean-deps --json | jq -r .checkpoint_id)
+morae box checkpoint list
+morae box checkpoint show "$CHECKPOINT_ID"
+morae box checkpoint fork "$CHECKPOINT_ID" --name experiment-a --yes
+morae box checkpoint delete "$CHECKPOINT_ID" --yes
+```
+
+checkpoint 생성은 source Box의 exclusive lease를 잡고 running·`Dirty` disk를 거부합니다. fork는 새 `BoxId`와 독립된 writable disk를 받으므로 한 fork의 변경·삭제가 checkpoint나 sibling fork를 바꾸지 않습니다. checkpoint도 신뢰할 수 없는 filesystem 내용을 보존하므로 Box와 같은 trust-boundary 주의가 필요합니다.
 
 ### 워크스페이스 연결과 파일 전송
 
@@ -265,8 +297,10 @@ claude mcp remove --scope user moraebox
 | `sandbox_box_export` / `sandbox_box_import` | 검증된 versioned bundle로 Box backup·복원 |
 | `sandbox_box_delete` / `sandbox_box_reset` | 명시적 확인 후 idle Box를 영구 변경 |
 | `sandbox_box_clone` | 명시적 확인 후 독립된 durable Box 생성 |
+| `sandbox_checkpoint_create` / `sandbox_checkpoint_list` / `sandbox_checkpoint_get` | immutable Box disk checkpoint 생성·조회 |
+| `sandbox_checkpoint_fork` / `sandbox_checkpoint_delete` | 명시적 확인 후 독립 Box fork 또는 checkpoint 삭제 |
 
-MCP 스키마에서도 명령은 argv 배열입니다. 출력 청크는 에이전트가 바로 읽을 수 있는 UTF-8 평문으로 제공하며, 잘못된 UTF-8 바이트는 `U+FFFD`로 치환합니다. stdin 바이트는 계속 base64로 인코딩합니다.
+MCP 스키마에서도 명령은 argv 배열입니다. `sandbox_exec.cwd`는 정규화된 절대 guest path이고 `env`는 최대 64개의 명시적 값만 받으며 host environment를 상속하지 않습니다. network policy와 preview 필드는 위 보안 동작을 그대로 따릅니다. 출력 청크는 에이전트가 바로 읽을 수 있는 UTF-8 평문으로 제공하며, 잘못된 UTF-8 바이트는 `U+FFFD`로 치환합니다. stdin 바이트는 계속 base64로 인코딩합니다.
 
 ## 동작 방식
 
@@ -322,7 +356,8 @@ prepare → start → ready → running → stop → dead
 
 - 실행에서 명시적으로 허용하지 않는 한 게스트 네트워크 인터페이스 없음
 - Transparent Socket Impersonation 플래그를 0으로 설정한 control vsock
-- 실행별 gvproxy virtio-net으로 egress를 허용하고 VM과 함께 정리
+- 실행별 gvproxy virtio-net과 policy relay로 unrestricted 또는 host-filtered egress를 제공하고 VM과 함께 정리
+- host loopback에만 bind하고 대응하는 guest reply만 허용하는 실행별 preview listener
 - 호스트 환경 전달 없음
 - 암묵적인 셸 파싱 없음
 - 불변 읽기 전용 워크스페이스 스냅샷
@@ -331,6 +366,8 @@ prepare → start → ready → running → stop → dead
 - 일회용 준비 unit과 부모 프로세스 종료 후 정리
 
 Persistent Box는 filesystem 폐기의 명시적 예외일 뿐 VM 폐기의 예외가 아닙니다. 신뢰할 수 없는 guest 변경을 실행 사이에 보존할 수 있으므로 관련 작업에만 같은 Box를 사용하고 trust boundary를 넘기 전 delete 또는 reset해야 합니다. exclusive lease가 한 Box의 동시 writer를 막습니다.
+
+immutable checkpoint도 신뢰할 수 없는 guest 상태를 보존합니다. 반복 fork가 가능하지만 checkpoint나 fork의 내용이 신뢰되거나 새로 검사되었다는 뜻은 아닙니다.
 
 moraebox는 적대적인 호스트 사용자, 손상된 hypervisor·VMM, 적대적인 멀티테넌트 환경으로부터 보호한다고 주장하지 않습니다. process 백엔드는 격리를 제공하지 않습니다.
 
@@ -394,7 +431,7 @@ Apple Silicon macOS에서는 이식 가능한 검사를 마친 뒤 서명된 네
 scripts/native-egress-e2e.sh
 ```
 
-이 게이트는 debug helper를 `assets/moraebox-vmm.entitlements`로 ad-hoc 서명하고, 준비된 기본 캐시 이미지를 사용해 network-off DNS/TCP/UDP 차단, network-on egress, timeout·취소·helper 실패 후 정리를 검증합니다. 다른 준비된 캐시 이미지는 `MORAE_NATIVE_E2E_IMAGE`, 기본값이 아닌 캐시는 `MORAE_NATIVE_E2E_CACHE_DIR`로 지정할 수 있습니다. 테스트 환경에서 외부 TCP/DNS 대상 변경이 필요하면 `MORAE_EGRESS_HOST`와 `MORAE_EGRESS_UDP_DNS`를 사용합니다.
+이 게이트는 debug helper를 `assets/moraebox-vmm.entitlements`로 ad-hoc 서명하고, 준비된 기본 캐시 이미지를 사용해 network-off DNS/TCP/UDP 차단, unrestricted egress, domain-filtered TLS와 무관한 direct-IP 차단, loopback preview 전달, timeout·취소·helper 실패 후 정리를 검증합니다. 다른 준비된 캐시 이미지는 `MORAE_NATIVE_E2E_IMAGE`, 기본값이 아닌 캐시는 `MORAE_NATIVE_E2E_CACHE_DIR`로 지정할 수 있습니다. 테스트 환경에서 외부 TCP/DNS 대상 변경이 필요하면 `MORAE_EGRESS_HOST`와 `MORAE_EGRESS_UDP_DNS`를 사용하며 domain override는 443 TLS를 지원해야 합니다.
 
 버그 리포트와 범위가 명확한 pull request를 환영합니다. 네이티브 런타임 문제를 보고할 때는 백엔드, 호스트 플랫폼, 정확한 명령, `morae doctor --json` 출력을 포함해 주세요. 진단 정보를 공유하기 전에 로컬 경로나 민감한 값은 제거해야 합니다.
 

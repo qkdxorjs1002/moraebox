@@ -53,7 +53,7 @@ impl Backend for ProcessBackend {
                 "PTY on the deterministic process backend",
             ));
         }
-        if spec.network {
+        if spec.network_enabled() {
             return Err(BackendError::Unsupported(
                 "network opt-in on the process backend; it already uses the host network without VM isolation",
             ));
@@ -251,13 +251,21 @@ mod tests {
     async fn rejects_vm_network_opt_in() {
         let mut spec = RunSpec::command(["true"]);
         spec.network = true;
+        let mut policy_spec = RunSpec::command(["true"]);
+        policy_spec.network_policy = Some(moraebox_core::NetworkPolicy {
+            mode: moraebox_core::NetworkMode::Allowlist,
+            allow_cidrs: vec!["203.0.113.0/24".into()],
+            allow_domains: Vec::new(),
+        });
 
-        assert!(matches!(
-            ProcessBackend
-                .spawn(&spec, &RunBudget::new(spec.timeout))
-                .await,
-            Err(BackendError::Unsupported(_))
-        ));
+        for spec in [spec, policy_spec] {
+            assert!(matches!(
+                ProcessBackend
+                    .spawn(&spec, &RunBudget::new(spec.timeout))
+                    .await,
+                Err(BackendError::Unsupported(_))
+            ));
+        }
     }
 
     #[tokio::test]

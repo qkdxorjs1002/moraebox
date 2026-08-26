@@ -1,5 +1,14 @@
 use super::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
+
+const MAX_MCP_CWD_BYTES: usize = 4096;
+const MAX_MCP_ENV_VARS: usize = 64;
+const MAX_MCP_ENV_NAME_BYTES: usize = 128;
+const MAX_MCP_ENV_VALUE_BYTES: usize = 16 * 1024;
+const MAX_MCP_ENV_TOTAL_BYTES: usize = 256 * 1024;
 
 pub(super) async fn call_tool(
     server: &McpServer,
@@ -62,6 +71,21 @@ pub(super) async fn call_tool(
             .await
             .map(ToolOutput::mirrored),
         "sandbox_box_import" => sandbox_box_import(server, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_checkpoint_create" => sandbox_checkpoint_create(server, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_checkpoint_list" => sandbox_checkpoint_list(server, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_checkpoint_get" => sandbox_checkpoint_get(server, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_checkpoint_delete" => sandbox_checkpoint_delete(server, arguments)
+            .await
+            .map(ToolOutput::mirrored),
+        "sandbox_checkpoint_fork" => sandbox_checkpoint_fork(server, arguments)
             .await
             .map(ToolOutput::mirrored),
         _ => return protocol_error(id, -32602, "unknown tool"),
@@ -285,19 +309,28 @@ impl From<BoxStoreError> for ToolError {
     fn from(error: BoxStoreError) -> Self {
         let message = error.to_string();
         match error {
-            BoxStoreError::NotFound(_) => Self::new(
+            BoxStoreError::NotFound(_) | BoxStoreError::CheckpointNotFound(_) => Self::new(
                 "box_not_found",
                 "box_lookup",
                 false,
                 message,
-                "Use sandbox_box_list to select an existing BoxId.",
+                "Use the corresponding Box or checkpoint list tool to select an existing id.",
             ),
-            BoxStoreError::Busy { .. } | BoxStoreError::BaseDiskBusy { .. } => Self::new(
+            BoxStoreError::Busy { .. }
+            | BoxStoreError::BaseDiskBusy { .. }
+            | BoxStoreError::CheckpointBusy { .. } => Self::new(
                 "box_busy",
                 "box_lock",
                 true,
                 message,
-                "Wait for the current Box operation to finish, then retry.",
+                "Wait for the current Box or checkpoint operation to finish, then retry.",
+            ),
+            BoxStoreError::CheckpointSourceNotReady { .. } => Self::new(
+                "checkpoint_source_not_ready",
+                "checkpoint_create",
+                false,
+                message,
+                "Repair or finish the source Box so it is idle and Ready, then retry.",
             ),
             BoxStoreError::NeedsRepair(_) => Self::new(
                 "box_needs_repair",
@@ -392,7 +425,7 @@ async fn sandbox_exec_with_inline_limit(
     cancellation: Option<oneshot::Receiver<()>>,
     inline_output_bytes: usize,
 ) -> Result<ToolOutput, ExecError> {
-    let args: ExecArgs = serde_json::from_value(arguments)
+    let mut args: ExecArgs = serde_json::from_value(arguments)
         .map_err(|error| ExecError::Failed(ToolError::invalid_arguments(error.to_string())))?;
     if args.argv.is_empty() {
         return Err(ExecError::Failed(ToolError::invalid_arguments(
@@ -404,11 +437,21 @@ async fn sandbox_exec_with_inline_limit(
             "copy_in and copy_out each support at most 64 entries",
         )));
     }
-    let mut spec = RunSpec::command(args.argv);
+    let cwd = args
+        .cwd
+        .as_deref()
+        .map(normalize_guest_cwd)
+        .transpose()
+        .map_err(|message| ExecError::Failed(ToolError::invalid_arguments(message)))?;
+    validate_environment(&args.env)
+        .map_err(|message| ExecError::Failed(ToolError::invalid_arguments(message)))?;
+    let mut spec = RunSpec::command(std::mem::take(&mut args.argv));
+    apply_network_options(&mut spec, &mut args).map_err(ExecError::Failed)?;
     spec.box_id = args.box_id;
+    spec.cwd = cwd;
+    spec.env = args.env;
     spec.image_pull_policy = args.pull_policy;
     spec.tty = args.tty;
-    spec.network = args.network;
     spec.workspace_mode = args.workspace_mode;
     spec.copy_in = args.copy_in;
     spec.copy_out = args.copy_out;
@@ -474,6 +517,88 @@ async fn sandbox_exec_with_inline_limit(
             json!({ "status": status, "next_cursor": 0 }),
         ))
     }
+}
+
+fn apply_network_options(spec: &mut RunSpec, args: &mut ExecArgs) -> Result<(), ToolError> {
+    if args.network && (!args.allow_cidrs.is_empty() || !args.allow_domains.is_empty()) {
+        return Err(ToolError::invalid_arguments(
+            "network=true cannot be combined with allow_cidrs or allow_domains",
+        ));
+    }
+    spec.network = args.network;
+    spec.publish = std::mem::take(&mut args.publish)
+        .into_iter()
+        .map(|request| PublishRequest {
+            protocol: PublishProtocol::Tcp,
+            host_address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            host_port: request.host_port,
+            guest_port: request.guest_port,
+        })
+        .collect();
+    if !args.allow_cidrs.is_empty()
+        || !args.allow_domains.is_empty()
+        || (!spec.publish.is_empty() && !spec.network)
+    {
+        spec.network_policy = Some(NetworkPolicy {
+            mode: NetworkMode::Allowlist,
+            allow_cidrs: std::mem::take(&mut args.allow_cidrs),
+            allow_domains: std::mem::take(&mut args.allow_domains),
+        });
+    }
+    Ok(())
+}
+
+fn normalize_guest_cwd(path: &str) -> Result<PathBuf, String> {
+    let valid = path == "/"
+        || (path.len() >= 2
+            && path.len() <= MAX_MCP_CWD_BYTES
+            && path.starts_with('/')
+            && !path.contains('\0')
+            && path
+                .split('/')
+                .skip(1)
+                .all(|component| !component.is_empty() && !matches!(component, "." | "..")));
+    if !valid {
+        return Err(format!(
+            "cwd must be a normalized absolute guest path of at most {MAX_MCP_CWD_BYTES} bytes"
+        ));
+    }
+    Ok(PathBuf::from(path))
+}
+
+fn validate_environment(env: &BTreeMap<String, String>) -> Result<(), String> {
+    if env.len() > MAX_MCP_ENV_VARS {
+        return Err(format!("env supports at most {MAX_MCP_ENV_VARS} entries"));
+    }
+
+    let mut total_bytes = 0usize;
+    for (name, value) in env {
+        let mut name_chars = name.chars();
+        let valid_name = name.len() <= MAX_MCP_ENV_NAME_BYTES
+            && name_chars
+                .next()
+                .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+            && name_chars.all(|character| character.is_ascii_alphanumeric() || character == '_');
+        if !valid_name {
+            return Err(format!(
+                "env variable names must match [A-Za-z_][A-Za-z0-9_]* and be at most {MAX_MCP_ENV_NAME_BYTES} bytes"
+            ));
+        }
+        if value.len() > MAX_MCP_ENV_VALUE_BYTES || value.contains('\0') {
+            return Err(format!(
+                "env values must be at most {MAX_MCP_ENV_VALUE_BYTES} bytes and must not contain NUL"
+            ));
+        }
+        total_bytes = total_bytes
+            .saturating_add(name.len())
+            .saturating_add(value.len());
+        if total_bytes > MAX_MCP_ENV_TOTAL_BYTES {
+            return Err(format!(
+                "env entries must total at most {MAX_MCP_ENV_TOTAL_BYTES} bytes"
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn sandbox_io(sdk: &SandboxSdk, arguments: Value) -> Result<Value, ToolError> {
@@ -768,12 +893,79 @@ async fn sandbox_box_import(server: &McpServer, arguments: Value) -> Result<Valu
         .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
 }
 
+async fn sandbox_checkpoint_create(
+    server: &McpServer,
+    arguments: Value,
+) -> Result<Value, ToolError> {
+    let args: CheckpointCreateArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    let metadata = server
+        .sdk
+        .create_checkpoint(
+            args.box_id,
+            CreateCheckpoint {
+                name: args.name,
+                labels: args.labels,
+                tags: args.tags,
+            },
+        )
+        .await?;
+    serde_json::to_value(metadata)
+        .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
+}
+
+async fn sandbox_checkpoint_list(server: &McpServer, arguments: Value) -> Result<Value, ToolError> {
+    let _: EmptyArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    let report = server.sdk.list_checkpoints().await?;
+    serde_json::to_value(report)
+        .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
+}
+
+async fn sandbox_checkpoint_get(server: &McpServer, arguments: Value) -> Result<Value, ToolError> {
+    let args: CheckpointIdArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    let metadata = server.sdk.get_checkpoint(args.checkpoint_id).await?;
+    serde_json::to_value(metadata)
+        .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
+}
+
+async fn sandbox_checkpoint_delete(
+    server: &McpServer,
+    arguments: Value,
+) -> Result<Value, ToolError> {
+    let args: ConfirmedCheckpointArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    require_confirmation(args.confirm)?;
+    let metadata = server.sdk.delete_checkpoint(args.checkpoint_id).await?;
+    Ok(json!({ "deleted": metadata.checkpoint_id }))
+}
+
+async fn sandbox_checkpoint_fork(server: &McpServer, arguments: Value) -> Result<Value, ToolError> {
+    let args: CheckpointForkArgs = serde_json::from_value(arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+    require_confirmation(args.confirm)?;
+    let metadata = server
+        .sdk
+        .fork_checkpoint(
+            args.checkpoint_id,
+            ForkCheckpoint {
+                name: args.name,
+                labels: args.labels,
+                tags: args.tags,
+            },
+        )
+        .await?;
+    serde_json::to_value(metadata)
+        .map_err(|error| ToolError::internal("response_serialization", error.to_string()))
+}
+
 fn require_confirmation(confirmed: bool) -> Result<(), ToolError> {
     if confirmed {
         Ok(())
     } else {
         Err(ToolError::invalid_arguments(
-            "confirm must be true for this Box operation",
+            "confirm must be true for this durable storage operation",
         ))
     }
 }
@@ -881,6 +1073,21 @@ fn session_status_schema() -> Value {
                 "anyOf": [{ "type": "string" }, { "type": "null" }],
                 "description": "Actual materialized OCI manifest digest for image-backed sessions."
             },
+            "published_ports": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "protocol": { "type": "string", "enum": ["tcp"] },
+                        "host_address": { "type": "string", "enum": ["127.0.0.1", "::1"] },
+                        "host_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                        "guest_port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+                    },
+                    "required": ["protocol", "host_address", "host_port", "guest_port"],
+                    "additionalProperties": false
+                },
+                "description": "Resolved loopback preview listeners. Auto-assigned host ports appear here after startup."
+            },
             "state": {
                 "type": "string",
                 "enum": ["new", "preparing", "starting", "ready", "running", "stopping", "failed", "timed_out", "dead"]
@@ -897,8 +1104,8 @@ fn session_status_schema() -> Value {
             "elapsed_micros": { "type": "integer", "minimum": 0 }
         },
         "required": [
-            "session_id", "backend", "resolved_image_digest", "state", "termination_reason",
-            "exit_code", "signal", "timed_out", "elapsed_micros"
+            "session_id", "backend", "resolved_image_digest", "published_ports", "state",
+            "termination_reason", "exit_code", "signal", "timed_out", "elapsed_micros"
         ],
         "additionalProperties": false
     })
@@ -1069,6 +1276,63 @@ fn box_list_output_schema() -> Value {
     })
 }
 
+fn checkpoint_metadata_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "schema_version": { "type": "integer", "minimum": 1 },
+            "checkpoint_id": { "type": "string", "format": "uuid" },
+            "source_box_id": { "type": "string", "format": "uuid" },
+            "source_generation": { "type": "integer", "minimum": 0 },
+            "manifest_digest": { "type": "string" },
+            "platform": { "type": "string" },
+            "disk_format": { "type": "string", "enum": ["raw_ext4"] },
+            "virtual_size_bytes": { "type": "integer", "minimum": 1 },
+            "physical_size_bytes": { "type": "integer", "minimum": 0 },
+            "created_at_unix_ms": { "type": "integer", "minimum": 0 },
+            "owner_uid": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+            "name": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+            "labels": { "type": "object", "additionalProperties": { "type": "string" } },
+            "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+        },
+        "required": [
+            "schema_version", "checkpoint_id", "source_box_id", "source_generation",
+            "manifest_digest", "platform", "disk_format", "virtual_size_bytes",
+            "physical_size_bytes", "created_at_unix_ms", "owner_uid", "name", "labels", "tags"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn checkpoint_list_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "checkpoints": { "type": "array", "items": checkpoint_metadata_schema() },
+            "errors": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "entry_name": { "type": "string" },
+                        "checkpoint_id": {
+                            "anyOf": [
+                                { "type": "string", "format": "uuid" },
+                                { "type": "null" }
+                            ]
+                        },
+                        "message": { "type": "string" }
+                    },
+                    "required": ["entry_name", "checkpoint_id", "message"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["checkpoints", "errors"],
+        "additionalProperties": false
+    })
+}
+
 fn deleted_box_output_schema() -> Value {
     json!({
         "type": "object",
@@ -1131,19 +1395,24 @@ pub(super) fn tools_list() -> Value {
             {
                 "name": "sandbox_exec",
                 "title": "Execute in configured runtime",
-                "description": "Start a command in the configured runtime. Every call receives a new SessionId and, with libkrun, a new microVM. Image-backed runs prepare their image lazily within timeout_ms; pull_policy=missing uses the cache first, always refreshes from the registry, and never permits only an existing cache entry. Failures use code image_prepare_failed and stage image_pull, and status.resolved_image_digest reports the actual materialized manifest. Pass box_id only when the command should reuse that Box's persistent root filesystem. Prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default; set network=true to opt in for one native VM run. output_limit_bytes bounds retained output and kill_grace_ms bounds TERM-to-force cleanup; defaults remain 64 MiB and 5000 ms. At most 32 sessions run concurrently. wait=true returns at most 1 MiB inline; when has_more is true, call sandbox_io with the returned SessionId and continuation_cursor within five minutes. Cancelled wait=true runs are cleaned. wait=false starts a session owned by this stdio connection until sandbox_remove or disconnect; completed status and output expire after five minutes. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
+                "description": "Start a command in the configured runtime. Every call receives a new SessionId and, with libkrun, a new microVM. Image-backed runs prepare their image lazily within timeout_ms; pull_policy=missing uses the cache first, always refreshes from the registry, and never permits only an existing cache entry. Failures use code image_prepare_failed and stage image_pull, and status.resolved_image_digest reports the actual materialized manifest. Pass box_id only when the command should reuse that Box's persistent root filesystem. Prefer this for untrusted code, dependency installation, isolated experiments, reproducible Linux checks, or long-running sessions. Network access is disabled by default. Set network=true for unrestricted native-VM egress, or use allow_cidrs/allow_domains for restricted egress. Domain rules permit DNS-correlated TLS SNI; QUIC, ECH-only, and TLS without an observable SNI fail closed. publish exposes loopback-only TCP previews; use wait=false and read status.published_ports to discover auto-assigned host ports. output_limit_bytes bounds retained output and kill_grace_ms bounds TERM-to-force cleanup; defaults remain 64 MiB and 5000 ms. At most 32 sessions run concurrently. wait=true returns at most 1 MiB inline; when has_more is true, call sandbox_io with the returned SessionId and continuation_cursor within five minutes. Cancelled wait=true runs are cleaned. wait=false starts a session owned by this stdio connection until sandbox_remove or disconnect; completed status and output expire after five minutes. Output chunks contain UTF-8 text; invalid byte sequences are replaced with U+FFFD.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "argv": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
                         "stdin_base64": { "type": "string", "maxLength": MAX_MCP_STDIN_BASE64_CHARS },
                         "box_id": { "type": "string", "format": "uuid", "description": "Persistent Box root filesystem to reuse; the microVM and SessionId remain new." },
+                        "cwd": { "type": "string", "minLength": 1, "maxLength": MAX_MCP_CWD_BYTES, "pattern": "^/(?!.*(?:^|/)\\.\\.?(?:/|$))(?:[^/]+(?:/[^/]+)*)?$", "description": "Normalized absolute guest working directory; `/` is also accepted." },
+                        "env": { "type": "object", "maxProperties": MAX_MCP_ENV_VARS, "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "maxLength": MAX_MCP_ENV_NAME_BYTES }, "additionalProperties": { "type": "string", "maxLength": MAX_MCP_ENV_VALUE_BYTES }, "default": {}, "description": "Explicit environment variables only; host environment variables are never inherited." },
                         "pull_policy": { "type": "string", "enum": ["missing", "always", "never"], "default": "missing", "description": "Image acquisition policy for image-backed sessions." },
                         "timeout_ms": { "type": "integer", "minimum": 1 },
                         "unlimited": { "type": "boolean", "default": false },
                         "output_limit_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_OUTPUT_LIMIT, "default": DEFAULT_OUTPUT_LIMIT },
                         "kill_grace_ms": { "type": "integer", "minimum": 1, "maximum": 60_000, "default": DEFAULT_KILL_GRACE.as_millis() },
                         "network": { "type": "boolean", "default": false },
+                        "allow_cidrs": { "type": "array", "maxItems": MAX_NETWORK_CIDRS, "uniqueItems": true, "items": { "type": "string" }, "default": [], "description": "Outbound IPv4/IPv6 CIDRs allowed by the host-side policy relay. Cannot be combined with network=true." },
+                        "allow_domains": { "type": "array", "maxItems": MAX_NETWORK_DOMAINS, "uniqueItems": true, "items": { "type": "string" }, "default": [], "description": "Exact domains or one-label wildcard patterns such as *.example.com. DNS-correlated TLS SNI only; cannot be combined with network=true." },
+                        "publish": { "type": "array", "maxItems": MAX_PUBLISH_REQUESTS, "items": { "type": "object", "properties": { "host_port": { "type": "integer", "minimum": 0, "maximum": 65535, "default": 0, "description": "Loopback host port; 0 requests automatic allocation." }, "guest_port": { "type": "integer", "minimum": 1, "maximum": 65535 } }, "required": ["guest_port"], "additionalProperties": false }, "default": [], "description": "Loopback-only TCP previews. Publishing alone enables only the preview path, not general egress." },
                         "tty": { "type": "boolean", "default": false },
                         "workspace_mode": { "type": "string", "enum": ["read_only", "overlay"], "default": "read_only", "description": "Use overlay only when the MCP server was configured with a workspace disk." },
                         "copy_in": { "type": "array", "maxItems": 64, "items": { "type": "object", "properties": { "source": { "type": "string", "description": "Host file or directory." }, "destination": { "type": "string", "description": "Normalized absolute guest destination." } }, "required": ["source", "destination"], "additionalProperties": false }, "default": [] },
@@ -1378,6 +1647,80 @@ pub(super) fn tools_list() -> Value {
                 },
                 "outputSchema": tool_output_schema(box_metadata_schema()),
                 "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_checkpoint_create",
+                "title": "Create Box checkpoint",
+                "description": "Capture the disk of one idle Ready Box as a new immutable checkpoint. The source Box remains unchanged.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "box_id": { "type": "string", "format": "uuid" },
+                        "name": { "type": "string", "description": "Optional checkpoint display name." },
+                        "labels": { "type": "object", "additionalProperties": { "type": "string" } },
+                        "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+                    },
+                    "required": ["box_id"],
+                    "additionalProperties": false
+                },
+                "outputSchema": tool_output_schema(checkpoint_metadata_schema()),
+                "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_checkpoint_list",
+                "title": "List Box checkpoints",
+                "description": "List valid immutable checkpoints and report corrupt entries without following unsafe paths.",
+                "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+                "outputSchema": tool_output_schema(checkpoint_list_output_schema()),
+                "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_checkpoint_get",
+                "title": "Get Box checkpoint",
+                "description": "Read validated metadata for one immutable checkpoint.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "checkpoint_id": { "type": "string", "format": "uuid" } },
+                    "required": ["checkpoint_id"],
+                    "additionalProperties": false
+                },
+                "outputSchema": tool_output_schema(checkpoint_metadata_schema()),
+                "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_checkpoint_delete",
+                "title": "Delete Box checkpoint",
+                "description": "Permanently delete one idle immutable checkpoint. confirm must be true.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "checkpoint_id": { "type": "string", "format": "uuid" },
+                        "confirm": { "type": "boolean", "description": "Explicitly authorize permanent deletion." }
+                    },
+                    "required": ["checkpoint_id", "confirm"],
+                    "additionalProperties": false
+                },
+                "outputSchema": tool_output_schema(deleted_box_output_schema()),
+                "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false }
+            },
+            {
+                "name": "sandbox_checkpoint_fork",
+                "title": "Fork Box checkpoint",
+                "description": "Create a new independent writable Ready Box from one immutable checkpoint. confirm must be true because this allocates durable state.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "checkpoint_id": { "type": "string", "format": "uuid" },
+                        "confirm": { "type": "boolean" },
+                        "name": { "type": "string", "description": "Optional unique name for the new Box." },
+                        "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Replacement labels; omit to inherit checkpoint labels." },
+                        "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "description": "Replacement tags; omit to inherit checkpoint tags." }
+                    },
+                    "required": ["checkpoint_id", "confirm"],
+                    "additionalProperties": false
+                },
+                "outputSchema": tool_output_schema(box_metadata_schema()),
+                "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
             }
         ]
     })
@@ -1390,12 +1733,17 @@ struct ExecArgs {
     argv: Vec<String>,
     stdin_base64: Option<String>,
     box_id: Option<BoxId>,
+    cwd: Option<String>,
+    env: BTreeMap<String, String>,
     pull_policy: ImagePullPolicy,
     timeout_ms: Option<u64>,
     unlimited: bool,
     output_limit_bytes: Option<usize>,
     kill_grace_ms: Option<u64>,
     network: bool,
+    allow_cidrs: Vec<String>,
+    allow_domains: Vec<String>,
+    publish: Vec<ExecPublishArgs>,
     tty: bool,
     workspace_mode: WorkspaceMode,
     copy_in: Vec<CopyInSpec>,
@@ -1410,12 +1758,17 @@ impl Default for ExecArgs {
             argv: Vec::new(),
             stdin_base64: None,
             box_id: None,
+            cwd: None,
+            env: BTreeMap::new(),
             pull_policy: ImagePullPolicy::Missing,
             timeout_ms: None,
             unlimited: false,
             output_limit_bytes: None,
             kill_grace_ms: None,
             network: false,
+            allow_cidrs: Vec::new(),
+            allow_domains: Vec::new(),
+            publish: Vec::new(),
             tty: false,
             workspace_mode: WorkspaceMode::ReadOnly,
             copy_in: Vec::new(),
@@ -1424,6 +1777,13 @@ impl Default for ExecArgs {
             wait: true,
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ExecPublishArgs {
+    host_port: u16,
+    guest_port: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1532,6 +1892,44 @@ struct ConfirmedBoxArgs {
     confirm: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointCreateArgs {
+    box_id: BoxId,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+    #[serde(default)]
+    tags: BTreeSet<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointIdArgs {
+    checkpoint_id: CheckpointId,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmedCheckpointArgs {
+    checkpoint_id: CheckpointId,
+    confirm: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointForkArgs {
+    checkpoint_id: CheckpointId,
+    confirm: bool,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    labels: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    tags: Option<BTreeSet<String>>,
+}
+
 fn platform_name(platform: &Platform) -> String {
     match &platform.variant {
         Some(variant) => format!("{}/{}/{}", platform.os, platform.architecture, variant),
@@ -1616,7 +2014,7 @@ mod tests {
             .get("tools")
             .and_then(Value::as_array)
             .expect("tools list");
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 20);
         assert!(tools.iter().all(|tool| tool.get("outputSchema").is_some()));
         assert!(tools.iter().all(|tool| {
             tool.pointer("/outputSchema/oneOf/1/properties/error")
@@ -1652,6 +2050,8 @@ mod tests {
             "sandbox_session_status",
             "sandbox_box_list",
             "sandbox_box_get",
+            "sandbox_checkpoint_list",
+            "sandbox_checkpoint_get",
         ] {
             assert_eq!(
                 advertised(name).pointer("/annotations/readOnlyHint"),
@@ -1659,7 +2059,11 @@ mod tests {
                 "{name} must be read-only"
             );
         }
-        for name in ["sandbox_box_delete", "sandbox_box_reset"] {
+        for name in [
+            "sandbox_box_delete",
+            "sandbox_box_reset",
+            "sandbox_checkpoint_delete",
+        ] {
             assert_eq!(
                 advertised(name).pointer("/annotations/destructiveHint"),
                 Some(&json!(true)),
@@ -1682,6 +2086,21 @@ mod tests {
             advertised("sandbox_box_create")
                 .pointer("/outputSchema/oneOf/0/properties/owner_uid/anyOf/1/type"),
             Some(&json!("null"))
+        );
+        assert_eq!(
+            advertised("sandbox_exec")
+                .pointer("/inputSchema/properties/publish/items/properties/host_port/minimum"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            advertised("sandbox_exec").pointer("/inputSchema/properties/allow_cidrs/maxItems"),
+            Some(&json!(MAX_NETWORK_CIDRS))
+        );
+        assert_eq!(
+            advertised("sandbox_exec").pointer(
+                "/outputSchema/oneOf/0/oneOf/1/properties/status/properties/published_ports/type"
+            ),
+            Some(&json!("array"))
         );
     }
 
@@ -1817,6 +2236,28 @@ mod tests {
         assert_eq!(
             list.pointer("/result/tools/0/inputSchema/properties/workspace_mode/enum"),
             Some(&json!(["read_only", "overlay"]))
+        );
+        assert_eq!(
+            list.pointer("/result/tools/0/inputSchema/properties/cwd/type"),
+            Some(&json!("string"))
+        );
+        assert_eq!(
+            list.pointer("/result/tools/0/inputSchema/properties/cwd/maxLength"),
+            Some(&json!(MAX_MCP_CWD_BYTES))
+        );
+        assert_eq!(
+            list.pointer("/result/tools/0/inputSchema/properties/env/maxProperties"),
+            Some(&json!(MAX_MCP_ENV_VARS))
+        );
+        assert_eq!(
+            list.pointer("/result/tools/0/inputSchema/properties/env/propertyNames/pattern"),
+            Some(&json!("^[A-Za-z_][A-Za-z0-9_]*$"))
+        );
+        assert_eq!(
+            list.pointer(
+                "/result/tools/0/inputSchema/properties/env/additionalProperties/maxLength"
+            ),
+            Some(&json!(MAX_MCP_ENV_VALUE_BYTES))
         );
     }
 
@@ -2018,6 +2459,26 @@ mod tests {
                 "copy-out requires",
             ),
             (
+                "sandbox_exec",
+                json!({ "argv": successful_command(), "cwd": "relative" }),
+                "cwd must be a normalized absolute guest path",
+            ),
+            (
+                "sandbox_exec",
+                json!({ "argv": successful_command(), "cwd": "/workspace/../host" }),
+                "cwd must be a normalized absolute guest path",
+            ),
+            (
+                "sandbox_exec",
+                json!({ "argv": successful_command(), "env": { "1INVALID": "value" } }),
+                "env variable names",
+            ),
+            (
+                "sandbox_exec",
+                json!({ "argv": successful_command(), "env": { "VALID": "bad\u{0000}value" } }),
+                "env values",
+            ),
+            (
                 "sandbox_io",
                 json!({ "session_id": SessionId::new(), "max_bytes": 0 }),
                 "max_bytes must be between",
@@ -2074,6 +2535,60 @@ mod tests {
                 "expected {expected:?} in {message:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn exec_handler_rejects_an_oversized_environment() {
+        let server = test_server(SandboxSdk::new(Arc::new(ProcessBackend)));
+        let env = (0..=MAX_MCP_ENV_VARS)
+            .map(|index| (format!("VAR_{index}"), String::from("value")))
+            .collect::<BTreeMap<_, _>>();
+        let response = call(
+            &server,
+            "sandbox_exec",
+            json!({ "argv": successful_command(), "env": env }),
+        )
+        .await;
+
+        assert_eq!(response.pointer("/result/isError"), Some(&json!(true)));
+        assert_eq!(
+            response.pointer("/result/structuredContent/error/code"),
+            Some(&json!("invalid_arguments"))
+        );
+        assert!(
+            response
+                .pointer("/result/structuredContent/error/message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("at most 64 entries"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_handler_maps_cwd_and_explicit_environment() {
+        let sdk = SandboxSdk::new(Arc::new(ProcessBackend));
+        let result = sandbox_exec_with_inline_limit(
+            &sdk,
+            json!({
+                "argv": ["/bin/sh", "-c", "printf '%s:' \"$MORAEBOX_MCP_TEST\"; /bin/pwd"],
+                "cwd": "/",
+                "env": { "MORAEBOX_MCP_TEST": "explicit" }
+            }),
+            None,
+            1024,
+        )
+        .await
+        .unwrap();
+
+        let output = result
+            .structured_content
+            .get("output")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|chunk| chunk.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        assert_eq!(output, "explicit:/\n");
     }
 
     #[test]
@@ -2146,27 +2661,55 @@ mod tests {
     #[tokio::test]
     async fn process_backend_rejects_vm_network_opt_in() {
         let server = test_server(SandboxSdk::new(Arc::new(ProcessBackend)));
+        for arguments in [
+            json!({"argv":successful_command(),"network":true}),
+            json!({"argv":successful_command(),"allow_cidrs":["203.0.113.0/24"]}),
+            json!({"argv":successful_command(),"publish":[{"guest_port":3000}]}),
+        ] {
+            let call = handle_request(
+                &server,
+                json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"sandbox_exec","arguments":arguments}
+                }),
+            )
+            .await;
+
+            assert_eq!(call.pointer("/result/isError"), Some(&json!(true)));
+            assert!(
+                call.pointer("/result/structuredContent/error/message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|error| error.contains("without VM isolation"))
+            );
+            assert_eq!(
+                call.pointer("/result/structuredContent/error/code"),
+                Some(&json!("unsupported_capability"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unrestricted_and_allowlist_network_options_conflict() {
+        let server = test_server(SandboxSdk::new(Arc::new(ProcessBackend)));
         let call = handle_request(
             &server,
             json!({
                 "jsonrpc":"2.0","id":1,"method":"tools/call",
                 "params":{
                     "name":"sandbox_exec",
-                    "arguments":{"argv":successful_command(),"network":true}
+                    "arguments":{
+                        "argv":successful_command(),
+                        "network":true,
+                        "allow_domains":["example.com"]
+                    }
                 }
             }),
         )
         .await;
 
-        assert_eq!(call.pointer("/result/isError"), Some(&json!(true)));
-        assert!(
-            call.pointer("/result/structuredContent/error/message")
-                .and_then(Value::as_str)
-                .is_some_and(|error| error.contains("without VM isolation"))
-        );
         assert_eq!(
             call.pointer("/result/structuredContent/error/code"),
-            Some(&json!("unsupported_capability"))
+            Some(&json!("invalid_arguments"))
         );
     }
 
@@ -2298,6 +2841,100 @@ mod tests {
         )
         .await;
         assert_eq!(deleted.pointer("/result/isError"), Some(&json!(false)));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_create_list_get_fork_and_delete_work() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source.ext4");
+        let file = std::fs::File::create(&source).unwrap();
+        file.set_len(1024 * 1024).unwrap();
+        let store = BoxStore::new(temporary.path().join("state"));
+        let box_metadata = store
+            .create(
+                &CreateBox::new("sha256:test", "linux/arm64", 1024 * 1024),
+                &source,
+            )
+            .unwrap();
+        let server =
+            test_server(SandboxSdk::new(Arc::new(ProcessBackend)).with_box_store(store.clone()));
+
+        let created = call(
+            &server,
+            "sandbox_checkpoint_create",
+            json!({
+                "box_id": box_metadata.box_id,
+                "name": "baseline",
+                "labels": {"suite": "smoke"},
+                "tags": ["known-good"]
+            }),
+        )
+        .await;
+        assert_eq!(created.pointer("/result/isError"), Some(&json!(false)));
+        let checkpoint_id: CheckpointId = serde_json::from_value(
+            created
+                .pointer("/result/structuredContent/checkpoint_id")
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        let listed = call(&server, "sandbox_checkpoint_list", json!({})).await;
+        assert_eq!(
+            listed.pointer("/result/structuredContent/checkpoints/0/checkpoint_id"),
+            Some(&json!(checkpoint_id))
+        );
+        let fetched = call(
+            &server,
+            "sandbox_checkpoint_get",
+            json!({"checkpoint_id": checkpoint_id}),
+        )
+        .await;
+        assert_eq!(
+            fetched.pointer("/result/structuredContent/name"),
+            Some(&json!("baseline"))
+        );
+        let unconfirmed_fork = call(
+            &server,
+            "sandbox_checkpoint_fork",
+            json!({"checkpoint_id": checkpoint_id, "confirm": false}),
+        )
+        .await;
+        assert_eq!(
+            unconfirmed_fork.pointer("/result/isError"),
+            Some(&json!(true))
+        );
+        let forked = call(
+            &server,
+            "sandbox_checkpoint_fork",
+            json!({"checkpoint_id": checkpoint_id, "confirm": true, "name": "forked"}),
+        )
+        .await;
+        assert_eq!(forked.pointer("/result/isError"), Some(&json!(false)));
+        assert_ne!(
+            forked.pointer("/result/structuredContent/box_id"),
+            Some(&json!(box_metadata.box_id))
+        );
+        let unconfirmed_delete = call(
+            &server,
+            "sandbox_checkpoint_delete",
+            json!({"checkpoint_id": checkpoint_id, "confirm": false}),
+        )
+        .await;
+        assert_eq!(
+            unconfirmed_delete.pointer("/result/isError"),
+            Some(&json!(true))
+        );
+        let deleted = call(
+            &server,
+            "sandbox_checkpoint_delete",
+            json!({"checkpoint_id": checkpoint_id, "confirm": true}),
+        )
+        .await;
+        assert_eq!(deleted.pointer("/result/isError"), Some(&json!(false)));
+        assert!(matches!(
+            store.get_checkpoint(checkpoint_id),
+            Err(BoxStoreError::CheckpointNotFound(_))
+        ));
     }
 
     #[test]
