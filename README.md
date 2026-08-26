@@ -75,7 +75,7 @@ morae --cache-dir /var/tmp/morae-cache image list --json
 morae image list --cache-dir /var/tmp/morae-cache --json
 ```
 
-The precedence is an explicit CLI option, then its `MORAE_*` environment variable, then automatic discovery or the user-wide default. Storage uses `MORAE_CACHE_DIR` and `MORAE_STATE_DIR`. Native dependency overrides use `MORAE_HELPER_PATH`, `MORAE_LIBKRUN_PATH`, `MORAE_GVPROXY_PATH`, `MORAE_LIB_DIR`, `MORAE_MKE2FS`, and `MORAE_E2FSCK`. There is no implicit project configuration file, so changing directories does not change this resolution order. Registry credentials and `MORAE_ROOTFS` remain scoped to commands that consume them.
+The precedence is an explicit CLI option, then its `MORAE_*` environment variable, then automatic discovery or the user-wide default. Storage uses `MORAE_CACHE_DIR` and `MORAE_STATE_DIR`. Native dependency overrides use `MORAE_HELPER_PATH`, `MORAE_LIBKRUN_PATH`, `MORAE_GVPROXY_PATH`, `MORAE_LIB_DIR`, `MORAE_MKE2FS`, and `MORAE_E2FSCK`. There is no implicitly loaded project configuration file, so changing directories does not change this resolution order. A `morae.toml` file is read only when `run --profile` or a `profile` inspection command explicitly selects it. Registry credentials and `MORAE_ROOTFS` remain scoped to commands that consume them.
 
 Generate completion code for the current shell with:
 
@@ -84,6 +84,51 @@ source <(morae completion bash)
 source <(morae completion zsh)
 morae completion fish | source
 ```
+
+### Reuse an explicit execution profile
+
+Put repeatable, non-secret run settings in a versioned `morae.toml`:
+
+```toml
+version = 1
+
+[profiles.dev]
+backend = "libkrun"
+image = "python:3.12"
+command = ["python", "-m", "app"]
+cpus = 2
+memory_mib = 1024
+workspace = "."
+timeout = "30m"
+output_limit = "64MiB"
+kill_grace = "5s"
+tty = false
+
+[profiles.dev.env]
+APP_ENV = "development"
+
+[profiles.dev.network]
+mode = "allowlist"
+allow_domains = ["api.example.com"]
+
+[[profiles.dev.publish]]
+guest_port = 3000
+host_port = 0
+```
+
+Profiles are opt-in. `--profile` without `--config` reads only `./morae.toml`; it never searches parent directories. Use an exact alternate path when needed:
+
+```sh
+morae profile validate
+morae profile list --config ./ops/morae.toml
+morae run --profile dev
+morae run --config ./ops/morae.toml --profile ci
+morae run --profile dev -- pytest -q  # CLI argv replaces profile command
+```
+
+Resolution is built-in defaults, then the profile, then explicit CLI values. CLI `--env` replaces a profile value with the same key; repeated CLI allowlist and publish values extend the profile lists. `--network` replaces a profile policy with unrestricted networking. `--no-network`, `--no-tty`, and `--workspace-read-only` explicitly disable corresponding profile settings.
+
+Version 1 accepts argv arrays, backend, image or Box, pull policy, CPU/memory/disk limits, a workspace confined to the profile file's directory, normalized guest cwd, literal env values, timeout/output/kill-grace controls, TTY, network policy, and loopback TCP previews. It deliberately rejects unknown fields, shell command strings, inheritance/includes, variable interpolation, registry credentials, host runtime/storage paths, rootfs, `inherit_env`, stdin/interactive settings, and host copy paths. Do not commit secrets as literal env values. A normal `morae run` ignores even a malformed `morae.toml` unless a profile is explicitly selected.
 
 ### Choose resources and a timeout
 

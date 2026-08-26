@@ -9,6 +9,8 @@ use moraebox_runtime::{
 use moraebox_sdk::NativeConfigurationError;
 use thiserror::Error;
 
+use crate::profile::ProfileError;
+
 #[derive(Debug, Error)]
 pub(super) enum CliErrorSource {
     #[error("{0}")]
@@ -33,6 +35,8 @@ pub(super) enum CliErrorSource {
     Session(#[from] SessionError),
     #[error(transparent)]
     NativeConfiguration(#[from] NativeConfigurationError),
+    #[error(transparent)]
+    Profile(#[from] ProfileError),
     #[error("{message}")]
     Stage {
         stage: RunStage,
@@ -120,6 +124,15 @@ pub(super) struct CliError {
 
 impl CliError {
     pub(super) fn for_command(default_stage: &'static str, source: CliErrorSource) -> Self {
+        if matches!(source, CliErrorSource::Profile(_)) {
+            return Self {
+                code: "profile_invalid",
+                stage: "profile_load".into(),
+                retryable: false,
+                remediation: "Fix the selected morae.toml file or choose another --config/--profile, then retry.",
+                source: Box::new(source),
+            };
+        }
         let (default_code, remediation) = command_metadata(default_stage);
         let stage = source
             .stage()
@@ -139,6 +152,11 @@ fn command_metadata(stage: &str) -> (&'static str, &'static str) {
         (
             "execution_failed",
             "Review the command, backend options, and diagnostics, then retry.",
+        )
+    } else if stage.starts_with("profile_") {
+        (
+            "profile_operation_failed",
+            "Inspect the selected morae.toml path and profile syntax, then retry.",
         )
     } else if stage.starts_with("image_") {
         (

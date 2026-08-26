@@ -66,6 +66,51 @@ morae run -- python3 -c 'print("hello from moraebox")'
 
 ## CLI 사용법
 
+### 명시적 실행 profile 재사용
+
+반복해서 쓰는 비밀이 아닌 실행 설정은 versioned `morae.toml`에 저장할 수 있습니다.
+
+```toml
+version = 1
+
+[profiles.dev]
+backend = "libkrun"
+image = "python:3.12"
+command = ["python", "-m", "app"]
+cpus = 2
+memory_mib = 1024
+workspace = "."
+timeout = "30m"
+output_limit = "64MiB"
+kill_grace = "5s"
+tty = false
+
+[profiles.dev.env]
+APP_ENV = "development"
+
+[profiles.dev.network]
+mode = "allowlist"
+allow_domains = ["api.example.com"]
+
+[[profiles.dev.publish]]
+guest_port = 3000
+host_port = 0
+```
+
+profile은 opt-in입니다. `--config` 없이 `--profile`을 사용하면 현재 디렉터리의 `./morae.toml` 하나만 읽고 상위 디렉터리를 탐색하지 않습니다.
+
+```sh
+morae profile validate
+morae profile list --config ./ops/morae.toml
+morae run --profile dev
+morae run --config ./ops/morae.toml --profile ci
+morae run --profile dev -- pytest -q  # CLI argv가 profile command를 대체
+```
+
+우선순위는 내장 기본값, profile, 명시적 CLI 순서입니다. CLI `--env`는 같은 key의 profile 값을 덮어쓰고 CLI allowlist·publish 항목은 profile 목록에 추가됩니다. `--network`는 profile policy를 unrestricted로 대체합니다. `--no-network`, `--no-tty`, `--workspace-read-only`로 profile의 해당 설정을 명시적으로 끌 수 있습니다.
+
+version 1은 argv 배열, backend, image 또는 Box, pull policy, CPU/memory/disk, profile 파일 디렉터리 내부로 제한된 workspace, 정규화된 guest cwd, literal env, timeout/output/kill-grace, TTY, network policy와 loopback TCP preview를 지원합니다. unknown field, shell command 문자열, 상속/include, 변수 치환, registry credential, host runtime/storage path, rootfs, `inherit_env`, stdin/interactive와 host copy path는 거부합니다. literal env에 비밀을 넣어 commit하지 마십시오. 일반 `morae run`은 명시적으로 profile을 선택하지 않는 한 잘못된 `morae.toml`도 읽지 않습니다.
+
 ### 리소스와 타임아웃 지정
 
 ```sh

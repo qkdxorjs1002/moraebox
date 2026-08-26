@@ -40,6 +40,7 @@ use tokio::io::AsyncWriteExt;
 mod commands;
 mod errors;
 mod interactive;
+mod profile;
 
 use commands::{
     execute, exit_code, parse_box_label, parse_box_label_filter, parse_box_label_key,
@@ -132,6 +133,11 @@ enum Command {
     Doctor(DoctorArgs),
     /// Run one command and destroy its sandbox when it exits.
     Run(Box<RunArgs>),
+    /// Inspect and validate explicit morae.toml execution profiles.
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
     /// Pull and prepare OCI images without a container daemon.
     Image {
         #[command(subcommand)]
@@ -151,6 +157,22 @@ enum Command {
     Benchmark(Box<BenchmarkArgs>),
     /// Generate shell completion code on stdout.
     Completion(CompletionArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileCommand {
+    /// List profile names after validating the entire file.
+    #[command(visible_alias = "ls")]
+    List(ProfileFileArgs),
+    /// Parse and semantically validate the entire profile file.
+    Validate(ProfileFileArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProfileFileArgs {
+    /// Exact profile file path. Defaults to ./morae.toml without parent discovery.
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -241,9 +263,15 @@ struct DoctorArgs {
 #[derive(Debug, Args)]
 #[allow(clippy::struct_excessive_bools)]
 struct RunArgs {
+    /// Load NAME from an explicitly selected morae.toml execution profile.
+    #[arg(long)]
+    profile: Option<String>,
+    /// Profile file path. Requires --profile; defaults to ./morae.toml.
+    #[arg(long, requires = "profile")]
+    config: Option<PathBuf>,
     /// Execution backend. `process` is deterministic but is not isolated.
-    #[arg(long, default_value = "libkrun", value_parser = ["process", "libkrun"])]
-    backend: String,
+    #[arg(long, value_parser = ["process", "libkrun"])]
+    backend: Option<String>,
     /// Use an already materialized guest root directory instead of a managed image.
     #[arg(long, env = "MORAE_ROOTFS")]
     rootfs: Option<PathBuf>,
@@ -251,26 +279,29 @@ struct RunArgs {
     #[arg(long)]
     image: Option<String>,
     /// Image acquisition policy: cache-first, forced refresh, or cache-only.
-    #[arg(long = "pull", default_value_t = ImagePullPolicy::Missing)]
-    pull_policy: ImagePullPolicy,
+    #[arg(long = "pull")]
+    pull_policy: Option<ImagePullPolicy>,
     /// Reuse the persistent root filesystem identified by this `BoxId` or name.
     #[arg(long = "box", conflicts_with_all = ["rootfs", "image", "workspace"])]
     box_id: Option<String>,
-    #[arg(long, default_value_t = 2)]
-    cpus: u8,
-    #[arg(long, default_value_t = 512)]
-    memory_mib: u32,
+    #[arg(long)]
+    cpus: Option<u8>,
+    #[arg(long)]
+    memory_mib: Option<u32>,
     /// Host directory to copy into an immutable read-only ext4 guest workspace.
     #[arg(long)]
     workspace: Option<PathBuf>,
     /// Give /workspace a disposable writable overlay while preserving the snapshot lower.
-    #[arg(long, requires = "workspace")]
+    #[arg(long, conflicts_with = "workspace_read_only")]
     workspace_writable: bool,
+    /// Override a writable profile workspace with read-only attachment.
+    #[arg(long, conflicts_with = "workspace_writable")]
+    workspace_read_only: bool,
     /// Atomically copy the final /workspace tree to this new host path.
-    #[arg(long, requires = "workspace")]
+    #[arg(long)]
     workspace_copy_out: Option<PathBuf>,
     /// Write an add/modify/delete JSON manifest to this new host path.
-    #[arg(long, requires = "workspace_writable")]
+    #[arg(long)]
     workspace_diff: Option<PathBuf>,
     /// Copy HOST source to an absolute GUEST destination, formatted HOST=GUEST.
     #[arg(long = "copy-in", value_parser = parse_copy_in)]
@@ -291,20 +322,23 @@ struct RunArgs {
     )]
     registry_password: Option<String>,
     /// Virtual root disk size for an ephemeral image-backed run.
-    #[arg(long, default_value = "8GiB", value_parser = parse_disk_size)]
-    disk_size: u64,
+    #[arg(long, value_parser = parse_disk_size)]
+    disk_size: Option<u64>,
     /// Sandbox wall timeout, for example 30s, 1h, or none.
-    #[arg(long, default_value = "1h")]
-    timeout: String,
+    #[arg(long)]
+    timeout: Option<String>,
     /// Maximum retained output, for example 8MiB or 128MB.
-    #[arg(long, default_value = "64MiB", value_parser = parse_output_limit)]
-    output_limit: usize,
+    #[arg(long, value_parser = parse_output_limit)]
+    output_limit: Option<usize>,
     /// Grace period between graceful termination and forced cleanup.
-    #[arg(long, default_value = "5s", value_parser = parse_kill_grace)]
-    kill_grace: Duration,
+    #[arg(long, value_parser = parse_kill_grace)]
+    kill_grace: Option<Duration>,
     /// Allocate a pseudo-terminal (native backend).
-    #[arg(short = 't', long)]
+    #[arg(short = 't', long, conflicts_with = "no_tty")]
     tty: bool,
+    /// Override a TTY-enabled profile without allocating a pseudo-terminal.
+    #[arg(long, conflicts_with = "tty")]
+    no_tty: bool,
     /// Forward stdin even when the host stdin is a terminal.
     #[arg(short = 'i', long)]
     interactive: bool,
@@ -312,8 +346,11 @@ struct RunArgs {
     #[arg(long)]
     inherit_env: bool,
     /// Allow outbound network access from the native VM.
-    #[arg(long, conflicts_with_all = ["allow_cidrs", "allow_domains"])]
+    #[arg(long, conflicts_with_all = ["no_network", "allow_cidrs", "allow_domains"])]
     network: bool,
+    /// Disable profile networking and published preview ports.
+    #[arg(long, conflicts_with_all = ["network", "allow_cidrs", "allow_domains", "publish"])]
+    no_network: bool,
     /// Allow outbound traffic to a CIDR (repeatable, native VM only).
     #[arg(long = "allow-cidr")]
     allow_cidrs: Vec<String>,
@@ -328,7 +365,42 @@ struct RunArgs {
     /// Add one guest environment value as KEY=VALUE.
     #[arg(short = 'e', long = "env", value_parser = parse_env)]
     env: Vec<(String, String)>,
-    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
+}
+
+#[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
+struct ResolvedRunArgs {
+    backend: String,
+    rootfs: Option<PathBuf>,
+    image: Option<String>,
+    pull_policy: ImagePullPolicy,
+    box_id: Option<String>,
+    cpus: u8,
+    memory_mib: u32,
+    workspace: Option<PathBuf>,
+    workspace_writable: bool,
+    workspace_copy_out: Option<PathBuf>,
+    workspace_diff: Option<PathBuf>,
+    copy_in: Vec<CopyInSpec>,
+    copy_out: Vec<CopyOutSpec>,
+    copy_limit: usize,
+    registry_username: Option<String>,
+    registry_password: Option<String>,
+    disk_size: u64,
+    timeout: String,
+    output_limit: usize,
+    kill_grace: Duration,
+    tty: bool,
+    interactive: bool,
+    inherit_env: bool,
+    network: bool,
+    allow_cidrs: Vec<String>,
+    allow_domains: Vec<String>,
+    publish: Vec<PublishRequest>,
+    cwd: Option<PathBuf>,
+    env: Vec<(String, String)>,
     command: Vec<String>,
 }
 
@@ -742,6 +814,12 @@ fn command_stage(command: &Command) -> &'static str {
     match command {
         Command::Doctor(_) => "doctor",
         Command::Run(_) => "run",
+        Command::Profile {
+            command: ProfileCommand::List(_),
+        } => "profile_list",
+        Command::Profile {
+            command: ProfileCommand::Validate(_),
+        } => "profile_validate",
         Command::Image {
             command: ImageCommand::Pull(_),
         } => "image_pull",

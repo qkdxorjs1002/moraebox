@@ -13,11 +13,11 @@ use super::{
     IsolationLevel, LibkrunBackend, MAX_KILL_GRACE, MAX_OUTPUT_LIMIT, ManagedStorage,
     NativeRuntimeOverrides, NativeRuntimePaths, NativeSandboxConfig, NetworkMode, NetworkPolicy,
     OutputChannel, Path, Platform, PoolConfig, PreparedImage, PreparedRootPool, ProcessBackend,
-    PruneReport, PublishProtocol, PublishRequest, Read, RemoveReport, RootfsMetadataIssueKind,
-    RunArgs, RunBudget, RunSpec, RunStage, Serialize, StoragePaths, Supervisor, TimeoutPolicy,
-    UpdateBox, WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode, WorkspaceSnapshot, WorkspaceStage, Write,
-    command_stage, fs, io, resolve_cache_dir, resolve_state_dir, run_interactive,
-    stderr_line_ending,
+    ProfileCommand, ProfileFileArgs, PruneReport, PublishProtocol, PublishRequest, Read,
+    RemoveReport, RootfsMetadataIssueKind, RunArgs, RunBudget, RunSpec, RunStage, Serialize,
+    StoragePaths, Supervisor, TimeoutPolicy, UpdateBox, WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode,
+    WorkspaceSnapshot, WorkspaceStage, Write, command_stage, fs, io, profile, resolve_cache_dir,
+    resolve_state_dir, run_interactive, stderr_line_ending,
 };
 use futures_util::{StreamExt, stream};
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,6 +34,12 @@ pub(super) async fn execute(cli: Cli) -> Result<i32, CliError> {
     let result = match command {
         Command::Doctor(args) => doctor(&args, &global),
         Command::Run(args) => run(*args, &global).await,
+        Command::Profile {
+            command: ProfileCommand::List(args),
+        } => profile_list(&args, &global),
+        Command::Profile {
+            command: ProfileCommand::Validate(args),
+        } => profile_validate(&args, &global),
         Command::Image {
             command: ImageCommand::Pull(args),
         } => image_pull(args, &global).await,
@@ -138,10 +144,6 @@ struct StorageUse {
 
 fn storage_use(command: &Command) -> StorageUse {
     match command {
-        Command::Run(args) if args.backend == "libkrun" => StorageUse {
-            cache: true,
-            state: true,
-        },
         Command::Image { .. } | Command::Cache { .. } => StorageUse {
             cache: true,
             state: false,
@@ -160,9 +162,11 @@ fn storage_use(command: &Command) -> StorageUse {
             cache: true,
             state: true,
         },
-        Command::Doctor(_) | Command::Run(_) | Command::Benchmark(_) | Command::Completion(_) => {
-            StorageUse::default()
-        }
+        Command::Doctor(_)
+        | Command::Run(_)
+        | Command::Profile { .. }
+        | Command::Benchmark(_)
+        | Command::Completion(_) => StorageUse::default(),
     }
 }
 
@@ -216,6 +220,46 @@ fn project_local_storage_warning(
 fn completion(args: &CompletionArgs) {
     let mut command = Cli::command();
     clap_complete::generate(args.shell, &mut command, "morae", &mut io::stdout());
+}
+
+fn profile_list(args: &ProfileFileArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
+    let loaded = profile::load_profiles(args.config.as_deref())?;
+    let names = loaded.names().collect::<Vec<_>>();
+    if global.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": loaded.path(),
+                "profiles": names,
+            }))?
+        );
+    } else {
+        for name in names {
+            println!("{name}");
+        }
+    }
+    Ok(0)
+}
+
+fn profile_validate(args: &ProfileFileArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
+    let loaded = profile::load_profiles(args.config.as_deref())?;
+    let profile_count = loaded.names().count();
+    if global.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": loaded.path(),
+                "valid": true,
+                "profile_count": profile_count,
+            }))?
+        );
+    } else {
+        println!(
+            "valid: {} ({profile_count} profiles)",
+            loaded.path().display()
+        );
+    }
+    Ok(0)
 }
 
 fn doctor(args: &DoctorArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
@@ -290,6 +334,31 @@ fn doctor(args: &DoctorArgs, global: &GlobalOptions) -> Result<i32, CliErrorSour
 
 #[allow(clippy::too_many_lines)]
 async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, CliErrorSource> {
+    let args = profile::resolve_run_args(args)?;
+    if args.command.is_empty() {
+        return Err("a command is required either in the selected profile or after `--`".into());
+    }
+    if args.workspace.is_none()
+        && (args.workspace_writable
+            || args.workspace_copy_out.is_some()
+            || args.workspace_diff.is_some())
+    {
+        return Err("workspace options require a CLI or profile workspace".into());
+    }
+    if args.workspace_diff.is_some() && !args.workspace_writable {
+        return Err("--workspace-diff requires a writable workspace".into());
+    }
+    warn_project_local_storage(
+        global,
+        if args.backend == "libkrun" {
+            StorageUse {
+                cache: true,
+                state: true,
+            }
+        } else {
+            StorageUse::default()
+        },
+    );
     if args.interactive && global.json {
         return Err("--interactive cannot be combined with --json".into());
     }
@@ -2069,7 +2138,7 @@ pub(super) fn parse_kill_grace(input: &str) -> Result<Duration, String> {
     Ok(duration)
 }
 
-fn parse_timeout(input: &str) -> Result<TimeoutPolicy, CliErrorSource> {
+pub(super) fn parse_timeout(input: &str) -> Result<TimeoutPolicy, CliErrorSource> {
     if input.eq_ignore_ascii_case("none") || input == "0" {
         return Ok(TimeoutPolicy::Unlimited);
     }
@@ -2295,6 +2364,7 @@ mod tests {
         let Command::Run(defaults) = defaults.command else {
             panic!("expected run command");
         };
+        let defaults = profile::resolve_run_args(*defaults).unwrap();
         assert_eq!(defaults.output_limit, moraebox_core::DEFAULT_OUTPUT_LIMIT);
         assert_eq!(defaults.kill_grace, moraebox_core::DEFAULT_KILL_GRACE);
 
@@ -2312,6 +2382,7 @@ mod tests {
         let Command::Run(explicit) = explicit.command else {
             panic!("expected run command");
         };
+        let explicit = profile::resolve_run_args(*explicit).unwrap();
         assert_eq!(explicit.output_limit, 4096);
         assert_eq!(explicit.kill_grace, Duration::from_millis(750));
     }
@@ -2322,6 +2393,7 @@ mod tests {
         let Command::Run(default) = default.command else {
             panic!("expected run command");
         };
+        let default = profile::resolve_run_args(*default).unwrap();
         assert_eq!(default.pull_policy, ImagePullPolicy::Missing);
 
         let run =
@@ -2329,6 +2401,7 @@ mod tests {
         let Command::Run(run) = run.command else {
             panic!("expected run command");
         };
+        let run = profile::resolve_run_args(*run).unwrap();
         assert_eq!(run.pull_policy, ImagePullPolicy::Never);
 
         let create = Cli::try_parse_from(["morae", "box", "create", "--pull", "always"]).unwrap();
@@ -2435,6 +2508,7 @@ mod tests {
         let Command::Run(run) = run.command else {
             panic!("expected run command");
         };
+        let run = profile::resolve_run_args(*run).unwrap();
         assert_eq!(run.backend, "libkrun");
 
         let benchmark = Cli::try_parse_from(["morae", "benchmark", "--", "/bin/true"]).unwrap();
@@ -2642,7 +2716,7 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("Usage: morae run [OPTIONS] <COMMAND>...")
+                    .contains("Usage: morae run [OPTIONS] [COMMAND]...")
             );
         }
 
