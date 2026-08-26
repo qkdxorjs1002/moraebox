@@ -1,10 +1,25 @@
 use super::{
     Arc, AsyncWriteExt, Backend, CliErrorSource, IsTerminal, OutputChannel, OutputReadError, Read,
     RunBudget, RunSpec, SessionError, SessionHandle, SessionManager, SessionState, SessionStatus,
-    Signal, io, stderr_line_ending,
+    Signal, Supervisor, io, stderr_line_ending,
 };
 
 const INTERACTIVE_READ_BYTES: usize = 64 * 1024;
+
+pub(super) async fn run_non_interactive<B>(
+    backend: B,
+    spec: RunSpec,
+    budget: RunBudget,
+) -> Result<moraebox_runtime::RunReport, CliErrorSource>
+where
+    B: Backend + 'static,
+{
+    let mut signals = HostSignals::new()?;
+    Supervisor::new(backend)
+        .run_with_budget_and_signal(spec, budget, signals.recv_signal())
+        .await
+        .map_err(Into::into)
+}
 
 pub(super) async fn run_interactive<B>(
     backend: B,
@@ -328,6 +343,14 @@ impl HostSignals {
             }
         }
     }
+
+    async fn recv_signal(&mut self) -> io::Result<Signal> {
+        loop {
+            if let HostEvent::Signal(signal) = self.recv().await? {
+                return Ok(signal);
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -357,6 +380,13 @@ impl HostSignals {
             .map(|()| HostEvent::Signal(Signal::Interrupt))
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "host signal stream closed"))
     }
+
+    async fn recv_signal(&mut self) -> io::Result<Signal> {
+        match self.recv().await? {
+            HostEvent::Signal(signal) => Ok(signal),
+            HostEvent::Resize(..) => unreachable!("Windows does not emit resize events"),
+        }
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -371,6 +401,13 @@ impl HostSignals {
     async fn recv(&mut self) -> io::Result<HostEvent> {
         tokio::signal::ctrl_c().await?;
         Ok(HostEvent::Signal(Signal::Interrupt))
+    }
+
+    async fn recv_signal(&mut self) -> io::Result<Signal> {
+        match self.recv().await? {
+            HostEvent::Signal(signal) => Ok(signal),
+            HostEvent::Resize(..) => unreachable!("this platform does not emit resize events"),
+        }
     }
 }
 

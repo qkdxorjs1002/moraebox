@@ -17,7 +17,7 @@ use super::{
     RemoveReport, RootfsMetadataIssueKind, RunArgs, RunBudget, RunSpec, RunStage, Serialize,
     StoragePaths, Supervisor, TimeoutPolicy, UpdateBox, WORKSPACE_DIFF_GUEST_PATH, WorkspaceMode,
     WorkspaceSnapshot, WorkspaceStage, Write, command_stage, fs, io, profile, resolve_cache_dir,
-    resolve_state_dir, run_interactive, stderr_line_ending,
+    resolve_state_dir, run_interactive, run_non_interactive, stderr_line_ending,
 };
 use futures_util::{StreamExt, stream};
 use std::collections::{BTreeMap, BTreeSet};
@@ -556,9 +556,7 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, CliErrorSourc
             if args.interactive {
                 return run_interactive(ProcessBackend, spec, budget).await;
             }
-            Supervisor::new(ProcessBackend)
-                .run_with_budget(spec, budget)
-                .await?
+            run_non_interactive(ProcessBackend, spec, budget).await?
         }
         "libkrun" => {
             let cache_dir = cache_dir
@@ -613,9 +611,7 @@ async fn run(args: RunArgs, global: &GlobalOptions) -> Result<i32, CliErrorSourc
             if args.interactive {
                 return run_interactive(backend, spec, budget).await;
             }
-            Supervisor::new(backend)
-                .run_with_budget(spec, budget)
-                .await?
+            run_non_interactive(backend, spec, budget).await?
         }
         _ => unreachable!("clap validates backend values"),
     };

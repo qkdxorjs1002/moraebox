@@ -48,7 +48,7 @@ use commands::{
     parse_kill_grace, parse_output_limit, parse_publish,
 };
 use errors::{CliError, CliErrorSource};
-use interactive::run_interactive;
+use interactive::{run_interactive, run_non_interactive};
 
 fn stderr_line_ending() -> &'static str {
     let stderr = io::stderr();

@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
-use moraebox_core::{OutputChunk, RunSpec, SessionId, SessionState, TerminationReason};
+use moraebox_core::{OutputChunk, RunSpec, SessionId, SessionState, Signal, TerminationReason};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -41,45 +41,124 @@ where
         spec: RunSpec,
         budget: RunBudget,
     ) -> Result<RunReport, SupervisorError> {
-        let session = start_session(Arc::clone(&self.backend), spec, budget)
-            .await
-            .map_err(map_session_start)?;
+        let session = self.start_with_budget(spec, budget).await?;
         let _ = session.close_stdin().await;
-        let status = match session.wait().await {
-            Ok(status) => status,
-            Err(SessionError::Io(failure)) => return Err(SupervisorError::SessionIo(failure)),
-            Err(error) => {
-                if let Some(details) = session.terminal_error() {
-                    return Err(SupervisorError::Cleanup(details));
+        let status = wait_for_session(&session).await?;
+        collect_report(&session, status).await
+    }
+
+    pub async fn run_with_budget_and_signal<F>(
+        &self,
+        spec: RunSpec,
+        budget: RunBudget,
+        signal: F,
+    ) -> Result<RunReport, SupervisorError>
+    where
+        F: Future<Output = std::io::Result<Signal>>,
+    {
+        let signal_grace = spec.kill_grace;
+        let session = self.start_with_budget(spec, budget).await?;
+        let _ = session.close_stdin().await;
+        tokio::pin!(signal);
+        let status = tokio::select! {
+            status = session.wait() => map_session_wait(&session, status)?,
+            signal = &mut signal => {
+                let signal = match signal {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        stop_and_wait(&session).await?;
+                        return Err(error.into());
+                    }
+                };
+                if let Err(error) = session.signal(signal).await
+                    && session.status().state != SessionState::Dead
+                {
+                    stop_and_wait(&session).await?;
+                    return Err(error.into());
                 }
-                return Err(error.into());
+                match tokio::time::timeout(signal_grace, session.wait()).await {
+                    Ok(status) => map_session_wait(&session, status)?,
+                    Err(_) => stop_and_wait(&session).await?,
+                }
             }
         };
-        if let Some(details) = session.terminal_error() {
-            return Err(SupervisorError::Cleanup(details));
-        }
-        let (all_output, output_earliest_cursor, output_next_cursor) =
-            session.retained_output().await;
-
-        Ok(RunReport {
-            session_id: status.session_id,
-            backend: status.backend,
-            state: status.state,
-            termination_reason: status.termination_reason,
-            exit_code: status.exit_code,
-            signal: status.signal,
-            timed_out: status.timed_out,
-            output: all_output.chunks,
-            output_earliest_cursor,
-            output_next_cursor,
-            output_truncated: all_output.truncated,
-            elapsed_micros: status.elapsed_micros,
-            startup: session.startup(),
-            trace: session.trace(),
-            stages: session.stage_timings(),
-            failure_stage: session.failure_stage(),
-        })
+        collect_report(&session, status).await
     }
+
+    async fn start_with_budget(
+        &self,
+        spec: RunSpec,
+        budget: RunBudget,
+    ) -> Result<crate::SessionHandle, SupervisorError> {
+        start_session(Arc::clone(&self.backend), spec, budget)
+            .await
+            .map_err(map_session_start)
+    }
+}
+
+async fn wait_for_session(
+    session: &crate::SessionHandle,
+) -> Result<crate::SessionStatus, SupervisorError> {
+    map_session_wait(session, session.wait().await)
+}
+
+async fn stop_and_wait(
+    session: &crate::SessionHandle,
+) -> Result<crate::SessionStatus, SupervisorError> {
+    if session.status().state != SessionState::Dead {
+        let _ = session.stop().await;
+    }
+    let status = wait_for_session(session).await?;
+    if let Some(details) = session.terminal_error() {
+        return Err(SupervisorError::Cleanup(details));
+    }
+    Ok(status)
+}
+
+fn map_session_wait(
+    session: &crate::SessionHandle,
+    result: Result<crate::SessionStatus, SessionError>,
+) -> Result<crate::SessionStatus, SupervisorError> {
+    let status = match result {
+        Ok(status) => status,
+        Err(SessionError::Io(failure)) => return Err(SupervisorError::SessionIo(failure)),
+        Err(error) => {
+            if let Some(details) = session.terminal_error() {
+                return Err(SupervisorError::Cleanup(details));
+            }
+            return Err(error.into());
+        }
+    };
+    Ok(status)
+}
+
+async fn collect_report(
+    session: &crate::SessionHandle,
+    status: crate::SessionStatus,
+) -> Result<RunReport, SupervisorError> {
+    if let Some(details) = session.terminal_error() {
+        return Err(SupervisorError::Cleanup(details));
+    }
+    let (all_output, output_earliest_cursor, output_next_cursor) = session.retained_output().await;
+
+    Ok(RunReport {
+        session_id: status.session_id,
+        backend: status.backend,
+        state: status.state,
+        termination_reason: status.termination_reason,
+        exit_code: status.exit_code,
+        signal: status.signal,
+        timed_out: status.timed_out,
+        output: all_output.chunks,
+        output_earliest_cursor,
+        output_next_cursor,
+        output_truncated: all_output.truncated,
+        elapsed_micros: status.elapsed_micros,
+        startup: session.startup(),
+        trace: session.trace(),
+        stages: session.stage_timings(),
+        failure_stage: session.failure_stage(),
+    })
 }
 
 fn map_session_start(error: SessionError) -> SupervisorError {

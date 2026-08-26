@@ -129,6 +129,17 @@ connection.close()
 server.close()
 print("preview-served")
 "#;
+const PREVIEW_SIGINT_PROBE: &str = r#"
+import socket, time
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("0.0.0.0", 3000))
+server.listen(1)
+print("preview-listening", flush=True)
+while True:
+    time.sleep(1)
+"#;
 
 const SLEEP_PROBE: &str = "import time; time.sleep(60)";
 const PROTOCOL_IO_PROBE: &str = r#"
@@ -315,6 +326,20 @@ impl NativeHarness {
             .arg("-c")
             .arg(python_bootstrap(PREVIEW_PROBE));
         command.spawn().expect("spawn preview probe")
+    }
+
+    fn spawn_non_interactive_preview(&self, host_port: u16) -> Child {
+        let mut command = self.command();
+        command
+            .args(["--timeout", "20s", "--json", "--publish"])
+            .arg(format!("{host_port}:3000"))
+            .arg("--")
+            .arg("python3")
+            .arg("-c")
+            .arg(python_bootstrap(PREVIEW_SIGINT_PROBE));
+        command
+            .spawn()
+            .expect("spawn non-interactive SIGINT preview probe")
     }
 }
 
@@ -884,6 +909,49 @@ fn assert_cancellation_cleanup(harness: &NativeHarness) {
     harness.assert_network_state_empty();
 }
 
+fn assert_non_interactive_sigint_preview_cleanup(harness: &NativeHarness) {
+    let reservation = TcpListener::bind(("127.0.0.1", 0)).expect("reserve preview port");
+    let host_port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+
+    let mut child = harness.spawn_non_interactive_preview(host_port);
+    let children = wait_for_native_children(&mut child, true);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match TcpStream::connect(("127.0.0.1", host_port)) {
+            Ok(stream) => {
+                drop(stream);
+                break;
+            }
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+            Err(error) => panic!("non-interactive preview did not become ready: {error}"),
+        }
+    }
+
+    signal::kill(
+        Pid::from_raw(i32::try_from(child.id()).expect("morae PID fits i32")),
+        Signal::SIGINT,
+    )
+    .expect("signal non-interactive morae preview");
+    let output = wait_for_output(child);
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "SIGINT preview did not exit conventionally: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = parse_report(&output);
+    assert_dead_report(&report);
+    assert_eq!(report["timed_out"], false);
+    assert_children_gone(&children);
+    harness.assert_network_state_empty();
+    assert!(
+        TcpStream::connect(("127.0.0.1", host_port)).is_err(),
+        "SIGINT preview listener remains reachable"
+    );
+}
+
 fn assert_helper_crash_cleanup(harness: &NativeHarness) {
     let mut child = harness.spawn_json(true, "30s", SLEEP_PROBE);
     let children = wait_for_native_children(&mut child, true);
@@ -967,5 +1035,6 @@ fn signed_native_egress_gate() {
     assert_loopback_preview(&harness);
     assert_timeout_cleanup(&harness);
     assert_cancellation_cleanup(&harness);
+    assert_non_interactive_sigint_preview_cleanup(&harness);
     assert_helper_crash_cleanup(&harness);
 }

@@ -2,6 +2,12 @@
 
 use std::process::Command;
 
+#[cfg(unix)]
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
+
 #[test]
 fn propagates_exit_code_and_separate_output() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_morae"));
@@ -25,6 +31,116 @@ fn timeout_uses_the_conventional_exit_code() {
         "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+fn interrupt_non_interactive_process(script: &str) -> (std::process::Output, Duration) {
+    use nix::{
+        sys::signal::{Signal, kill},
+        unistd::Pid,
+    };
+
+    let temporary = tempfile::tempdir().unwrap();
+    let ready = temporary.path().join("ready");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_morae"))
+        .args([
+            "run",
+            "--backend",
+            "process",
+            "--json",
+            "--timeout",
+            "10s",
+            "--kill-grace",
+            "250ms",
+            "--env",
+        ])
+        .arg(format!("MORAE_READY_FILE={}", ready.display()))
+        .args(["--", "/bin/sh", "-c", script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "morae exited before the process command became ready"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "process command did not become ready"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let interrupted = Instant::now();
+    kill(
+        Pid::from_raw(i32::try_from(child.id()).unwrap()),
+        Signal::SIGINT,
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    (output, interrupted.elapsed())
+}
+
+#[cfg(unix)]
+#[test]
+fn non_interactive_sigint_waits_for_cleanup_and_reports_signal() {
+    let (output, _) = interrupt_non_interactive_process(
+        "printf ready > \"$MORAE_READY_FILE\"; exec /bin/sleep 5",
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["state"], "dead");
+    assert_eq!(report["signal"], 2);
+    assert_eq!(report["timed_out"], false);
+    assert_eq!(
+        report["trace"]
+            .as_array()
+            .and_then(|trace| trace.last())
+            .and_then(|event| event["kind"].as_str()),
+        Some("cleanup_complete")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn non_interactive_sigint_forces_an_ignoring_command_after_the_grace_period() {
+    let (output, elapsed) = interrupt_non_interactive_process(
+        "trap '' INT TERM; printf ready > \"$MORAE_READY_FILE\"; exec /bin/sleep 5",
+    );
+
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "ignored SIGINT cleanup took {elapsed:?}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(137),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["state"], "dead");
+    assert_eq!(report["termination_reason"], "cancelled");
+    assert_eq!(report["signal"], 9);
+    assert_eq!(report["timed_out"], false);
+    let trace = report["trace"].as_array().unwrap();
+    assert!(trace.iter().any(|event| event["kind"] == "forced_stop"));
+    assert_eq!(
+        trace.last().and_then(|event| event["kind"].as_str()),
+        Some("cleanup_complete")
     );
 }
 
