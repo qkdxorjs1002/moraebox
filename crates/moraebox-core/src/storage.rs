@@ -291,6 +291,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn creates_private_storage_root() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("nested/cache");
@@ -316,6 +317,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn tightens_existing_storage_root_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -334,6 +336,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn rejects_symlink_storage_root() {
         use std::os::unix::fs::symlink;
 
